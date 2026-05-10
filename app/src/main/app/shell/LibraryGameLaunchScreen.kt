@@ -1,5 +1,7 @@
 package com.winlator.cmod.app.shell
 
+import android.os.Build
+import android.view.WindowManager
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
@@ -19,9 +21,9 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -47,6 +49,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +63,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -67,6 +71,8 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogWindowProvider
+import androidx.core.view.WindowCompat
 import coil.compose.AsyncImage
 import coil.request.CachePolicy
 import coil.request.ImageRequest
@@ -109,6 +115,8 @@ internal fun LibraryGameLaunchScreen(
     val context = LocalContext.current
     var uninstallMenuOpen by remember { mutableStateOf(false) }
 
+    LaunchScreenCutoutMode()
+
     Box(Modifier.fillMaxSize()) {
         val edgePadding = 22.dp
         val bottomPadding = 20.dp
@@ -117,9 +125,7 @@ internal fun LibraryGameLaunchScreen(
         val actionWidth = actionIconSize * 5 + actionIconSpacing * 4
         val playHeight = 56.dp
         val contentGap = 18.dp
-        val topSafeInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Top)
-        val horizontalSafeInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
-        val bottomSafeInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom)
+        val horizontalNavInsets = WindowInsets.navigationBars.only(WindowInsetsSides.Horizontal)
 
         if (heroImageUrl != null) {
             val heroRequest =
@@ -200,8 +206,7 @@ internal fun LibraryGameLaunchScreen(
             modifier =
                 Modifier
                     .fillMaxWidth()
-                    .windowInsetsPadding(horizontalSafeInsets)
-                    .windowInsetsPadding(topSafeInsets)
+                    .windowInsetsPadding(horizontalNavInsets)
                     .padding(start = edgePadding, top = 12.dp, end = edgePadding),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -229,9 +234,7 @@ internal fun LibraryGameLaunchScreen(
             modifier =
                 Modifier
                     .fillMaxSize()
-                    .windowInsetsPadding(horizontalSafeInsets)
-                    .windowInsetsPadding(topSafeInsets)
-                    .windowInsetsPadding(bottomSafeInsets)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
                     .padding(start = edgePadding, top = 68.dp, end = edgePadding, bottom = bottomPadding),
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
@@ -390,6 +393,45 @@ internal fun LibraryGameLaunchScreen(
         }
     }
 }
+
+@Composable
+private fun LaunchScreenCutoutMode() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return
+
+    val view = LocalView.current
+    DisposableEffect(view) {
+        val window = (view.parent as? DialogWindowProvider)?.window
+            ?: return@DisposableEffect onDispose { }
+
+        val originalCutoutMode = window.attributes.layoutInDisplayCutoutMode
+        val originalWidth = window.attributes.width
+        val originalHeight = window.attributes.height
+
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.setLayout(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+        )
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = launchScreenCutoutMode()
+        }
+
+        onDispose {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = originalCutoutMode
+            }
+            WindowCompat.setDecorFitsSystemWindows(window, true)
+            window.setLayout(originalWidth, originalHeight)
+        }
+    }
+}
+
+private fun launchScreenCutoutMode(): Int =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+    } else {
+        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+    }
 
 @Composable
 private fun LaunchUninstallMenu(
