@@ -286,9 +286,33 @@ public abstract class ProcessHelper {
       pb.directory(workingDir);
       pb.environment().putAll(EnvironmentManager.getEnvVars());
       if (debugCallbacks.isEmpty()) {
-        File nullFile = new File("/dev/null");
-        pb.redirectError(nullFile);
-        pb.redirectOutput(nullFile);
+        // When WINEDEBUG is set, divert Wine's stderr/stdout to a rolling log
+        // file in the app's filesDir instead of /dev/null — otherwise every
+        // +module/+loaddll/+relay channel disappears and on-device launch
+        // failures can't be diagnosed. Path is fixed so we don't have to plumb
+        // a Context here; harmless for shells that aren't Wine.
+        String wineDebug = EnvironmentManager.getEnvVars().get("WINEDEBUG");
+        boolean wineDebugActive = wineDebug != null
+                && !wineDebug.isEmpty()
+                && !wineDebug.equals("-all");
+        Log.i("ProcessHelper",
+                "exec wine-debug branch: WINEDEBUG='" + wineDebug + "' active=" + wineDebugActive
+                        + " cmd=" + command.substring(0, Math.min(80, command.length())));
+        if (wineDebugActive) {
+          File logFile = new File("/data/data/com.winnative.cmod/files/wine_stderr.log");
+          try {
+            if (logFile.exists() && logFile.length() > 16 * 1024 * 1024) logFile.delete();
+          } catch (Exception ignored) {}
+          pb.redirectErrorStream(true);
+          pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile));
+          Log.i("ProcessHelper", "exec wine-debug: redirecting stderr+stdout to " + logFile.getAbsolutePath());
+        } else {
+          File nullFile = new File("/dev/null");
+          pb.redirectError(nullFile);
+          pb.redirectOutput(nullFile);
+        }
+      } else {
+        Log.i("ProcessHelper", "exec: debugCallbacks non-empty (" + debugCallbacks.size() + "), routing wine stderr to logcat");
       }
       java.lang.Process process = pb.start();
       if (!debugCallbacks.isEmpty()) {

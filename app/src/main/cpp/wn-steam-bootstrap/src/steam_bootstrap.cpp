@@ -48,7 +48,11 @@
 
 #include <atomic>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -81,19 +85,25 @@ constexpr const char* kLogTag = "WnSteamBoot";
 //       This is the internal Valve IClientEngine. Public SteamClient020
 //       interface is unsuitable for the refresh-token login path.
 //   4.  engine->vtable[8](user, pipe) → IClientUser sub-interface
-//   5.  Login dance on IClientUser vtable:
+//   5.  Login dance on IClientUser vtable (offsets for OUR bundled
+//       libsteamclient.so build):
 //          slot 49 (offset 0x188): bool IsAccountLoggedIn(account)
 //          slot 54 (offset 0x1B0): SetLoginInformation(account, password, remember)
 //          slot 56 (offset 0x1C0): LogonWithRefreshToken(refreshToken, account)
 //          slot 50 (offset 0x190): SetAccount(account, 1)        [already-logged path]
 //          slot 1  (offset 0x08): SetSteamID(steamId64)
+//
+//       CAUTION — do NOT port GameNative's offsets here. A Ghidra decompile
+//       of GameNative's libsteambootstrap.so shows its slot 0x1C0 as a
+//       1-arg SetLoginToken(token). OUR libsteamclient.so is a different
+//       build: slot 0x1C0 is the 2-arg LogonWithRefreshToken(token,
+//       account). Verified on-device 2026-05-19 — calling 0x1C0 with one
+//       arg SIGSEGVs inside strlen() on the missing 2nd (account) arg.
+//   6.  Poll loop, up to 100×100ms=10s:
+//          drain pending callbacks via Steam_BGetCallback/FreeLastCallback
 //   6.  Poll loop, up to 100×100ms=10s:
 //          drain pending callbacks via Steam_BGetCallback/FreeLastCallback
 //          if Steam_BLoggedOn(pipe, user) — DONE
-//
-// Method-name guesses above are slot-by-slot reasoning from the call
-// arity and the SteamWorks SDK; exact names may differ but the slot
-// numbers match what the reference bootstrap dispatches to.
 struct State {
     std::mutex   mu;
     void*        lsc_handle  = nullptr;   // libsteamclient.so dlopen handle
@@ -118,6 +128,29 @@ struct State {
     // libsteamclient.so — do NOT free.
     void* iclient_user = nullptr;
 
+    // Cached PUBLIC ISteam* interface pointers — the hybrid stage-2 backend
+    // path. Populated by cache_public_interfaces() after the IClientEngine
+    // logon block. All owned by libsteamclient.so — do NOT free. Versions
+    // probed at init (the registry-string strings present in the binary
+    // don't all instantiate at runtime); the ver pointers below point at
+    // string literals inside the binary so they stay valid.
+    void* steamclient_iface     = nullptr;    // SteamClient020
+    void* isteam_user           = nullptr;    // SteamUser023
+    void* isteam_utils          = nullptr;    // SteamUtils010
+    void* isteam_userstats      = nullptr;    // STEAMUSERSTATS_INTERFACE_VERSION013
+    void* isteam_apps           = nullptr;    // ISteamApps (best matching ver)
+    void* isteam_remotestorage  = nullptr;    // ISteamRemoteStorage (best ver)
+    void* isteam_friends        = nullptr;    // ISteamFriends (best matching ver)
+    const char* isteam_apps_ver = nullptr;
+    const char* isteam_rs_ver   = nullptr;
+    const char* isteam_friends_ver = nullptr;
+
+    // SteamID64 supplied by Kotlin to nativeInit, cached so the
+    // Java_…_nativeGetSteamId accessor doesn't need to round-trip through
+    // libsteamclient.so. Updated on every successful nativeInit, cleared
+    // on nativeShutdown.
+    uint64_t cached_steam_id = 0;
+
     // Every env key nativeInit setenv()'d, recorded so nativeShutdown
     // can unsetenv() them. Otherwise a bionic→real-Steam mode switch in
     // the same process inherits leaked WINESTEAMCLIENTPATH / Steam3Master /
@@ -131,6 +164,18 @@ struct State {
     // pumped for the whole process lifetime, so a detached thread takes
     // over once start()'s poll loop finishes.
     std::atomic<bool> pump_running{false};
+
+    // Callback bridge — lets Kotlin sync-wait for specific Steam
+    // callback IDs (UserStatsReceived_t=1101, UserStatsStored_t=1102,
+    // EncryptedAppTicketResponse_t=154, RemoteStorage* in 1300 range,
+    // etc.). Pump loop captures payloads only for ids the caller
+    // subscribed to (bounded memory). awaitCallback() condvar-waits
+    // until the next instance of the requested id arrives, then
+    // returns + clears it. Subscription persists across waits so a
+    // subsequent op of the same id immediately sees the next payload.
+    std::condition_variable                  cv_callback;
+    std::set<int>                            subscribed_ids;
+    std::map<int, std::vector<uint8_t>>      received_callbacks;
 };
 State g_state;
 
@@ -138,12 +183,15 @@ State g_state;
 // 8-byte fn ptrs). All confirmed by Ghidra decomp of reference bootstrap.
 constexpr int kVtClientEngine_GetIClientUser = 0x40;   // returns sub-iface
 
-// IClientUser vtable slots — sizes match aarch64 ABI 8-byte slots.
-constexpr int kVtClientUser_SetSteamID        = 0x08;
-constexpr int kVtClientUser_IsAccountLoggedIn = 0x188; // bool IsAccountLoggedIn(const char*)
-constexpr int kVtClientUser_SetAccount        = 0x190; // (already-logged path)
-constexpr int kVtClientUser_SetLoginInformation = 0x1B0;
-constexpr int kVtClientUser_LogonWithRefresh  = 0x1C0;
+// IClientUser vtable slots for OUR bundled libsteamclient.so build
+// (aarch64 ABI, 8-byte fn ptrs). Do NOT replace 0x1C0 with GameNative's
+// 1-arg SetLoginToken — our build's 0x1C0 is the 2-arg
+// LogonWithRefreshToken; the 1-arg form SIGSEGVs (verified 2026-05-19).
+constexpr int kVtClientUser_SetSteamID          = 0x08;
+constexpr int kVtClientUser_IsAccountLoggedIn   = 0x188; // bool IsAccountLoggedIn(const char*)
+constexpr int kVtClientUser_SetAccount          = 0x190; // (already-logged path)
+constexpr int kVtClientUser_SetLoginInformation = 0x1B0; // (account, "", remember)
+constexpr int kVtClientUser_LogonWithRefresh    = 0x1C0; // 2-arg (refreshToken, account)
 
 // Persistent callback-pump loop. Runs on a detached thread for the
 // lifetime of the process: libsteamclient.so only advances its logon
@@ -159,10 +207,38 @@ void callback_pump_loop() {
     while (g_state.pump_running.load(std::memory_order_relaxed)) {
         if (g_state.fn_Steam_BGetCallback && g_state.fn_Steam_FreeLastCallback) {
             while (g_state.fn_Steam_BGetCallback(g_state.pipe, cb_buf)) {
+                // CallbackMsg_t layout (validated by Valve's open API
+                // headers): m_hSteamUser @+0, m_iCallback @+4,
+                // m_pubParam ptr @+8, m_cubParam @+16 (8-byte ptr
+                // alignment leaves +8..+16 for the pointer, then size
+                // at +16). On aarch64 little-endian, the size is int32.
+                int   cb_id   = *reinterpret_cast<int*>(cb_buf + 4);
+                void* cb_data = *reinterpret_cast<void**>(cb_buf + 8);
+                int   cb_size = *reinterpret_cast<int*>(cb_buf + 16);
                 if (cb_logged < 120) {
-                    LOGI("pump callback id=%d", *reinterpret_cast<int*>(cb_buf + 4));
+                    LOGI("pump callback id=%d size=%d", cb_id, cb_size);
                     ++cb_logged;
                 }
+                // Callback bridge — if a Kotlin awaiter has subscribed
+                // to this id, snapshot the payload + signal. Only-
+                // subscribed model: untouched ids are zero work in
+                // the pump's hot path beyond an O(log N) set lookup.
+                bool wake = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_state.mu);
+                    if (g_state.subscribed_ids.count(cb_id)) {
+                        auto& slot = g_state.received_callbacks[cb_id];
+                        if (cb_data && cb_size > 0) {
+                            slot.assign(
+                                reinterpret_cast<const uint8_t*>(cb_data),
+                                reinterpret_cast<const uint8_t*>(cb_data) + cb_size);
+                        } else {
+                            slot.clear();
+                        }
+                        wake = true;
+                    }
+                }
+                if (wake) g_state.cv_callback.notify_all();
                 g_state.fn_Steam_FreeLastCallback(g_state.pipe);
             }
         }
@@ -187,6 +263,36 @@ std::string jstr(JNIEnv* env, jstring s) {
     if (!c) return {};
     std::string out(c);
     env->ReleaseStringUTFChars(s, c);
+    return out;
+}
+
+// Resolve the Android app's filesDir (context.getFilesDir().getAbsolutePath())
+// via JNI. Used to locate the CA bundle for STEAM_SSL_CERT_FILE. Returns an
+// empty string if context is null or any reflection step fails.
+std::string android_files_dir(JNIEnv* env, jobject context) {
+    if (!context) return {};
+    jclass ctxCls = env->GetObjectClass(context);
+    if (!ctxCls) return {};
+    jmethodID mGetFilesDir =
+        env->GetMethodID(ctxCls, "getFilesDir", "()Ljava/io/File;");
+    env->DeleteLocalRef(ctxCls);
+    if (!mGetFilesDir) return {};
+    jobject fileObj = env->CallObjectMethod(context, mGetFilesDir);
+    if (!fileObj) return {};
+    std::string out;
+    jclass fileCls = env->GetObjectClass(fileObj);
+    if (fileCls) {
+        jmethodID mGetPath =
+            env->GetMethodID(fileCls, "getAbsolutePath", "()Ljava/lang/String;");
+        if (mGetPath) {
+            jstring js = static_cast<jstring>(
+                env->CallObjectMethod(fileObj, mGetPath));
+            out = jstr(env, js);
+            if (js) env->DeleteLocalRef(js);
+        }
+        env->DeleteLocalRef(fileCls);
+    }
+    env->DeleteLocalRef(fileObj);
     return out;
 }
 
@@ -329,12 +435,17 @@ extern "C" {
 
 JNIEXPORT jint JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
-        JNIEnv* env, jclass /*cls*/, jobject /*context*/,
+        JNIEnv* env, jclass /*cls*/, jobject context,
         jstring jlibPath, jstring jhome,
         jstring jsteam3Master, jstring jsteamClientService,
         jobjectArray jextraEnv,
-        jstring jaccountName, jstring jrefreshToken, jlong jsteamId64) {
-    std::lock_guard<std::mutex> lk(g_state.mu);
+        jstring jaccountName, jstring jrefreshToken, jlong jsteamId64,
+        jint jappId) {
+    // unique_lock (not lock_guard) so the stage-2 inline await can
+    // temporarily release+reacquire the mutex around its cv_callback
+    // wait — the pump thread takes g_state.mu briefly per callback to
+    // stash payloads, and holding it across the wait would deadlock.
+    std::unique_lock<std::mutex> lk(g_state.mu);
     if (g_state.initialized) {
         LOGI("nativeInit: already initialized (lsc=%p pipe=%d user=%d)",
              g_state.lsc_handle, g_state.pipe, g_state.user);
@@ -348,6 +459,8 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
     const std::string user     = jstr(env, jaccountName);
     const std::string token    = jstr(env, jrefreshToken);
     const uint64_t    steamId  = static_cast<uint64_t>(jsteamId64);
+    // Cache for nativeGetSteamId; reset on nativeShutdown.
+    g_state.cached_steam_id = steamId;
 
     LOGI("nativeInit: libPath=%s home=%s steam3Master=%s "
          "steamClientService=%s user=%s tokenLen=%zu steamId=%llu",
@@ -366,14 +479,84 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
     if (!home.empty()) {
         ::setenv("HOME", home.c_str(), 1);
         g_state.applied_env_keys.emplace_back("HOME");
+        // Cross-process state-sync directory (task #164). Points to
+        // imagefs/tmp/ so the app-side writer drops wn_lobby_<appid>.txt
+        // there; wine-side readers (Forest's libsteamclient.so) see the
+        // same physical files via /tmp/ after proot chroot.
+        //
+        // Observed `home` is .../files/imagefs/home (no user suffix
+        // appended at this layer — the per-user dir is added later by
+        // the launch path). Strip the trailing "/home" → imagefs root,
+        // then append "/tmp".
+        std::string state_dir = "/tmp";
+        if (home.size() >= 5 && home.compare(home.size() - 5, 5, "/home") == 0) {
+            state_dir = home.substr(0, home.size() - 4) + "tmp";
+        } else if (auto slash = home.rfind("/home/"); slash != std::string::npos) {
+            // Older layout: .../imagefs/home/xuser-N → strip /home/xuser-N
+            state_dir = home.substr(0, slash) + "/tmp";
+        }
+        ::mkdir(state_dir.c_str(), 0755);  // best-effort; ok if exists
+        ::setenv("WN_STATE_DIR", state_dir.c_str(), 1);
+        g_state.applied_env_keys.emplace_back("WN_STATE_DIR");
+        LOGI("nativeInit: WN_STATE_DIR=%s", state_dir.c_str());
     }
     if (!s3m.empty()) {
         ::setenv("Steam3Master", s3m.c_str(), 1);
         g_state.applied_env_keys.emplace_back("Steam3Master");
     }
+    // SteamAppId/SteamGameId in the Android process — needed so the
+    // app-context-dependent interfaces (ISteamApps, ISteamRemoteStorage,
+    // ISteamUserStats) instantiate from ISteamClient.GetIStream*.
+    // Without these, GetISteamApps returns NULL (verified in the stage-2
+    // smoke test). Caller passes 0 for "library/prewarm — no specific
+    // game" (then app-scoped ifaces stay null but User/Utils/Friends
+    // still work); a positive value binds the bootstrap to that app
+    // for the duration of this nativeInit cycle. Non-zero is the
+    // common path for Bionic game launches (XServerDisplayActivity
+    // passes the launching game's appId).
+    if (jappId > 0) {
+        char app_buf[16];
+        std::snprintf(app_buf, sizeof(app_buf), "%d", static_cast<int>(jappId));
+        ::setenv("SteamAppId",  app_buf, 1);
+        ::setenv("SteamGameId", app_buf, 1);
+        g_state.applied_env_keys.emplace_back("SteamAppId");
+        g_state.applied_env_keys.emplace_back("SteamGameId");
+        LOGI("nativeInit: SteamAppId=%s (caller-supplied)", app_buf);
+    } else {
+        LOGI("nativeInit: appId=0 — no SteamAppId env set "
+             "(library/prewarm mode; ISteamApps/ISteamRemoteStorage/"
+             "ISteamUserStats will instantiate as null)");
+    }
     if (!scs.empty()) {
         ::setenv("SteamClientService", scs.c_str(), 1);
         g_state.applied_env_keys.emplace_back("SteamClientService");
+    }
+
+    // STEAM_SSL_CERT_FILE — Valve's libsteamclient.so validates its TLS
+    // connection to the Steam CM servers against a single-file PEM CA
+    // bundle pointed at by this env var, read at module-init time.
+    // GameNative's reference libsteambootstrap.so sets it explicitly
+    // before dlopen (to <filesDir>/cacert.pem); without it the native
+    // client cannot complete a secure logon. We point it at the bundle
+    // CaBundleExtractor concatenates into <filesDir>/wnsteam_cacert.pem.
+    // Only set it when (a) a caller hasn't already supplied it via
+    // extraEnv and (b) the file actually exists — pointing the var at a
+    // missing file is worse than leaving it unset.
+    if (!::getenv("STEAM_SSL_CERT_FILE")) {
+        const std::string files_dir = android_files_dir(env, context);
+        if (!files_dir.empty()) {
+            const std::string ca = files_dir + "/wnsteam_cacert.pem";
+            struct stat st{};
+            if (::stat(ca.c_str(), &st) == 0 && st.st_size > 0) {
+                ::setenv("STEAM_SSL_CERT_FILE", ca.c_str(), 1);
+                g_state.applied_env_keys.emplace_back("STEAM_SSL_CERT_FILE");
+                LOGI("setenv STEAM_SSL_CERT_FILE=%s", ca.c_str());
+            } else {
+                LOGW("STEAM_SSL_CERT_FILE not set: %s missing/empty — call "
+                     "CaBundleExtractor.ensureBundle() before start() or "
+                     "libsteamclient.so TLS logon may fail", ca.c_str());
+            }
+        }
     }
 
     // LD_LIBRARY_PATH — honored by Bionic for in-namespace dlopens. The
@@ -396,13 +579,34 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
     stage_steam_config_dir(home);
 
     // -------------------------------------------------------------------
-    // STEP 1 — dlopen libsteamclient.so + resolve flat C entry points.
+    // SteamService_StartThread("SteamClientService") — REQUIRED.
     //
-    // libsteamclient.so handles steamservice lifecycle internally; we
-    // don't need to call SteamService_StartThread explicitly. The
-    // preload of steamservice.so (RTLD_GLOBAL) above is enough — the
-    // linker namespace has the symbols ready when libsteamclient.so
-    // dlopens it.
+    // 2026-05-21 reverse-engineering of GameNative's libsteambootstrap.so
+    // (Ghidra disassembly @ /tmp/bootstrap_disasm.txt, JNI_OnLoad at 0x14a8,
+    // nativePrepareApp at 0x282c) shows this call is mandatory BEFORE any
+    // libsteamclient.so vtable methods (CreateInterface and onwards) are
+    // safe to invoke. Without it, the wine-side lsteamclient.dll's
+    // CreateInterface dispatch crashes 0xC0000005 in kernelbase — the
+    // server side (libsteamclient.so) isn't actually running yet.
+    //
+    // The earlier note here ("libsteamclient.so handles steamservice
+    // lifecycle internally") was wrong. RTLD_GLOBAL preload alone gets
+    // the symbols visible but doesn't START the SteamService background
+    // thread that the wine guest needs to attach to.
+    // -------------------------------------------------------------------
+    typedef void* (*SteamService_StartThread_fn)(const char*);
+    auto svc_start = reinterpret_cast<SteamService_StartThread_fn>(
+        ::dlsym(RTLD_DEFAULT, "SteamService_StartThread"));
+    if (svc_start) {
+        void* svc_ctx = svc_start("SteamClientService");
+        LOGI("SteamService_StartThread(\"SteamClientService\") -> %p", svc_ctx);
+    } else {
+        LOGW("SteamService_StartThread symbol not in global namespace — "
+             "preload may have failed; wine guest may crash on CreateInterface");
+    }
+
+    // -------------------------------------------------------------------
+    // STEP 1 — dlopen libsteamclient.so + resolve flat C entry points.
     // -------------------------------------------------------------------
     void* lsc = try_dlopen(libPath);
     if (!lsc) return -1;
@@ -464,15 +668,17 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
     // -------------------------------------------------------------------
     // STEP 3 — Refresh-token login via IClientEngine (optional).
     //
-    // From Ghidra decomp of the reference bootstrap:
+    // For OUR bundled libsteamclient.so build:
     //   CreateInterface("CLIENTENGINE_INTERFACE_VERSION005", &err)  → engine
-    //   engine_vt[8] (offset 0x40): GetIClientUser(user, pipe)      → IClientUser
+    //   engine_vt @ offset 0x40: GetIClientUser(user, pipe)         → IClientUser
     //   IClientUser_vt:
-    //     [49] offset 0x188:  bool IsAccountLoggedIn(const char*)
-    //     [54] offset 0x1B0:  SetLoginInformation(account, password, remember)
-    //     [56] offset 0x1C0:  LogonWithRefreshToken(refreshToken, account)
-    //     [50] offset 0x190:  SetAccount(account, 1)        (cached path)
-    //     [1]  offset 0x08:   SetSteamID(steamId64)
+    //     offset 0x1B0:  SetLoginInformation(account, "", remember=1)
+    //     offset 0x1C0:  LogonWithRefreshToken(refreshToken, account)  — 2 args
+    //     offset 0x08:   SetSteamID(steamId64)
+    //
+    // (GameNative's libsteambootstrap.so RE shows a different layout for
+    // ITS build — 1-arg SetLoginToken at 0x1C0. Our build is not the same
+    // binary; calling 0x1C0 with one arg SIGSEGVs. Verified 2026-05-19.)
     //
     // If we don't have credentials, libsteamclient.so will sit at
     // "connected but not logged on" — Wine IPC still functions for the
@@ -502,39 +708,66 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
                 auto is_logged = reinterpret_cast<IsAccountLoggedInFn>(
                     iuser_vt[kVtClientUser_IsAccountLoggedIn / 8]);
                 bool already = is_logged(iuser, user.c_str());
-                LOGI("IClientUser.IsAccountLoggedIn(%s) = %d (note: this "
-                     "reports whether the account is KNOWN, not actively "
-                     "authenticated — we drive LogonWithRefreshToken either "
-                     "way to ensure a fresh authenticated session)",
-                     user.c_str(), already ? 1 : 0);
+                LOGI("IClientUser.IsAccountLoggedIn(%s) = %d", user.c_str(),
+                     already ? 1 : 0);
 
-                // ALWAYS run SetLoginInformation + LogonWithRefreshToken.
-                // The reference bootstrap branched on IsAccountLoggedIn and
-                // skipped the logon when "already" was true; on Android we
-                // never have valid cached session state across process
-                // restarts (we stage empty config.vdf/local.vdf), so the
-                // "already known" return is misleading and we must
-                // actively re-authenticate every session.
-                using SetLoginInfoFn = void (*)(void*, const char*, const char*, int);
-                auto set_login = reinterpret_cast<SetLoginInfoFn>(
-                    iuser_vt[kVtClientUser_SetLoginInformation / 8]);
-                set_login(iuser, user.c_str(), "", 1);
-                LOGI("IClientUser.SetLoginInformation(%s, \"\", 1) called",
-                     user.c_str());
-
-                using LogonRefreshFn = void (*)(void*, const char*, const char*);
-                auto logon = reinterpret_cast<LogonRefreshFn>(
-                    iuser_vt[kVtClientUser_LogonWithRefresh / 8]);
-                logon(iuser, token.c_str(), user.c_str());
-                LOGI("IClientUser.LogonWithRefreshToken called (token=%zu bytes)",
-                     token.size());
-
+                // Try auto-logon from libsteamclient.so's own persisted
+                // config.vdf first. When the account is KNOWN (already=true),
+                // libsteamclient.so has a cached session — and crucially,
+                // Steam ROTATES refresh tokens on logon, so the token in its
+                // config.vdf is the FRESH one, while PrefManager still holds
+                // the original (now-invalidated) one. Forcing
+                // LogonWithRefreshToken(stale) on every process restart was
+                // the root cause of repeated EResult=15 AccessDenied. Poll
+                // briefly for the auto-logon to land; only fall through to
+                // the forced logon if no cached session establishes.
+                bool auto_logged_on = false;
+                if (already && g_state.fn_Steam_BLoggedOn) {
+                    constexpr int kAutoPollMax = 30;          // 30 × 100ms = 3s
+                    for (int i = 0; i < kAutoPollMax; ++i) {
+                        if (g_state.fn_Steam_BLoggedOn(g_state.pipe, g_state.user)) {
+                            auto_logged_on = true;
+                            LOGI("Auto-logon from cached session OK after %dx100ms — "
+                                 "skipping forced LogonWithRefreshToken (avoids the "
+                                 "stale-token AccessDenied)", i + 1);
+                            break;
+                        }
+                        ::usleep(100 * 1000);
+                    }
+                }
                 using SetSteamIDFn = void (*)(void*, uint64_t);
                 auto set_sid = reinterpret_cast<SetSteamIDFn>(
                     iuser_vt[kVtClientUser_SetSteamID / 8]);
-                set_sid(iuser, steamId);
-                LOGI("IClientUser.SetSteamID(%llu) called",
-                     static_cast<unsigned long long>(steamId));
+                if (auto_logged_on) {
+                    // Already authenticated by libsteamclient.so itself.
+                    set_sid(iuser, steamId);
+                    LOGI("IClientUser.SetSteamID(%llu) called (post auto-logon)",
+                         static_cast<unsigned long long>(steamId));
+                } else {
+                    LOGI("No cached session usable; driving forced "
+                         "LogonWithRefreshToken with the stored token "
+                         "(account-known=%d)", already ? 1 : 0);
+
+                    using SetLoginInfoFn = void (*)(void*, const char*, const char*, int);
+                    auto set_login = reinterpret_cast<SetLoginInfoFn>(
+                        iuser_vt[kVtClientUser_SetLoginInformation / 8]);
+                    set_login(iuser, user.c_str(), "", 1);
+                    LOGI("IClientUser.SetLoginInformation(%s, \"\", 1) called",
+                         user.c_str());
+
+                    // 0x1C0 on our build is the 2-arg LogonWithRefreshToken
+                    // (token, account); 1-arg form SIGSEGVs (verified).
+                    using LogonRefreshFn = void (*)(void*, const char*, const char*);
+                    auto logon = reinterpret_cast<LogonRefreshFn>(
+                        iuser_vt[kVtClientUser_LogonWithRefresh / 8]);
+                    logon(iuser, token.c_str(), user.c_str());
+                    LOGI("IClientUser.LogonWithRefreshToken called (token=%zu bytes)",
+                         token.size());
+
+                    set_sid(iuser, steamId);
+                    LOGI("IClientUser.SetSteamID(%llu) called",
+                         static_cast<unsigned long long>(steamId));
+                }
             }
         } else {
             LOGW("CreateInterface(CLIENTENGINE_INTERFACE_VERSION005) -> %p (err=%d)",
@@ -597,6 +830,363 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeInit(
     if (!g_state.pump_running.exchange(true)) {
         std::thread(callback_pump_loop).detach();
         LOGI("callback pump thread started (libsteamclient session kept live)");
+        // Spawn the cross-process state-sync poller alongside the
+        // callback pump — both serve the app's role as a CMClient host
+        // for wine-side libsteamclient.so instances. The poller picks
+        // up request files dropped by wine processes (Forest's
+        // libsteamclient.so when it has no in-process CMClient) and
+        // fulfills them by querying the in-process CMClient + writing
+        // the response file. See cm_bridge.cpp::state_sync_poller_loop.
+        //
+        // wn-steam-bootstrap doesn't link directly against libwnsteam.so
+        // so we dlsym via the libsteamclient handle (linker-merged).
+        using StartFn = void (*)(void);
+        auto start = reinterpret_cast<StartFn>(
+            ::dlsym(g_state.lsc_handle, "wn_cm_bridge_start_state_sync_poller"));
+        if (start != nullptr) {
+            start();
+            LOGI("cross-process state-sync poller started");
+        } else {
+            LOGW("wn_cm_bridge_start_state_sync_poller not found: %s",
+                 ::dlerror());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // HYBRID STAGE-2 — cache the PUBLIC ISteam* interface pointers in
+    // g_state so subsequent JNI accessors (nativeBIsSubscribedApp, …)
+    // can call the documented vtables synchronously without
+    // re-instantiating per call. libsteamclient.so owns these objects
+    // (returns the same pointer for repeated CreateInterface/GetISteamX
+    // with the same version) — we hold raw pointers and reset them in
+    // nativeShutdown.
+    //
+    // The hybrid endgame routes the app backend (apps/cloud/stats/etc.)
+    // through public, documented, stable ISteam* interfaces obtained from
+    // ISteamClient — NOT through the internal IClientEngine vtable that the
+    // refresh-token logon path uses. libsteamclient.so exports zero flat
+    // `SteamAPI_*` wrappers (verified), so we call the public vtables
+    // directly with the documented SDK method order. Slot map proven by
+    // the 2026-05-19 on-device smoke test:
+    //   slot  5: GetISteamUser(hUser,hPipe,ver)        — SteamUser023
+    //   slot  9: GetISteamUtils(hPipe,ver)             — SteamUtils010
+    //   slot 13: GetISteamUserStats(hUser,hPipe,ver)   — …USERSTATS_…013
+    //   slot 14: GetISteamApps(hUser,hPipe,ver)        — STEAMAPPS_…009
+    //   slot 16: GetISteamRemoteStorage(hUser,hPipe,ver) — auth-gated
+    //
+    // Auth-gating: GetISteamApps and GetISteamRemoteStorage return non-null
+    // only after a logged-on session — verified empirically. The cache
+    // therefore re-runs on every nativeInit (each fresh logon refreshes
+    // the auth-gated interfaces). On any failure we log and continue.
+    {
+        int sc_err = 0;
+        void* steamclient = g_state.fn_CreateInterface("SteamClient020", &sc_err);
+        LOGI("Stage2: CreateInterface(SteamClient020) -> %p err=%d logged_on=%d",
+             steamclient, sc_err, logged_on ? 1 : 0);
+        if (steamclient && sc_err == 0) {
+            // CRITICAL: reset every cached ISteam* pointer + version
+            // string before re-populating. Without this, a prior
+            // nativeInit that CRASHED mid-stage-2 (leaving
+            // g_state.initialized=false → WnSteamBootstrap.stop() is a
+            // no-op → nativeShutdown doesn't clear) leaves dangling
+            // pointers; the version-probe loops below have
+            // `if (o && !g_state.isteam_X)` guards that intentionally
+            // keep the FIRST non-null match — those guards combined
+            // with stale-non-null pointers preserve the dangling
+            // values, and the next JNI accessor that dereferences them
+            // SIGSEGVs. Diagnosed 2026-05-19 from crash at
+            // nativeInit+8540 after a multi-cycle toggle test.
+            g_state.steamclient_iface     = nullptr;
+            g_state.isteam_user           = nullptr;
+            g_state.isteam_utils          = nullptr;
+            g_state.isteam_userstats      = nullptr;
+            g_state.isteam_apps           = nullptr;
+            g_state.isteam_remotestorage  = nullptr;
+            g_state.isteam_friends        = nullptr;
+            g_state.isteam_apps_ver       = nullptr;
+            g_state.isteam_rs_ver         = nullptr;
+            g_state.isteam_friends_ver    = nullptr;
+
+            g_state.steamclient_iface = steamclient;
+            long* sc_vt = *reinterpret_cast<long**>(steamclient);
+
+            // slot 9: GetISteamUtils(hPipe, ver) — pipe-only, no user, auth-free.
+            using GetUtilsFn = void* (*)(void*, int, const char*);
+            auto get_utils = reinterpret_cast<GetUtilsFn>(sc_vt[9]);
+            g_state.isteam_utils = get_utils(steamclient, pipe_out, "SteamUtils010");
+            LOGI("Stage2: ISteamClient.GetISteamUtils(SteamUtils010) -> %p",
+                 g_state.isteam_utils);
+
+            // slot 5: GetISteamUser(hUser, hPipe, ver).
+            using GetUserFn = void* (*)(void*, int, int, const char*);
+            auto get_user = reinterpret_cast<GetUserFn>(sc_vt[5]);
+            g_state.isteam_user = get_user(steamclient, user_h, pipe_out,
+                                           "SteamUser023");
+            LOGI("Stage2: ISteamClient.GetISteamUser(SteamUser023) -> %p",
+                 g_state.isteam_user);
+
+            // slot 13: GetISteamUserStats(hUser, hPipe, ver).
+            using GetStatsFn = void* (*)(void*, int, int, const char*);
+            auto get_stats = reinterpret_cast<GetStatsFn>(sc_vt[13]);
+            g_state.isteam_userstats = get_stats(
+                steamclient, user_h, pipe_out,
+                "STEAMUSERSTATS_INTERFACE_VERSION013");
+            LOGI("Stage2: ISteamClient.GetISteamUserStats(v013) -> %p",
+                 g_state.isteam_userstats);
+
+            // slot 14: GetISteamApps(hUser, hPipe, ver). Probe each registered
+            // version — the string being IN the binary doesn't mean
+            // GetISteamApps internally accepts that exact value.
+            using GetAppsFn = void* (*)(void*, int, int, const char*);
+            auto get_apps = reinterpret_cast<GetAppsFn>(sc_vt[14]);
+            // Break on first non-null — same safety as Friends below
+            // (libsteamclient.so can SIGSEGV on later version strings
+            // when an earlier one already succeeded).
+            for (const char* v : {"STEAMAPPS_INTERFACE_VERSION009",
+                                  "STEAMAPPS_INTERFACE_VERSION008",
+                                  "STEAMAPPS_INTERFACE_VERSION007"}) {
+                void* o = get_apps(steamclient, user_h, pipe_out, v);
+                LOGI("Stage2:   GetISteamApps(\"%s\") -> %p", v, o);
+                if (o) {
+                    g_state.isteam_apps     = o;
+                    g_state.isteam_apps_ver = v;
+                    break;
+                }
+            }
+            LOGI("Stage2: ISteamClient.GetISteamApps WINNER -> %p ver=%s",
+                 g_state.isteam_apps,
+                 g_state.isteam_apps_ver ? g_state.isteam_apps_ver : "(none)");
+
+            // slot 16: GetISteamRemoteStorage(hUser, hPipe, ver). Probe versions.
+            using GetRSFn = void* (*)(void*, int, int, const char*);
+            auto get_rs = reinterpret_cast<GetRSFn>(sc_vt[16]);
+            // Break on first non-null — same safety as Friends / Apps.
+            for (const char* v : {"STEAMREMOTESTORAGE_INTERFACE_VERSION016",
+                                  "STEAMREMOTESTORAGE_INTERFACE_VERSION014"}) {
+                void* o = get_rs(steamclient, user_h, pipe_out, v);
+                LOGI("Stage2:   GetISteamRemoteStorage(\"%s\") -> %p", v, o);
+                if (o) {
+                    g_state.isteam_remotestorage = o;
+                    g_state.isteam_rs_ver        = v;
+                    break;
+                }
+            }
+            LOGI("Stage2: ISteamClient.GetISteamRemoteStorage WINNER -> %p ver=%s",
+                 g_state.isteam_remotestorage,
+                 g_state.isteam_rs_ver ? g_state.isteam_rs_ver : "(none)");
+
+            // slot 8: GetISteamFriends(hUser, hPipe, ver). Probe versions —
+            // the public SDK ships "SteamFriends017" / "SteamFriends018" /
+            // "SteamFriends015" historically; libsteamclient.so may accept
+            // any subset. Slot-8-from-SteamClient020 is stable across our
+            // builds (the smoke test's prior runs confirmed the documented
+            // SDK method order on User/Utils/Apps/RemoteStorage/UserStats).
+            using GetFriendsFn = void* (*)(void*, int, int, const char*);
+            auto get_friends = reinterpret_cast<GetFriendsFn>(sc_vt[8]);
+            // BREAK ON FIRST NON-NULL — libsteamclient.so SIGSEGVs on
+            // *some* version strings when a logon HAS succeeded (the
+            // empty/null-return path on a failed logon is safe; the
+            // post-logon path crashes deep in the library trying to
+            // re-allocate friend lists for an older protocol). Observed
+            // 2026-05-19 21:09:41 — bootstrap got OK logon on a fresh
+            // account (account=maxjividen, steamId=76561198448983170,
+            // EResult OK), then crashed on SteamFriends014 even though
+            // 017 (the modern current version) had already returned a
+            // valid non-null pointer. SteamFriends017 has been the
+            // current SDK version for ~7 years; it's effectively
+            // universal in any libsteamclient.so we'd ever bundle.
+            for (const char* v : {"SteamFriends017",
+                                  "SteamFriends018",
+                                  "SteamFriends015"}) {
+                void* o = get_friends(steamclient, user_h, pipe_out, v);
+                LOGI("Stage2:   GetISteamFriends(\"%s\") -> %p", v, o);
+                if (o) {
+                    g_state.isteam_friends     = o;
+                    g_state.isteam_friends_ver = v;
+                    break;
+                }
+            }
+            LOGI("Stage2: ISteamClient.GetISteamFriends WINNER -> %p ver=%s",
+                 g_state.isteam_friends,
+                 g_state.isteam_friends_ver ? g_state.isteam_friends_ver : "(none)");
+
+            // CRITICAL — when logon FAILED, libsteamclient.so can still
+            // return a non-null ISteamUserStats from CreateInterface, but
+            // its vtable methods reference uninitialized memory and
+            // SIGSEGV when called. Apps + RemoteStorage correctly return
+            // null on auth-failure (we observed that in the
+            // 9329ecf/0b2048a tests), but UserStats does NOT — it
+            // instantiates half-baked. Diagnosed 2026-05-19 from a
+            // HybridModeReceiver `op=state` query crash at
+            // HybridModeReceiver.onReceive line 589 (listAchievements
+            // call) after a successful nativeInit on a rate-limited
+            // logon (EResult=15). Null out the cached pointer here so
+            // every downstream JNI accessor's `if (!g_state.isteam_userstats)`
+            // guard correctly short-circuits.
+            if (!logged_on && g_state.isteam_userstats) {
+                LOGW("Stage2: NULLING isteam_userstats (got non-null %p but "
+                     "logon failed — half-baked iface would SIGSEGV)",
+                     g_state.isteam_userstats);
+                g_state.isteam_userstats = nullptr;
+            }
+            // NOTE 2026-05-19: with the open-source libsteamclient.so
+            // (wn-libsteamclient), the previous appId==0 null-out is
+            // intentionally removed. Our stub's GetNumAchievements /
+            // RequestCurrentStats / etc safely read pushed-state and
+            // never SIGSEGV — they return 0 / false / empty until
+            // Kotlin pushes a real schema for the bound game. The
+            // original null-out defended against the *prebuilt* binary
+            // crashing deep inside its CMsgClientGetUserStats stash;
+            // that crash is impossible against our implementation, so
+            // keeping the null-out silently kills every ISteamUserStats
+            // accessor in prewarm/library mode (verified 23:34 — a
+            // schema push of 3 entries via JNI was correctly stored
+            // but `bs.numAchievements()` returned 0 because the
+            // bootstrap had nulled isteam_userstats).
+
+            // Foundation self-tests through the cached public-API pointers.
+            // These run on EVERY nativeInit so every successful logon
+            // verifies the JNI accessors before any caller depends on them.
+            // Slot numbers are the Steamworks SDK's documented method order;
+            // the smoke test (above) already proved ISteamClient020 uses
+            // that order, so the sub-interfaces are expected to too.
+            //
+            // ISteamApps.BIsSubscribedApp (slot 6) — auth-gated (false
+            // before logon). The JNI accessor reuses this cached pointer.
+            if (g_state.isteam_apps) {
+                long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+                using BIsSubAppFn = bool (*)(void*, unsigned int);
+                auto is_sub_app = reinterpret_cast<BIsSubAppFn>(apps_vt[6]);
+                // Probe the caller-supplied appId (jappId > 0 case);
+                // when 0, fall back to The Forest as a sanity check
+                // (BIsSubscribedApp works for ANY app, not just the
+                // SteamAppId-bound one — so a non-bound probe still
+                // tells us if ISteamApps itself is functional).
+                const unsigned probe = jappId > 0
+                    ? static_cast<unsigned>(jappId)
+                    : 242760u;
+                bool owns = is_sub_app(g_state.isteam_apps, probe);
+                LOGI("Stage2: ISteamApps.BIsSubscribedApp(%u) = %d", probe, owns ? 1 : 0);
+            }
+            // ISteamUser.GetSteamID (slot 2 in SteamUser023). Returns a
+            // 64-bit CSteamID; auth-gated like BIsSubscribedApp. Comparing
+            // against the steamId64 passed by Kotlin (PrefManager) is the
+            // strongest cross-check that the bootstrap is authenticated
+            // as the SAME account as the wn-steam-client session.
+            if (g_state.isteam_user) {
+                long* u_vt = *reinterpret_cast<long**>(g_state.isteam_user);
+                using GetSteamIDFn = uint64_t (*)(void*);
+                auto get_sid = reinterpret_cast<GetSteamIDFn>(u_vt[2]);
+                uint64_t live_sid = get_sid(g_state.isteam_user);
+                LOGI("Stage2: ISteamUser.GetSteamID() = %llu (prefmgr=%llu, "
+                     "match=%d)",
+                     static_cast<unsigned long long>(live_sid),
+                     static_cast<unsigned long long>(g_state.cached_steam_id),
+                     live_sid == g_state.cached_steam_id ? 1 : 0);
+            }
+            // ISteamUtils.GetAppID (slot 9 in SteamUtils010). Reads the
+            // ENV the bootstrap set (SteamAppId=242760 today). Confirms
+            // the SteamAppId env propagated into libsteamclient.so's
+            // process state. Not auth-gated.
+            if (g_state.isteam_utils) {
+                long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+                using GetAppIDFn = uint32_t (*)(void*);
+                auto get_app_id = reinterpret_cast<GetAppIDFn>(utils_vt[9]);
+                uint32_t live_app = get_app_id(g_state.isteam_utils);
+                LOGI("Stage2: ISteamUtils.GetAppID() = %u", live_app);
+            }
+            // ISteamFriends readouts — slot map from public SDK:
+            //   slot 0  GetPersonaName()        → const char*
+            //   slot 2  GetPersonaState()       → int (EPersonaState)
+            //   slot 3  GetFriendCount(flags)   → int   (0x4 = immediate friends)
+            // Auth-gated through the cached pointer.
+            if (g_state.isteam_friends) {
+                long* fr_vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+                using NameFn  = const char* (*)(void*);
+                using StateFn = int (*)(void*);
+                using CountFn = int (*)(void*, int);
+                auto get_name  = reinterpret_cast<NameFn>(fr_vt[0]);
+                auto get_state = reinterpret_cast<StateFn>(fr_vt[2]);
+                auto get_count = reinterpret_cast<CountFn>(fr_vt[3]);
+                const char* name = get_name(g_state.isteam_friends);
+                int         st   = get_state(g_state.isteam_friends);
+                int         fcount = get_count(g_state.isteam_friends, 0x4);
+                LOGI("Stage2: ISteamFriends.GetPersonaName=\"%s\" "
+                     "GetPersonaState=%d GetFriendCount(immediate)=%d",
+                     name ? name : "(null)", st, fcount);
+            }
+            // ISteamRemoteStorage readouts — slot map from the documented
+            // Steamworks SDK (STEAMREMOTESTORAGE_INTERFACE_VERSION016
+            // method order, no virtual destructor): slot 18 GetFileCount,
+            // slot 20 GetQuota(uint64*, uint64*), slot 21
+            // IsCloudEnabledForAccount, slot 22 IsCloudEnabledForApp.
+            // All auth-gated — the cached pointer is null before logon.
+            if (g_state.isteam_remotestorage) {
+                long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+                using GetCountFn   = int  (*)(void*);
+                using GetQuotaFn   = void (*)(void*, uint64_t*, uint64_t*);
+                using CloudAcctFn  = bool (*)(void*);
+                using CloudAppFn   = bool (*)(void*);
+                auto get_count    = reinterpret_cast<GetCountFn>(rs_vt[18]);
+                auto get_quota    = reinterpret_cast<GetQuotaFn>(rs_vt[20]);
+                auto cloud_acct   = reinterpret_cast<CloudAcctFn>(rs_vt[21]);
+                auto cloud_app    = reinterpret_cast<CloudAppFn>(rs_vt[22]);
+                int files = get_count(g_state.isteam_remotestorage);
+                uint64_t total = 0, avail = 0;
+                get_quota(g_state.isteam_remotestorage, &total, &avail);
+                bool on_acct = cloud_acct(g_state.isteam_remotestorage);
+                bool on_app  = cloud_app(g_state.isteam_remotestorage);
+                LOGI("Stage2: ISteamRemoteStorage cloud_account=%d cloud_app=%d "
+                     "file_count=%d quota_total=%llu avail=%llu",
+                     on_acct ? 1 : 0, on_app ? 1 : 0, files,
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(avail));
+            }
+            // ISteamUserStats013 — kick RequestCurrentStats then await
+            // UserStatsReceived_t (callback id 1101) through the proper
+            // callback bridge. Subscribe BEFORE the call so we don't
+            // race a fast arrival. Bridge captures the payload in the
+            // pump thread; we condvar-wait up to 3s. Achievement
+            // accessors return real data immediately after.
+            //
+            // GUARDED by logged_on: on logon failure libsteamclient.so
+            // can instantiate a HALF-BAKED ISteamUserStats interface
+            // whose vtable methods SIGSEGV when called (observed
+            // 2026-05-19 — nativeInit+8540 crash on a takeover that
+            // failed its LogonWithRefreshToken with EResult=15). The
+            // accessor block above the cache-populate logs logged_on
+            // explicitly so callers can correlate the skip with the
+            // failed logon.
+            if (g_state.isteam_userstats && logged_on) {
+                long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+                using ReqFn       = bool     (*)(void*);
+                using GetNumAchFn = uint32_t (*)(void*);
+                auto req_stats = reinterpret_cast<ReqFn>(us_vt[0]);
+                auto get_n     = reinterpret_cast<GetNumAchFn>(us_vt[14]);
+                constexpr int kUserStatsReceived = 1101;
+                g_state.subscribed_ids.insert(kUserStatsReceived);
+                g_state.received_callbacks.erase(kUserStatsReceived);
+                bool req_ok = req_stats(g_state.isteam_userstats);
+                LOGI("Stage2: ISteamUserStats.RequestCurrentStats() = %d",
+                     req_ok ? 1 : 0);
+                // Wait up to 3s for the callback to land. cv_callback.
+                // wait_until releases the mutex during the wait so the
+                // pump thread can take it briefly to record the payload.
+                // Uses the same `lk` the function-level unique_lock owns
+                // — no second handle needed, no double-unlock at scope exit.
+                auto deadline = std::chrono::steady_clock::now()
+                              + std::chrono::seconds(3);
+                g_state.cv_callback.wait_until(lk, deadline, [&] {
+                    return g_state.received_callbacks.count(kUserStatsReceived) > 0;
+                });
+                uint32_t n = get_n(g_state.isteam_userstats);
+                LOGI("Stage2: ISteamUserStats.GetNumAchievements() = %u "
+                     "(UserStatsReceived_t %s)",
+                     n,
+                     g_state.received_callbacks.count(kUserStatsReceived)
+                         ? "arrived" : "TIMEOUT");
+            }
+        }
     }
 
     return 0;
@@ -613,15 +1203,985 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeIsLog
         ? JNI_TRUE : JNI_FALSE;
 }
 
-// SteamID64 is set by the launcher during init; we don't currently query
-// libsteamclient.so for it after the fact (the IClientUser path would
-// be additional vtable RE). Return the cached value if we have one.
+// SteamID64 is captured at nativeInit (passed by Kotlin from
+// PrefManager.steamId64). Returned synchronously from the cache so this
+// is safe from any thread. Reset to 0 by nativeShutdown.
 JNIEXPORT jlong JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeGetSteamId(
         JNIEnv* /*env*/, jclass /*cls*/) {
     std::lock_guard<std::mutex> lk(g_state.mu);
-    // We don't cache steamId yet; return 0. Kotlin can read from PrefManager.
-    return 0;
+    if (!g_state.initialized) return 0;
+    return static_cast<jlong>(g_state.cached_steam_id);
+}
+
+// HYBRID STAGE-2 — first real backend method routed through the public
+// ISteamApps interface. Returns true iff the logged-on account owns
+// the given app. Returns false (with a log line) when the session isn't
+// authenticated or ISteamApps couldn't be obtained — never throws.
+//
+// ISteamApps vtable slot 6 = BIsSubscribedApp(AppId_t) per the
+// documented Steamworks SDK (ISteamApps009). The cached pointer comes
+// from CreateInterface(SteamClient020).GetISteamApps(<probed-ver>) in
+// nativeInit; we re-resolve the slot per call (the vtable address might
+// rebase across a libsteamclient.so reload).
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeBIsSubscribedApp(
+        JNIEnv* /*env*/, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized) {
+        LOGW("nativeBIsSubscribedApp(%d): not initialized", appId);
+        return JNI_FALSE;
+    }
+    if (!g_state.isteam_apps) {
+        LOGW("nativeBIsSubscribedApp(%d): ISteamApps not cached "
+             "(auth-gated — needs a logged-on session)", appId);
+        return JNI_FALSE;
+    }
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using BIsSubAppFn = bool (*)(void*, unsigned int);
+    auto is_sub_app = reinterpret_cast<BIsSubAppFn>(apps_vt[6]);
+    const bool owns = is_sub_app(g_state.isteam_apps,
+                                 static_cast<unsigned int>(appId));
+    return owns ? JNI_TRUE : JNI_FALSE;
+}
+
+// HYBRID STAGE-2 — ISteamApps009 install-state surface. Slot map
+// (documented SDK, STEAMAPPS_INTERFACE_VERSION009):
+//   slot  4  GetCurrentGameLanguage()                 → const char*
+//   slot 17  GetInstalledDepots(app, depots[], max)   → uint32 (count)
+//   slot 18  GetAppInstallDir(app, buf, n)            → uint32 (chars)
+//   slot 19  BIsAppInstalled(app)                     → bool
+//   slot 20  GetAppOwner()                            → CSteamID (uint64)
+// All auth-gated through the cached ISteamApps pointer.
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsBIsAppInstalled(
+        JNIEnv* /*env*/, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return JNI_FALSE;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using BIsInstFn = bool (*)(void*, unsigned int);
+    auto is_inst = reinterpret_cast<BIsInstFn>(apps_vt[19]);
+    return is_inst(g_state.isteam_apps,
+                   static_cast<unsigned int>(appId)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetAppInstallDir(
+        JNIEnv* env, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return nullptr;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using GetDirFn = uint32_t (*)(void*, unsigned int, char*, uint32_t);
+    auto get_dir = reinterpret_cast<GetDirFn>(apps_vt[18]);
+    char buf[1024] = {0};
+    uint32_t n = get_dir(g_state.isteam_apps,
+                         static_cast<unsigned int>(appId),
+                         buf, sizeof(buf));
+    if (n == 0) return nullptr;
+    return env->NewStringUTF(buf);
+}
+
+// Returns int[] of installed depot IDs for the given app; empty if no
+// depots or auth failure. Caps at 64 depots which is well beyond what
+// even the largest titles ship with.
+JNIEXPORT jintArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetInstalledDepots(
+        JNIEnv* env, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return env->NewIntArray(0);
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using GetDepFn = uint32_t (*)(void*, unsigned int, unsigned int*, uint32_t);
+    auto get_dep = reinterpret_cast<GetDepFn>(apps_vt[17]);
+    unsigned int depots[64] = {0};
+    uint32_t n = get_dep(g_state.isteam_apps,
+                         static_cast<unsigned int>(appId),
+                         depots, 64);
+    if (n > 64) n = 64;
+    jintArray out = env->NewIntArray(static_cast<jsize>(n));
+    if (!out) return nullptr;
+    if (n > 0) {
+        // Reinterpret unsigned[]→jint[] in place; the bit pattern is
+        // identical for DepotId_t values (always < 2^31 in practice).
+        env->SetIntArrayRegion(out, 0, static_cast<jsize>(n),
+                               reinterpret_cast<const jint*>(depots));
+    }
+    return out;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetCurrentGameLanguage(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return nullptr;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using GetLangFn = const char* (*)(void*);
+    auto get_lang = reinterpret_cast<GetLangFn>(apps_vt[4]);
+    const char* v = get_lang(g_state.isteam_apps);
+    return (v && *v) ? env->NewStringUTF(v) : nullptr;
+}
+
+// HYBRID STAGE-2 — ISteamApps009 per-app metadata (sync, auth-gated).
+//   slot  7  BIsDlcInstalled(dlcAppId)        → bool
+//   slot  8  GetEarliestPurchaseUnixTime(app) → uint32 (0 if not owned)
+//   slot 10  GetDLCCount(app)                 → int
+//   slot 20  GetAppOwner()                    → uint64 CSteamID (original
+//                                                owner; differs from current
+//                                                user under family sharing)
+//   slot 27  BIsSubscribedFromFamilySharing() → bool
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsBIsDlcInstalled(
+        JNIEnv* /*env*/, jclass /*cls*/, jint dlcAppId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return JNI_FALSE;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using DlcInstFn = bool (*)(void*, unsigned int);
+    auto dlc_inst = reinterpret_cast<DlcInstFn>(apps_vt[7]);
+    return dlc_inst(g_state.isteam_apps,
+                    static_cast<unsigned int>(dlcAppId)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetEarliestPurchaseUnixTime(
+        JNIEnv* /*env*/, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return 0;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using PurchaseFn = uint32_t (*)(void*, unsigned int);
+    auto purchase = reinterpret_cast<PurchaseFn>(apps_vt[8]);
+    return static_cast<jint>(purchase(g_state.isteam_apps,
+                                      static_cast<unsigned int>(appId)));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetDLCCount(
+        JNIEnv* /*env*/, jclass /*cls*/, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return 0;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using DlcCountFn = int (*)(void*, unsigned int);
+    auto dlc_count = reinterpret_cast<DlcCountFn>(apps_vt[10]);
+    return static_cast<jint>(dlc_count(g_state.isteam_apps,
+                                       static_cast<unsigned int>(appId)));
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetAppOwner(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return 0;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using GetOwnerFn = uint64_t (*)(void*);
+    auto get_owner = reinterpret_cast<GetOwnerFn>(apps_vt[20]);
+    return static_cast<jlong>(get_owner(g_state.isteam_apps));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsBIsSubscribedFromFamilySharing(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return JNI_FALSE;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using FamShareFn = bool (*)(void*);
+    auto fam_share = reinterpret_cast<FamShareFn>(apps_vt[27]);
+    return fam_share(g_state.isteam_apps) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Slot 23 — GetAppBuildId. Reads the bound app's PICS public-branch
+// buildid through the open-source libsteamclient.so's vtable. 0 when
+// no app is bound / no PICS data has been pushed for the bound app.
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamAppsGetAppBuildId(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_apps) return 0;
+    long* apps_vt = *reinterpret_cast<long**>(g_state.isteam_apps);
+    using BuildIdFn = int (*)(void*);
+    auto build_id = reinterpret_cast<BuildIdFn>(apps_vt[23]);
+    return static_cast<jint>(build_id(g_state.isteam_apps));
+}
+
+// HYBRID STAGE-2 — ISteamUser BLoggedOn + license check.
+//   slot  1  BLoggedOn() → bool   (vs flat Steam_BLoggedOn — same answer
+//                                  but routed through the public iface;
+//                                  useful as a separate sanity check)
+//   slot 18  UserHasLicenseForApp(steamID, appID) → int (EUserHasLicense)
+//            0=ok, 1=does-not-have, 2=no-auth-issued. Replaces
+//            wn-steam-client's getLicenseList membership lookup.
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserBLoggedOn(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_user) return JNI_FALSE;
+    long* u_vt = *reinterpret_cast<long**>(g_state.isteam_user);
+    using BLoggedFn = bool (*)(void*);
+    auto bl = reinterpret_cast<BLoggedFn>(u_vt[1]);
+    return bl(g_state.isteam_user) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserHasLicenseForApp(
+        JNIEnv* /*env*/, jclass /*cls*/, jlong steamId64, jint appId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_user) return 2; // no-auth
+    long* u_vt = *reinterpret_cast<long**>(g_state.isteam_user);
+    using HasLicFn = int (*)(void*, uint64_t, unsigned int);
+    auto hl = reinterpret_cast<HasLicFn>(u_vt[18]);
+    return static_cast<jint>(hl(g_state.isteam_user,
+                                static_cast<uint64_t>(steamId64),
+                                static_cast<unsigned int>(appId)));
+}
+
+// HYBRID STAGE-2 — bootstrap's view of the SteamID via ISteamUser.GetSteamID
+// (vtable slot 2 of SteamUser023). Auth-gated: returns 0 when ISteamUser
+// isn't cached (session not logged on at nativeInit time) OR when the
+// SDK call itself returns 0. Comparing this against PrefManager.steamId64
+// is the strongest cross-check that the bootstrap is authenticated as
+// the same account as the wn-steam-client CM session.
+JNIEXPORT jlong JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserGetSteamID(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_user) return 0;
+    long* u_vt = *reinterpret_cast<long**>(g_state.isteam_user);
+    using GetSteamIDFn = uint64_t (*)(void*);
+    auto get_sid = reinterpret_cast<GetSteamIDFn>(u_vt[2]);
+    return static_cast<jlong>(get_sid(g_state.isteam_user));
+}
+
+// HYBRID STAGE-2 — the AppID libsteamclient.so is currently scoped to,
+// via ISteamUtils.GetAppID (vtable slot 9 of SteamUtils010). Reads the
+// SteamAppId env we set before dlopen (or whatever app context the
+// session bound to). Not auth-gated — ISteamUtils instantiates at pipe
+// level and is cached unconditionally. Returns 0 only if ISteamUtils
+// wasn't cached at all (catastrophic).
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetAppID(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils) return 0;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using GetAppIDFn = uint32_t (*)(void*);
+    auto get_app_id = reinterpret_cast<GetAppIDFn>(utils_vt[9]);
+    return static_cast<jint>(get_app_id(g_state.isteam_utils));
+}
+
+// HYBRID STAGE-2 — ISteamUtils auth-FREE accessors (work even without
+// a logged-on session — ISteamUtils is pipe-only, no user-handle):
+//   slot  3  GetServerRealTime()         → uint32 (Steam-side unix epoch)
+//   slot  4  GetIPCountry()              → const char* (ISO 3166-1 alpha-2)
+//   slot  5  GetImageSize(h, &w, &h)     → bool
+//   slot  6  GetImageRGBA(h, dst, n)     → bool (RGBA8888 pixel array)
+//   slot  8  GetCurrentBatteryPower()    → byte (0..100, 255 = AC power)
+//   slot 23  GetSteamUILanguage()        → const char*
+//
+// These don't require a Steam logon — exercising them is the simplest
+// way to verify the JNI surface end-to-end when Steam's rate-limit is
+// blocking authenticated calls.
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetServerRealTime(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils) return 0;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using TimeFn = uint32_t (*)(void*);
+    auto get_time = reinterpret_cast<TimeFn>(utils_vt[3]);
+    return static_cast<jint>(get_time(g_state.isteam_utils));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetIPCountry(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils) return nullptr;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using CountryFn = const char* (*)(void*);
+    auto get_country = reinterpret_cast<CountryFn>(utils_vt[4]);
+    const char* v = get_country(g_state.isteam_utils);
+    return (v && *v) ? env->NewStringUTF(v) : nullptr;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetSteamUILanguage(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils) return nullptr;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using LangFn = const char* (*)(void*);
+    auto get_lang = reinterpret_cast<LangFn>(utils_vt[23]);
+    const char* v = get_lang(g_state.isteam_utils);
+    return (v && *v) ? env->NewStringUTF(v) : nullptr;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetCurrentBatteryPower(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils) return 255;  // assume AC
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using BatteryFn = uint8_t (*)(void*);
+    auto get_battery = reinterpret_cast<BatteryFn>(utils_vt[8]);
+    return static_cast<jint>(get_battery(g_state.isteam_utils));
+}
+
+// Returns [width, height] of the image at [handle] (a HSteamImage from
+// e.g. GetMediumFriendAvatar or GetAchievementIcon). Both 0 if the
+// handle is invalid or the image isn't loaded yet.
+JNIEXPORT jintArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetImageSize(
+        JNIEnv* env, jclass /*cls*/, jint imageHandle) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    jintArray out = env->NewIntArray(2);
+    if (!out) return nullptr;
+    if (!g_state.initialized || !g_state.isteam_utils || imageHandle <= 0) return out;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using SizeFn = bool (*)(void*, int, uint32_t*, uint32_t*);
+    auto get_size = reinterpret_cast<SizeFn>(utils_vt[5]);
+    uint32_t w = 0, h = 0;
+    if (get_size(g_state.isteam_utils, imageHandle, &w, &h)) {
+        jint values[2] = { static_cast<jint>(w), static_cast<jint>(h) };
+        env->SetIntArrayRegion(out, 0, 2, values);
+    }
+    return out;
+}
+
+// Materialize the RGBA8888 pixels for the image at [handle]. Caller
+// must size [outRgba] to width * height * 4 (from GetImageSize). Returns
+// false if the size doesn't match or the call fails.
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUtilsGetImageRGBA(
+        JNIEnv* env, jclass /*cls*/, jint imageHandle, jbyteArray outRgba) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_utils || !outRgba || imageHandle <= 0) {
+        return JNI_FALSE;
+    }
+    jsize n = env->GetArrayLength(outRgba);
+    if (n <= 0) return JNI_FALSE;
+    long* utils_vt = *reinterpret_cast<long**>(g_state.isteam_utils);
+    using RGBAFn = bool (*)(void*, int, uint8_t*, int);
+    auto get_rgba = reinterpret_cast<RGBAFn>(utils_vt[6]);
+    jbyte* buf = env->GetByteArrayElements(outRgba, nullptr);
+    if (!buf) return JNI_FALSE;
+    bool ok = get_rgba(g_state.isteam_utils, imageHandle,
+                       reinterpret_cast<uint8_t*>(buf), static_cast<int>(n));
+    env->ReleaseByteArrayElements(outRgba, buf, 0);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// HYBRID STAGE-2 — ISteamRemoteStorage readouts. Slot map from the
+// documented Steamworks SDK (REMOTESTORAGE_INTERFACE_VERSION016):
+//   slot 18  GetFileCount() → int32
+//   slot 20  GetQuota(uint64* total, uint64* available)
+//   slot 21  IsCloudEnabledForAccount() → bool
+//   slot 22  IsCloudEnabledForApp() → bool
+// All auth-gated — the cached pointer is null before logon, in which
+// case the accessors return 0/false. Used by the SteamService cloud-sync
+// surface (getCloudFileList / setCloudEnabled) the hybrid backend port
+// will replace wn-steam-client's CM calls with.
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageGetFileCount(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage) return 0;
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using GetCountFn = int (*)(void*);
+    auto get_count = reinterpret_cast<GetCountFn>(rs_vt[18]);
+    return static_cast<jint>(get_count(g_state.isteam_remotestorage));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageIsCloudEnabledForAccount(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage) return JNI_FALSE;
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using CloudFn = bool (*)(void*);
+    auto cloud = reinterpret_cast<CloudFn>(rs_vt[21]);
+    return cloud(g_state.isteam_remotestorage) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageIsCloudEnabledForApp(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage) return JNI_FALSE;
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using CloudFn = bool (*)(void*);
+    auto cloud = reinterpret_cast<CloudFn>(rs_vt[22]);
+    return cloud(g_state.isteam_remotestorage) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Returns a 2-element long[] [totalBytes, availableBytes]; both 0 if
+// the interface isn't cached. The Steamworks SDK signature uses uint64,
+// and Kotlin's `long` is signed 64-bit — values fit because real Steam
+// cloud quotas are well under 2^63.
+JNIEXPORT jlongArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageGetQuota(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    jlongArray out = env->NewLongArray(2);
+    if (!out) return nullptr;
+    if (g_state.initialized && g_state.isteam_remotestorage) {
+        long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+        using GetQuotaFn = void (*)(void*, uint64_t*, uint64_t*);
+        auto get_quota = reinterpret_cast<GetQuotaFn>(rs_vt[20]);
+        uint64_t total = 0, avail = 0;
+        get_quota(g_state.isteam_remotestorage, &total, &avail);
+        jlong values[2] = { static_cast<jlong>(total), static_cast<jlong>(avail) };
+        env->SetLongArrayRegion(out, 0, 2, values);
+    }
+    return out;
+}
+
+// HYBRID STAGE-2 — ISteamUserStats013 readouts.
+//   slot  0  RequestCurrentStats() → bool   (kicks async download)
+//   slot 14  GetNumAchievements() → uint32  (valid after the callback)
+// RequestCurrentStats returns true if the call dispatched OK; the result
+// arrives later via the UserStatsReceived_t callback (the bootstrap's
+// callback pump drains it; we don't have a Kotlin-visible callback yet).
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsRequestCurrentStats(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats) return JNI_FALSE;
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using ReqFn = bool (*)(void*);
+    auto req = reinterpret_cast<ReqFn>(us_vt[0]);
+    return req(g_state.isteam_userstats) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetNumAchievements(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats) return 0;
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetNumFn = uint32_t (*)(void*);
+    auto n = reinterpret_cast<GetNumFn>(us_vt[14]);
+    return static_cast<jint>(n(g_state.isteam_userstats));
+}
+
+// HYBRID STAGE-2 — ISteamRemoteStorage cloud surface, write + enumeration.
+// Slot map from REMOTESTORAGE_INTERFACE_VERSION016 (no virtual destructor;
+// the smoke test proved sub-interfaces follow documented method order):
+//   slot  0  FileWrite(name, buf, nBytes)        → bool
+//   slot  1  FileRead (name, buf, nBytesToRead)  → int32 (bytes read)
+//   slot  6  FileDelete(name)                    → bool
+//   slot 13  FileExists(name)                    → bool
+//   slot 15  GetFileSize(name)                   → int32
+//   slot 19  GetFileNameAndSize(idx, &size)      → const char* (binary-owned)
+//   slot 23  SetCloudEnabledForApp(enabled)      → void
+// All auth-gated through the cached ISteamRemoteStorage; accessors return
+// safely (null/false/0) when the interface isn't cached.
+
+// Returns String[] of "name\tsize" entries — packed so a single JNI
+// round-trip yields the full cloud file list. The wn-steam-client's
+// getCloudFileList replacement target.
+JNIEXPORT jobjectArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageListFiles(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    jclass strCls = env->FindClass("java/lang/String");
+    if (!g_state.initialized || !g_state.isteam_remotestorage) {
+        return env->NewObjectArray(0, strCls, nullptr);
+    }
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using GetCountFn = int (*)(void*);
+    using GetNameSizeFn = const char* (*)(void*, int, int32_t*);
+    auto get_count = reinterpret_cast<GetCountFn>(rs_vt[18]);
+    auto get_ns    = reinterpret_cast<GetNameSizeFn>(rs_vt[19]);
+    int n = get_count(g_state.isteam_remotestorage);
+    if (n < 0) n = 0;
+    jobjectArray out = env->NewObjectArray(n, strCls, nullptr);
+    if (!out) return nullptr;
+    for (int i = 0; i < n; ++i) {
+        int32_t size = 0;
+        const char* name = get_ns(g_state.isteam_remotestorage, i, &size);
+        if (!name) name = "";
+        char buf[1024];
+        std::snprintf(buf, sizeof(buf), "%s\t%d", name, size);
+        jstring js = env->NewStringUTF(buf);
+        env->SetObjectArrayElement(out, i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageFileExists(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using ExistsFn = bool (*)(void*, const char*);
+    auto exists = reinterpret_cast<ExistsFn>(rs_vt[13]);
+    return exists(g_state.isteam_remotestorage, name.c_str()) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Reads the named cloud file into a fresh ByteArray. Returns null on any
+// failure path (interface not cached / file not present / size mismatch
+// / read truncation). Synchronous — for large files prefer the FileRead
+// async variants (not yet wired). Uses GetFileSize+FileRead at slots
+// 15+1 per the documented SDK.
+JNIEXPORT jbyteArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageFileRead(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage || !jname) return nullptr;
+    std::string name = jstr(env, jname);
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using GetSizeFn = int32_t (*)(void*, const char*);
+    using FileReadFn = int32_t (*)(void*, const char*, void*, int32_t);
+    auto get_size  = reinterpret_cast<GetSizeFn>(rs_vt[15]);
+    auto file_read = reinterpret_cast<FileReadFn>(rs_vt[1]);
+    int32_t size = get_size(g_state.isteam_remotestorage, name.c_str());
+    if (size <= 0) return nullptr;
+    jbyteArray out = env->NewByteArray(size);
+    if (!out) return nullptr;
+    // Read directly into the array's pinned buffer; avoids a copy compared
+    // to a heap buffer + SetByteArrayRegion. JNI_ABORT on release because
+    // we own the buffer and don't need to write back.
+    jbyte* buf = env->GetByteArrayElements(out, nullptr);
+    if (!buf) return nullptr;
+    int32_t read = file_read(g_state.isteam_remotestorage, name.c_str(),
+                             buf, size);
+    env->ReleaseByteArrayElements(out, buf, 0);
+    if (read != size) {
+        // Truncated read — reject the partial blob rather than handing
+        // back a half-written file. Same policy as the wn-steam-client
+        // cloud downloader (commit 6bbb36e).
+        return nullptr;
+    }
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageFileWrite(
+        JNIEnv* env, jclass /*cls*/, jstring jname, jbyteArray jdata) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage || !jname || !jdata) {
+        return JNI_FALSE;
+    }
+    std::string name = jstr(env, jname);
+    jsize n = env->GetArrayLength(jdata);
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using FileWriteFn = bool (*)(void*, const char*, const void*, int32_t);
+    auto file_write = reinterpret_cast<FileWriteFn>(rs_vt[0]);
+    // GetByteArrayElements pins (or copies) so the .so sees a contiguous
+    // buffer. JNI_ABORT on release: we never modified the array.
+    jbyte* buf = env->GetByteArrayElements(jdata, nullptr);
+    if (!buf) return JNI_FALSE;
+    bool ok = file_write(g_state.isteam_remotestorage, name.c_str(),
+                         buf, static_cast<int32_t>(n));
+    env->ReleaseByteArrayElements(jdata, buf, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageFileDelete(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using DeleteFn = bool (*)(void*, const char*);
+    auto file_del = reinterpret_cast<DeleteFn>(rs_vt[6]);
+    return file_del(g_state.isteam_remotestorage, name.c_str()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamRemoteStorageSetCloudEnabledForApp(
+        JNIEnv* /*env*/, jclass /*cls*/, jboolean enabled) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_remotestorage) return;
+    long* rs_vt = *reinterpret_cast<long**>(g_state.isteam_remotestorage);
+    using SetEnabledFn = void (*)(void*, bool);
+    auto set_en = reinterpret_cast<SetEnabledFn>(rs_vt[23]);
+    set_en(g_state.isteam_remotestorage, enabled == JNI_TRUE);
+}
+
+// HYBRID STAGE-2 — ISteamUserStats013 achievement surface.
+// Slot map from STEAMUSERSTATS_INTERFACE_VERSION013 (documented SDK
+// method order, no virtual destructor — same convention proven by the
+// earlier slot probes):
+//   slot  6  GetAchievement(name, &achieved)                 → bool
+//   slot  7  SetAchievement(name)                            → bool
+//   slot  8  ClearAchievement(name)                          → bool
+//   slot  9  GetAchievementAndUnlockTime(name, &ach, &unlt)  → bool
+//   slot 10  StoreStats()                                    → bool
+//   slot 11  GetAchievementIcon(name)                        → int (handle)
+//   slot 12  GetAchievementDisplayAttribute(name, key)       → const char*
+//   slot 15  GetAchievementName(index)                       → const char*
+// All auth-gated through the cached ISteamUserStats; valid data only
+// after RequestCurrentStats (slot 0) lands its UserStatsReceived_t
+// callback — callers that read pre-callback will see empty/false/0.
+
+// Returns String[] of achievement API names by walking
+// GetNumAchievements + GetAchievementName per index. Packs the full
+// schema list in one JNI round-trip. Empty array when the schema
+// hasn't arrived yet (RequestCurrentStats callback pending) or the
+// session isn't authenticated.
+JNIEXPORT jobjectArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsListAchievements(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    jclass strCls = env->FindClass("java/lang/String");
+    if (!g_state.initialized || !g_state.isteam_userstats) {
+        return env->NewObjectArray(0, strCls, nullptr);
+    }
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetNumFn  = uint32_t (*)(void*);
+    using GetNameFn = const char* (*)(void*, uint32_t);
+    auto get_n    = reinterpret_cast<GetNumFn>(us_vt[14]);
+    auto get_name = reinterpret_cast<GetNameFn>(us_vt[15]);
+    uint32_t n = get_n(g_state.isteam_userstats);
+    jobjectArray out = env->NewObjectArray(static_cast<jsize>(n), strCls, nullptr);
+    if (!out) return nullptr;
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* name = get_name(g_state.isteam_userstats, i);
+        if (!name) name = "";
+        jstring js = env->NewStringUTF(name);
+        env->SetObjectArrayElement(out, static_cast<jsize>(i), js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+}
+
+// Returns [achieved (0/1), unlockTimeRtime32] — both 0 if the call
+// itself failed or the achievement is unlocked. Packs slot-9's two
+// out-params; saves a second JNI round-trip vs separate getters.
+JNIEXPORT jintArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetAchievementAndUnlockTime(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    jintArray out = env->NewIntArray(2);
+    if (!out) return nullptr;
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return out;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetAchUtFn = bool (*)(void*, const char*, bool*, uint32_t*);
+    auto get_aut = reinterpret_cast<GetAchUtFn>(us_vt[9]);
+    bool achieved = false;
+    uint32_t unlock_time = 0;
+    bool ok = get_aut(g_state.isteam_userstats, name.c_str(),
+                      &achieved, &unlock_time);
+    if (!ok) return out;
+    jint values[2] = { achieved ? 1 : 0, static_cast<jint>(unlock_time) };
+    env->SetIntArrayRegion(out, 0, 2, values);
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsSetAchievement(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using SetAchFn = bool (*)(void*, const char*);
+    auto set_ach = reinterpret_cast<SetAchFn>(us_vt[7]);
+    return set_ach(g_state.isteam_userstats, name.c_str()) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsClearAchievement(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using ClrAchFn = bool (*)(void*, const char*);
+    auto clr_ach = reinterpret_cast<ClrAchFn>(us_vt[8]);
+    return clr_ach(g_state.isteam_userstats, name.c_str()) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Flushes pending stat/achievement writes. Steam batches Set* until
+// StoreStats() is called — same as the public SDK requires. Returns
+// true if the call dispatched; the result of the actual server commit
+// arrives later via the UserStatsStored_t callback.
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsStoreStats(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats) return JNI_FALSE;
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using StoreFn = bool (*)(void*);
+    auto store = reinterpret_cast<StoreFn>(us_vt[10]);
+    return store(g_state.isteam_userstats) ? JNI_TRUE : JNI_FALSE;
+}
+
+// HYBRID STAGE-2 — ISteamUserStats013 stat read/write surface.
+//   slot  1  GetStat(name, int32* out)            → bool
+//   slot  2  GetStat(name, float* out)            → bool
+//   slot  3  SetStat(name, int32 data)            → bool
+//   slot  4  SetStat(name, float data)            → bool
+//   slot  5  UpdateAvgRateStat(name, count, sec)  → bool
+// Steam stats live alongside achievements in the per-app schema —
+// these complete the storeUserStats hybrid path (achievement writes
+// committed in 213f20c; stat writes are this commit). Pair with
+// StoreStats() (slot 10) for the actual server commit.
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetStatInt(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return 0;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetStatIFn = bool (*)(void*, const char*, int32_t*);
+    auto get_stat = reinterpret_cast<GetStatIFn>(us_vt[1]);
+    int32_t data = 0;
+    if (!get_stat(g_state.isteam_userstats, name.c_str(), &data)) return 0;
+    return static_cast<jint>(data);
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetStatFloat(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return 0.0f;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetStatFFn = bool (*)(void*, const char*, float*);
+    auto get_stat = reinterpret_cast<GetStatFFn>(us_vt[2]);
+    float data = 0.0f;
+    if (!get_stat(g_state.isteam_userstats, name.c_str(), &data)) return 0.0f;
+    return static_cast<jfloat>(data);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsSetStatInt(
+        JNIEnv* env, jclass /*cls*/, jstring jname, jint jdata) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using SetStatIFn = bool (*)(void*, const char*, int32_t);
+    auto set_stat = reinterpret_cast<SetStatIFn>(us_vt[3]);
+    return set_stat(g_state.isteam_userstats, name.c_str(),
+                    static_cast<int32_t>(jdata)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsSetStatFloat(
+        JNIEnv* env, jclass /*cls*/, jstring jname, jfloat jdata) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using SetStatFFn = bool (*)(void*, const char*, float);
+    auto set_stat = reinterpret_cast<SetStatFFn>(us_vt[4]);
+    return set_stat(g_state.isteam_userstats, name.c_str(),
+                    static_cast<float>(jdata)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsUpdateAvgRateStat(
+        JNIEnv* env, jclass /*cls*/, jstring jname,
+        jfloat jcountThisSession, jdouble jsessionLength) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return JNI_FALSE;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using UpdateRateFn = bool (*)(void*, const char*, float, double);
+    auto upd = reinterpret_cast<UpdateRateFn>(us_vt[5]);
+    return upd(g_state.isteam_userstats, name.c_str(),
+               static_cast<float>(jcountThisSession),
+               static_cast<double>(jsessionLength)) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Reads achievement-schema display strings: "name" (localized title),
+// "desc" (description), "hidden" ("0"/"1"). The Goldberg achievements.json
+// fields ([[project_wnsteam_userstats_achievements]]) map 1:1 onto these
+// keys. Returns null when the schema isn't ready or the key doesn't
+// exist. Owned by libsteamclient.so — don't free.
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetAchievementDisplayAttribute(
+        JNIEnv* env, jclass /*cls*/, jstring jname, jstring jkey) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname || !jkey) return nullptr;
+    std::string name = jstr(env, jname);
+    std::string key  = jstr(env, jkey);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using GetAttrFn = const char* (*)(void*, const char*, const char*);
+    auto get_attr = reinterpret_cast<GetAttrFn>(us_vt[12]);
+    const char* v = get_attr(g_state.isteam_userstats, name.c_str(), key.c_str());
+    if (!v || !*v) return nullptr;
+    return env->NewStringUTF(v);
+}
+
+// Returns the icon image handle (a pre-cached HImage suitable for
+// ISteamUtils.GetImageRGBA / GetImageSize). 0 when the icon isn't
+// pre-fetched yet or the achievement is unknown.
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamUserStatsGetAchievementIcon(
+        JNIEnv* env, jclass /*cls*/, jstring jname) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_userstats || !jname) return 0;
+    std::string name = jstr(env, jname);
+    long* us_vt = *reinterpret_cast<long**>(g_state.isteam_userstats);
+    using IconFn = int (*)(void*, const char*);
+    auto icon = reinterpret_cast<IconFn>(us_vt[11]);
+    return static_cast<jint>(icon(g_state.isteam_userstats, name.c_str()));
+}
+
+// HYBRID STAGE-2 — ISteamFriends persona/friends surface. Slot map
+// from the public SDK (SteamFriends017 — no virtual destructor; the
+// SteamClient020 sub-interface order proven across the other ifaces):
+//   slot 0  GetPersonaName()         → const char*
+//   slot 1  SetPersonaName(name)     → SteamAPICall_t (async)
+//   slot 2  GetPersonaState()        → int (EPersonaState 0..7)
+//   slot 3  GetFriendCount(flags)    → int
+//   slot 4  GetFriendByIndex(i, fl)  → uint64 (CSteamID)
+//   slot 6  GetFriendPersonaState(s) → int
+//   slot 7  GetFriendPersonaName(s)  → const char*
+//   slot 10 GetFriendSteamLevel(s)   → int
+// All auth-gated. SetPersonaName returns a SteamAPICall_t handle; the
+// result lands later via PersonaStateChange_t (callback id 304) — the
+// callback bridge can sync-wait if needed.
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsGetPersonaName(
+        JNIEnv* env, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return nullptr;
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using NameFn = const char* (*)(void*);
+    auto get_name = reinterpret_cast<NameFn>(vt[0]);
+    const char* n = get_name(g_state.isteam_friends);
+    return (n && *n) ? env->NewStringUTF(n) : nullptr;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsGetPersonaState(
+        JNIEnv* /*env*/, jclass /*cls*/) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return 0;  // 0=Offline
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using StateFn = int (*)(void*);
+    auto get_state = reinterpret_cast<StateFn>(vt[2]);
+    return static_cast<jint>(get_state(g_state.isteam_friends));
+}
+
+// flags: EFriendFlags bitmask. 0x4 = immediate friends, 0xFFFF = all
+// relationships. Returns the count of friend entries currently reachable.
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsGetFriendCount(
+        JNIEnv* /*env*/, jclass /*cls*/, jint flags) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return 0;
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using CountFn = int (*)(void*, int);
+    auto get_count = reinterpret_cast<CountFn>(vt[3]);
+    return static_cast<jint>(get_count(g_state.isteam_friends,
+                                       static_cast<int>(flags)));
+}
+
+// Returns long[] of SteamID64 friend ids for [flags]. Empty when no
+// friends visible. One JNI trip for the whole list — walks slot 4
+// GetFriendByIndex per index.
+JNIEXPORT jlongArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsListFriends(
+        JNIEnv* env, jclass /*cls*/, jint flags) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return env->NewLongArray(0);
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using CountFn = int (*)(void*, int);
+    using ByIdxFn = uint64_t (*)(void*, int, int);
+    auto get_count = reinterpret_cast<CountFn>(vt[3]);
+    auto get_byidx = reinterpret_cast<ByIdxFn>(vt[4]);
+    int n = get_count(g_state.isteam_friends, static_cast<int>(flags));
+    if (n < 0) n = 0;
+    jlongArray out = env->NewLongArray(n);
+    if (!out || n == 0) return out;
+    for (int i = 0; i < n; ++i) {
+        uint64_t sid = get_byidx(g_state.isteam_friends, i,
+                                 static_cast<int>(flags));
+        jlong v = static_cast<jlong>(sid);
+        env->SetLongArrayRegion(out, i, 1, &v);
+    }
+    return out;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsGetFriendPersonaName(
+        JNIEnv* env, jclass /*cls*/, jlong steamId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return nullptr;
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using FNameFn = const char* (*)(void*, uint64_t);
+    auto get_fname = reinterpret_cast<FNameFn>(vt[7]);
+    const char* n = get_fname(g_state.isteam_friends,
+                              static_cast<uint64_t>(steamId));
+    return (n && *n) ? env->NewStringUTF(n) : nullptr;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeISteamFriendsGetFriendPersonaState(
+        JNIEnv* /*env*/, jclass /*cls*/, jlong steamId) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    if (!g_state.initialized || !g_state.isteam_friends) return 0;
+    long* vt = *reinterpret_cast<long**>(g_state.isteam_friends);
+    using FStateFn = int (*)(void*, uint64_t);
+    auto get_fstate = reinterpret_cast<FStateFn>(vt[6]);
+    return static_cast<jint>(get_fstate(g_state.isteam_friends,
+                                        static_cast<uint64_t>(steamId)));
+}
+
+// HYBRID STAGE-2 — callback bridge. Lets Kotlin sync-wait for a
+// specific Steam callback id (UserStatsReceived_t=1101,
+// UserStatsStored_t=1102, EncryptedAppTicketResponse_t=154,
+// RemoteStorage*_t in the 1300 range, etc.). Subscription persists
+// across waits so a subsequent op of the same id immediately sees
+// the next payload — call nativeUnsubscribeCallback to stop capturing.
+
+JNIEXPORT void JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeSubscribeCallback(
+        JNIEnv* /*env*/, jclass /*cls*/, jint id) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    g_state.subscribed_ids.insert(static_cast<int>(id));
+}
+
+JNIEXPORT void JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeUnsubscribeCallback(
+        JNIEnv* /*env*/, jclass /*cls*/, jint id) {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    g_state.subscribed_ids.erase(static_cast<int>(id));
+    g_state.received_callbacks.erase(static_cast<int>(id));
+}
+
+// Waits up to timeoutMs for the next instance of the given callback id.
+// Returns the raw payload bytes (consumed: the slot is cleared so the
+// next call waits for a fresh callback), or null on timeout. Auto-
+// subscribes the id on entry — callers don't need a separate subscribe
+// step, the subscription persists so the pump captures further instances.
+JNIEXPORT jbyteArray JNICALL
+Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeAwaitCallback(
+        JNIEnv* env, jclass /*cls*/, jint id, jint timeoutMs) {
+    std::unique_lock<std::mutex> lk(g_state.mu);
+    const int cb_id = static_cast<int>(id);
+    g_state.subscribed_ids.insert(cb_id);
+    auto deadline = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(std::max<jint>(0, timeoutMs));
+    bool got = g_state.cv_callback.wait_until(lk, deadline, [&] {
+        return g_state.received_callbacks.count(cb_id) > 0;
+    });
+    if (!got) return nullptr;
+    auto it = g_state.received_callbacks.find(cb_id);
+    if (it == g_state.received_callbacks.end()) return nullptr;
+    std::vector<uint8_t> payload = std::move(it->second);
+    g_state.received_callbacks.erase(it);
+    lk.unlock();
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(payload.size()));
+    if (!out) return nullptr;
+    if (!payload.empty()) {
+        env->SetByteArrayRegion(out, 0, static_cast<jsize>(payload.size()),
+                                reinterpret_cast<const jbyte*>(payload.data()));
+    }
+    return out;
 }
 
 JNIEXPORT void JNICALL
@@ -650,6 +2210,26 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamBootstrap_nativeShutd
     g_state.pipe       = 0;
     g_state.user       = 0;
     g_state.iclient_user                    = nullptr;
+    // Drop the hybrid stage-2 cached public-API interface pointers — they
+    // are owned by libsteamclient.so but become stale once we LogOff /
+    // tear the session down. cached_steam_id is also a per-session value.
+    g_state.steamclient_iface     = nullptr;
+    g_state.isteam_user           = nullptr;
+    g_state.isteam_utils          = nullptr;
+    g_state.isteam_userstats      = nullptr;
+    g_state.isteam_apps           = nullptr;
+    g_state.isteam_remotestorage  = nullptr;
+    g_state.isteam_friends        = nullptr;
+    g_state.isteam_apps_ver       = nullptr;
+    g_state.isteam_rs_ver         = nullptr;
+    g_state.isteam_friends_ver    = nullptr;
+    g_state.cached_steam_id       = 0;
+    // Drop the callback bridge state. Any waiter blocked on
+    // cv_callback gets woken (no payload arrives → returns null on
+    // timeout, or sees an empty subscribed_ids and falls through).
+    g_state.subscribed_ids.clear();
+    g_state.received_callbacks.clear();
+    g_state.cv_callback.notify_all();
     g_state.fn_CreateInterface              = nullptr;
     g_state.fn_Steam_CreateGlobalUser       = nullptr;
     g_state.fn_Steam_BLoggedOn              = nullptr;

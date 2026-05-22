@@ -1,8 +1,10 @@
 #include "wn_steam/cm_client.h"
+#include "wn_steam/cm_bridge.h"
 
 #include <android/log.h>
 
 #include <cctype>
+#include <thread>
 #include <zlib.h>
 
 #include "wn_steam/pb/cmsg_client_get_app_ownership_ticket.h"
@@ -143,6 +145,30 @@ void CMClient::disconnect() {
     steam_id_.store(0);
     session_id_.store(0);
     family_group_id_.store(0);
+}
+
+void CMClient::log_off_and_disconnect(std::chrono::milliseconds flush_window) {
+    // CMsgClientLogOff has an empty body; the EMsg id is what matters.
+    // Send + briefly let the channel flush before tearing down so Steam
+    // sees the logoff before the socket goes away. We do NOT wait for
+    // CMsgClientLoggedOff's eresult — best-effort: most of the value
+    // is in Steam's CM processing the LogOff record before our follow-up
+    // bootstrap LogonWithRefreshToken races in.
+    if (state_.load() == ClientState::LoggedOn) {
+        pb::CMsgClientLogOff msg;
+        const bool ok = send_proto_message(EMsg::ClientLogOff, msg.serialize());
+        WN_LOGI("CMsgClientLogOff sent (ok=%d) before hand-off disconnect; "
+                "flush_window=%lldms",
+                ok ? 1 : 0, static_cast<long long>(flush_window.count()));
+        if (ok && flush_window.count() > 0) {
+            std::this_thread::sleep_for(flush_window);
+        }
+    } else {
+        WN_LOGI("log_off_and_disconnect: not LoggedOn (state=%d) — "
+                "skipping LogOff send, going straight to disconnect",
+                static_cast<int>(state_.load()));
+    }
+    disconnect();
 }
 
 void CMClient::call_service_method(std::string_view method_name,
@@ -673,6 +699,37 @@ void CMClient::get_cdn_servers(uint32_t cell_id, CdnServersCallback cb,
         timeout);
 }
 
+void CMClient::cloud_get_user_quota(CloudUserQuotaCallback cb,
+                                    std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CCloud_GetUserQuota_Request req;
+    call_service_method(
+        "Cloud.GetUserQuota#1",
+        /*authed=*/true,
+        req.serialize(),
+        [cb = std::move(cb)](JobResult r) {
+            if (r.synthetic_failure || r.eresult != 1) {
+                WN_LOGE("cloud user-quota: failed eresult=%d", r.eresult);
+                if (cb) cb(std::nullopt);
+                return;
+            }
+            auto resp = pb::CCloud_GetUserQuota_Response::deserialize(r.body);
+            if (!resp) {
+                WN_LOGE("cloud user-quota: parse failed (%zu bytes)", r.body.size());
+                if (cb) cb(std::nullopt);
+                return;
+            }
+            WN_LOGI("cloud user-quota: total=%llu used=%llu",
+                    static_cast<unsigned long long>(resp->total_bytes),
+                    static_cast<unsigned long long>(resp->used_bytes));
+            if (cb) cb(std::move(resp));
+        },
+        timeout);
+}
+
 void CMClient::cloud_get_app_file_changelist(uint32_t app_id,
                                              uint64_t synced_change_number,
                                              CloudFileChangelistCallback cb,
@@ -968,6 +1025,36 @@ void CMClient::notify_games_played(const pb::CMsgClientGamesPlayed& msg) {
     }
 }
 
+void CMClient::set_rich_presence(
+        uint32_t app_id,
+        const std::vector<pb::CPlayer_SetRichPresence_KV>& kv) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("set_rich_presence(%u): not logged on, dropping", app_id);
+        return;
+    }
+    pb::CPlayer_SetRichPresence_Request req;
+    req.appid         = app_id;
+    req.rich_presence = kv;
+    // Fire-and-forget — Steam doesn't ack the RP write directly; the
+    // follow-up CMsgClientPersonaState for self carries the echoed
+    // rich_presence map which our persona_observer mirrors back.
+    // Calling with no callback gives a 5-second default timeout we
+    // ignore (the response is just an empty acknowledgment).
+    call_service_method(
+        "Player.SetRichPresence#1",
+        /*authed=*/true,
+        req.serialize(),
+        [app_id, count = kv.size()](JobResult r) {
+            if (r.synthetic_failure || r.eresult != 1) {
+                WN_LOGE("set_rich_presence(%u, %zu keys): eresult=%d",
+                        app_id, count, r.eresult);
+            } else {
+                WN_LOGI("set_rich_presence(%u, %zu keys): OK", app_id, count);
+            }
+        },
+        std::chrono::seconds{5});
+}
+
 void CMClient::cloud_signal_app_launch_intent(uint32_t app_id, uint64_t client_id,
                                               std::string machine_name,
                                               bool ignore_pending_operations,
@@ -1034,6 +1121,23 @@ void CMClient::set_persona_state(uint32_t persona_state) {
     }
 }
 
+void CMClient::set_persona_name(const std::string& name,
+                                uint32_t persona_state_keep_current) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("set_persona_name: not logged on, dropping");
+        return;
+    }
+    pb::CMsgClientChangeStatus msg;
+    msg.persona_state = persona_state_keep_current;
+    msg.player_name   = name;
+    if (send_proto_message(EMsg::ClientChangeStatus, msg.serialize())) {
+        WN_LOGI("set_persona_name: sent (name='%s' state=%u %zu B)",
+                name.c_str(), persona_state_keep_current, msg.serialize().size());
+    } else {
+        WN_LOGE("set_persona_name: send failed");
+    }
+}
+
 void CMClient::request_user_persona() {
     if (state_.load() != ClientState::LoggedOn) {
         WN_LOGI("request_user_persona: not logged on, dropping");
@@ -1050,6 +1154,27 @@ void CMClient::request_user_persona() {
     }
 }
 
+void CMClient::request_friend_personas(const std::vector<uint64_t>& sids,
+                                       uint32_t persona_state_requested) {
+    if (sids.empty()) return;
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("request_friend_personas: not logged on, dropping (n=%zu)",
+                sids.size());
+        return;
+    }
+    // CMsgClientRequestFriendData accepts a repeated list; sending a
+    // single message is more efficient than fanning out per friend.
+    pb::CMsgClientRequestFriendData req;
+    req.persona_state_requested = persona_state_requested;
+    req.friends = sids;  // copy is fine — caller's vector is small
+    if (send_proto_message(EMsg::ClientRequestFriendData, req.serialize())) {
+        WN_LOGI("request_friend_personas: requested %zu friend(s) flags=0x%x",
+                sids.size(), static_cast<unsigned>(persona_state_requested));
+    } else {
+        WN_LOGE("request_friend_personas: send failed (n=%zu)", sids.size());
+    }
+}
+
 std::optional<pb::PersonaStateFriend> CMClient::self_persona() const {
     std::lock_guard<std::mutex> lk(persona_mu_);
     return self_persona_;
@@ -1058,6 +1183,31 @@ std::optional<pb::PersonaStateFriend> CMClient::self_persona() const {
 std::vector<pb::License> CMClient::license_list() const {
     std::lock_guard<std::mutex> lk(license_mu_);
     return license_list_;
+}
+
+std::vector<uint64_t> CMClient::friends_list() const {
+    std::lock_guard<std::mutex> lk(friends_mu_);
+    // Only surface mutual friends (relationship == 3 / Friend) — the
+    // public ISteamFriends.GetFriendCount semantics expect "people I am
+    // friends with", not pending requests / blocked / etc. Other states
+    // are still tracked internally for future EFriendFlags filtering.
+    std::vector<uint64_t> out;
+    out.reserve(friends_.size());
+    for (const auto& [sid, rel] : friends_) {
+        if (rel == 3) out.push_back(sid);
+    }
+    return out;
+}
+
+std::vector<CMClient::FriendPersonaSnapshot>
+CMClient::friend_personas() const {
+    std::lock_guard<std::mutex> lk(friend_personas_mu_);
+    std::vector<FriendPersonaSnapshot> out;
+    out.reserve(friend_personas_.size());
+    for (const auto& [sid, snap] : friend_personas_) {
+        if (!snap.player_name.empty()) out.push_back(snap);
+    }
+    return out;
 }
 
 void CMClient::get_family_group(uint64_t family_group_id,
@@ -1428,12 +1578,70 @@ void CMClient::route_inbound_(EMsg emsg,
         case EMsg::ClientRequestEncryptedAppTicketResponse:
         case EMsg::ClientGetUserStatsResponse:
         case EMsg::ClientGetDepotDecryptionKeyResponse:
+        case EMsg::ClientMMSCreateLobbyResponse:
+        case EMsg::ClientMMSJoinLobbyResponse:
+        case EMsg::ClientMMSLeaveLobbyResponse:
+        case EMsg::ClientMMSGetLobbyListResponse:
+        case EMsg::ClientMMSSetLobbyDataResponse:
+        case EMsg::ClientMMSSetLobbyOwnerResponse:
+        case EMsg::ClientMMSGetLobbyStatusResponse:
             // Single-shot response — JobManager handles routing + parse.
             jobs_.deliver(header.jobid_target,
                           header.eresult,
                           header.error_message,
                           body);
             break;
+
+        case EMsg::ClientMMSLobbyData: {
+            // Server push — emitted whenever a lobby the client is
+            // subscribed to changes (metadata edit, member join/leave,
+            // owner change). Decode + forward to the observer; the
+            // observer (registered by libsteamclient.so) mirrors into
+            // pushed().active_lobbies and emits LobbyDataUpdate_t.
+            auto resp = pb::CMsgClientMMSLobbyData::deserialize(body);
+            if (!resp) {
+                WN_LOGE("MMSLobbyData parse failed (%zu bytes)", body.size());
+                break;
+            }
+            WN_LOGI("MMSLobbyData push: lobby=0x%llx owner=0x%llx members=%d/%d",
+                    static_cast<unsigned long long>(resp->steam_id_lobby),
+                    static_cast<unsigned long long>(resp->steam_id_owner),
+                    static_cast<int>(resp->members.size()),
+                    resp->max_members);
+            if (lobby_data_observer_) lobby_data_observer_(*resp);
+            break;
+        }
+        case EMsg::ClientMMSLobbyChatMsg: {
+            auto resp = pb::CMsgClientMMSLobbyChatMsg::deserialize(body);
+            if (!resp) {
+                WN_LOGE("MMSLobbyChatMsg parse failed (%zu bytes)", body.size());
+                break;
+            }
+            WN_LOGI("MMSLobbyChatMsg push: lobby=0x%llx sender=0x%llx body=%zuB",
+                    static_cast<unsigned long long>(resp->steam_id_lobby),
+                    static_cast<unsigned long long>(resp->steam_id_sender),
+                    resp->lobby_message.size());
+            if (lobby_chat_msg_observer_) lobby_chat_msg_observer_(*resp);
+            break;
+        }
+        case EMsg::ClientMMSUserJoinedLobby:
+        case EMsg::ClientMMSUserLeftLobby: {
+            auto resp = pb::CMsgClientMMSUserJoinedOrLeftLobby::deserialize(body);
+            if (!resp) {
+                WN_LOGE("MMSUser{Join,Left}Lobby parse failed (%zu bytes)",
+                        body.size());
+                break;
+            }
+            const bool joined = (emsg == EMsg::ClientMMSUserJoinedLobby);
+            WN_LOGI("MMS%s push: lobby=0x%llx user=0x%llx '%s'",
+                    joined ? "UserJoinedLobby" : "UserLeftLobby",
+                    static_cast<unsigned long long>(resp->steam_id_lobby),
+                    static_cast<unsigned long long>(resp->steam_id_user),
+                    resp->persona_name.c_str());
+            if (lobby_membership_observer_)
+                lobby_membership_observer_(joined, *resp);
+            break;
+        }
 
         case EMsg::ClientPICSProductInfoResponse: {
             // Multi-part: merge into the per-job accumulator; only fire the
@@ -1524,6 +1732,9 @@ void CMClient::route_inbound_(EMsg emsg,
                             send_proto_message(EMsg::ClientHeartBeat, hb.serialize());
                         });
                 }
+                if (resp->rtime32_server_time != 0) {
+                    wn_cm_bridge_dispatch_server_realtime(resp->rtime32_server_time);
+                }
             }
             ClientMessageCallback cb;
             { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
@@ -1547,6 +1758,14 @@ void CMClient::route_inbound_(EMsg emsg,
             steam_id_.store(0);
             session_id_.store(0);
             family_group_id_.store(0);
+            // Drop the LoggedOn flag while the channel is still up so the
+            // bridge fires dispatch_logon_state(false) and the
+            // libsteamclient mirror flips pushed.logged_on=false. Stays at
+            // Connected (post-handshake, pre-logon) so the SDK consumer
+            // can drive a re-logon if it wants to.
+            if (state_.load() == ClientState::LoggedOn) {
+                set_state_locked_(ClientState::Connected);
+            }
             ClientMessageCallback cb;
             { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
             safe_invoke(cb, emsg, header, body);
@@ -1560,18 +1779,76 @@ void CMClient::route_inbound_(EMsg emsg,
         // tag them here so the log explicitly names them.
         case EMsg::ClientPersonaState: {
             // Server-pushed persona updates; cache the entry for our own
-            // SteamID so self_persona() can surface name/avatar/game.
+            // SteamID so self_persona() can surface name/avatar/game,
+            // AND cache friend personas separately so the ISteamFriends
+            // queries (via libsteamclient.so) can return real names.
             auto resp = pb::CMsgClientPersonaState::deserialize(body);
             if (resp) {
                 const uint64_t self = steam_id_.load();
+                size_t friend_updates = 0;
                 for (auto& f : resp->friends) {
-                    if (f.friendid == self) {
+                    if (f.friendid == 0) continue;
+                    bool is_self = (f.friendid == self);
+                    if (is_self) {
                         WN_LOGI("persona state: self name='%s' app=%u",
                                 f.player_name.c_str(), f.game_played_app_id);
                         std::lock_guard<std::mutex> lk(persona_mu_);
-                        self_persona_ = std::move(f);
-                        break;
+                        self_persona_ = f;  // copy: cached for self_persona() reader
+                        // Fall through to the bridge dispatch so libsteamclient.so
+                        // mirrors self persona into its pushed.persona_name /
+                        // persona_state too. The observer differentiates self
+                        // from friend by comparing pushed().steam_id, so the
+                        // same dispatch wires both paths.
+                    } else {
+                        // Cache only entries that carry an actual name —
+                        // CMsgClientPersonaState can be sliced by
+                        // EClientPersonaStateFlag and arrive with just the
+                        // state, game, or avatar alone. Don't overwrite a
+                        // previously-cached name with an empty string.
+                        std::lock_guard<std::mutex> lk(friend_personas_mu_);
+                        auto& slot = friend_personas_[f.friendid];
+                        slot.sid = f.friendid;
+                        if (!f.player_name.empty()) slot.player_name = f.player_name;
+                        slot.persona_state      = f.persona_state;
+                        slot.game_played_app_id = f.game_played_app_id;
+                        // Avatar hash arrives only when EClientPersonaStateFlag_Avatar
+                        // is set on the request flags; an empty bytes vec means
+                        // "this push didn't carry one" — preserve the previously-
+                        // cached hash so a stats-only push doesn't wipe the
+                        // avatar.
+                        if (!f.avatar_hash.empty()) slot.avatar_hash = f.avatar_hash;
                     }
+                    // Reactive bridge dispatch — libsteamclient.so registers
+                    // an observer that mirrors this update into its pushed_
+                    // state + emits PersonaStateChange_t with zero Kotlin
+                    // round-trip. Observer fires AFTER the cache update so a
+                    // re-entrant friend_personas() read sees consistent data.
+                    {
+                        WnCmPersonaEvent ev{};
+                        ev.sid              = f.friendid;
+                        ev.persona_state    = f.persona_state;
+                        ev.game_played_app  = f.game_played_app_id;
+                        ev.name             = f.player_name.empty()
+                                                ? nullptr : f.player_name.c_str();
+                        ev.avatar_hash      = f.avatar_hash.empty()
+                                                ? nullptr : f.avatar_hash.data();
+                        ev.avatar_hash_len  = f.avatar_hash.size();
+                        // Build pointer-pair array for the RP map. Stack-
+                        // allocated; lives for the observer call duration.
+                        std::vector<WnCmRichPresenceKV> kv;
+                        kv.reserve(f.rich_presence.size());
+                        for (const auto& [k, v] : f.rich_presence) {
+                            kv.push_back({k.c_str(), v.c_str()});
+                        }
+                        ev.rp_pairs = kv.empty() ? nullptr : kv.data();
+                        ev.rp_count = kv.size();
+                        wn_cm_bridge_dispatch_persona(&ev);
+                    }
+                    ++friend_updates;
+                }
+                if (friend_updates > 0) {
+                    WN_LOGI("persona state: cached %zu friend persona(s)",
+                            friend_updates);
                 }
             }
             break;
@@ -1579,6 +1856,7 @@ void CMClient::route_inbound_(EMsg emsg,
 
         case EMsg::ClientLicenseList: {
             auto msg = pb::CMsgClientLicenseList::deserialize(body);
+            std::vector<WnCmLicenseEntry> bridge_entries;
             if (!msg) {
                 WN_LOGE("CMsgClientLicenseList parse failed (%zu bytes)", body.size());
             } else {
@@ -1587,6 +1865,22 @@ void CMClient::route_inbound_(EMsg emsg,
                 {
                     std::lock_guard<std::mutex> lk(license_mu_);
                     license_list_ = msg->licenses;
+                }
+                // Build the bridge-shaped POD array for the observer.
+                // Field-for-field projection; observer reads each entry's
+                // package_id + owner_id for family-share resolution.
+                bridge_entries.reserve(msg->licenses.size());
+                for (const auto& lic : msg->licenses) {
+                    bridge_entries.push_back({
+                        lic.package_id,
+                        lic.owner_id,
+                        lic.time_created,
+                        lic.license_type,
+                        lic.flags,
+                        lic.change_number,
+                        lic.minute_limit,
+                        lic.minutes_used,
+                    });
                 }
                 library_.ingest_license_list(*msg);
                 // Kick off the populate pipeline. Each PICS response feeds the
@@ -1601,6 +1895,12 @@ void CMClient::route_inbound_(EMsg emsg,
                             "for this session)");
                 }
             }
+            // Reactive bridge dispatch — fires after cache + library
+            // ingest so re-entrant readers see consistent state. No-op
+            // when no observer is registered.
+            wn_cm_bridge_dispatch_license_list(
+                bridge_entries.empty() ? nullptr : bridge_entries.data(),
+                bridge_entries.size());
             ClientMessageCallback cb;
             { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
             safe_invoke(cb, emsg, header, body);
@@ -1625,16 +1925,145 @@ void CMClient::route_inbound_(EMsg emsg,
             break;
         }
 
-        case EMsg::ClientAccountInfo:
-        case EMsg::ClientEmailAddrInfo:
         case EMsg::ClientFriendsList: {
-            const char* name =
-                (emsg == EMsg::ClientAccountInfo)  ? "ClientAccountInfo"  :
-                (emsg == EMsg::ClientEmailAddrInfo)? "ClientEmailAddrInfo":
-                                                     "ClientFriendsList";
-            WN_LOGI("post-logon push: %s (%u bytes) — Phase 4+ will parse this; "
-                    "for now forwarding to upstream observer for visibility",
-                    name, static_cast<unsigned>(body.size()));
+            // Server-pushed at logon (full snapshot, bincremental=false)
+            // and on every relationship change (bincremental=true) — we
+            // merge incrementals into the cached map. Powers
+            // ISteamFriends queries via WnLibSteamClient.setFriendsList.
+            auto msg = pb::CMsgClientFriendsList::deserialize(body);
+            std::vector<uint64_t> mutual_sids;
+            if (msg) {
+                std::lock_guard<std::mutex> lk(friends_mu_);
+                if (!msg->bincremental) friends_.clear();
+                size_t mutual = 0;
+                for (const auto& e : msg->friends) {
+                    if (e.efriendrelationship == 0) {
+                        // None = removed; drop the entry.
+                        friends_.erase(e.ulfriendid);
+                    } else {
+                        friends_[e.ulfriendid] = e.efriendrelationship;
+                    }
+                    if (e.efriendrelationship == 3) ++mutual;
+                }
+                // Collect ALL current mutual friends for the observer —
+                // matches the WnLibSteamClient.setFriendsList contract
+                // of full-set replacement on each push. Incremental
+                // pushes still produce a complete current snapshot here
+                // because we merged into friends_ first.
+                mutual_sids.reserve(friends_.size());
+                for (const auto& [sid, rel] : friends_) {
+                    if (rel == 3) mutual_sids.push_back(sid);
+                }
+                WN_LOGI("ClientFriendsList: incremental=%d entries=%zu "
+                        "(mutual=%zu in payload) total_now=%zu",
+                        msg->bincremental ? 1 : 0,
+                        msg->friends.size(), mutual, friends_.size());
+            } else {
+                WN_LOGE("CMsgClientFriendsList parse failed (%zu bytes)",
+                        body.size());
+            }
+            // Reactive bridge dispatch — libsteamclient.so observer mirrors
+            // into pushed.friends. Friends mutex already released above; the
+            // pointer-into-vector lives for this scope only, observer must
+            // copy if it retains (the registered handler does — std::vector
+            // assignment into pushed.friends).
+            wn_cm_bridge_dispatch_friends_list(
+                mutual_sids.empty() ? nullptr : mutual_sids.data(),
+                mutual_sids.size());
+            ClientMessageCallback cb;
+            { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
+            safe_invoke(cb, emsg, header, body);
+            break;
+        }
+
+        case EMsg::ClientAccountInfo: {
+            // CMsgClientAccountInfo fields we surface:
+            //   field 1  persona_name             (string)
+            //   field 2  ip_country               (string, ISO 3166-1)
+            //   field 15 two_factor_state         (varint enum; 0 = none)
+            //   field 17 is_phone_verified        (varint bool)
+            //   field 19 is_phone_identifying     (varint bool)
+            //   field 20 is_phone_need_verification (varint bool)
+            // Other fields (count_authed_computers, locked, tutorial …)
+            // are skipped.
+            WnCmAccountInfo info{};
+            std::string persona_name;
+            std::string ip_country;
+            wn_steam::proto::Reader r{std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(body.data()), body.size())};
+            while (auto tag = r.next_tag()) {
+                switch (tag->field_number) {
+                    case 1: {  // persona_name
+                        auto v = r.string();
+                        if (v) persona_name.assign(v->data(), v->size());
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    case 2: {  // ip_country
+                        auto v = r.string();
+                        if (v) ip_country.assign(v->data(), v->size());
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    case 15: {  // two_factor_state — enum (0=none, 1=mobile-auth)
+                        auto v = r.u32();
+                        if (v) info.two_factor_enabled = (*v != 0);
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    case 17: {
+                        auto v = r.boolean();
+                        if (v) info.phone_verified = *v;
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    case 19: {
+                        auto v = r.boolean();
+                        if (v) info.phone_identifying = *v;
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    case 20: {
+                        auto v = r.boolean();
+                        if (v) info.phone_requires_verification = *v;
+                        else r.skip(tag->wire_type);
+                        break;
+                    }
+                    default:
+                        if (!r.skip(tag->wire_type)) {
+                            WN_LOGE("ClientAccountInfo: skip failed at field %d (wt=%d)",
+                                    tag->field_number, static_cast<int>(tag->wire_type));
+                            goto account_info_done;
+                        }
+                        break;
+                }
+            }
+            account_info_done:
+            if (!persona_name.empty()) {
+                info.persona_name     = persona_name.c_str();
+                info.persona_name_len = persona_name.size();
+            }
+            if (!ip_country.empty()) {
+                info.ip_country     = ip_country.c_str();
+                info.ip_country_len = ip_country.size();
+            }
+            WN_LOGI("ClientAccountInfo: persona='%.*s' ip='%.*s' 2FA=%d phone_v=%d phone_id=%d phone_nv=%d",
+                    static_cast<int>(persona_name.size()), persona_name.c_str(),
+                    static_cast<int>(ip_country.size()),   ip_country.c_str(),
+                    info.two_factor_enabled, info.phone_verified,
+                    info.phone_identifying, info.phone_requires_verification);
+            wn_cm_bridge_dispatch_account_info(&info);
+            ClientMessageCallback cb;
+            { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
+            safe_invoke(cb, emsg, header, body);
+            break;
+        }
+        case EMsg::ClientEmailAddrInfo: {
+            // Email-address info is a separate message; we don't track
+            // email status today. Forward to the upstream observer for
+            // visibility (and future wires).
+            WN_LOGI("ClientEmailAddrInfo (%u bytes) — forwarded, not parsed",
+                    static_cast<unsigned>(body.size()));
             ClientMessageCallback cb;
             { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_client_message_; }
             safe_invoke(cb, emsg, header, body);
@@ -1651,10 +2080,30 @@ void CMClient::route_inbound_(EMsg emsg,
 }
 
 void CMClient::set_state_locked_(ClientState s) {
+    ClientState prev = state_.load();
     state_.store(s);
     StateCallback cb;
     { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_state_; }
     safe_invoke(cb, s);
+    // Reactive bridge — libsteamclient.so observes this directly without
+    // a Kotlin poll hop. Map ClientState → bool logged_on:
+    //   Disconnected / Connecting / Connected = not logged on
+    //   LoggedOn                                = logged on
+    //
+    // CRITICAL: only dispatch when the LoggedOn-vs-not edge actually
+    // CHANGES. Without this guard, a normal CM cycle
+    //   Disconnected → Connecting → Connected → LoggedOn
+    // dispatches three (logon_state=false) events before the final
+    // (true) — undoing the warm "logged_on=true" that seedFromPref
+    // Manager set from cached credentials on cold-start. The Compose
+    // UI gates Sign-In affordance on this flag, so the user perceives
+    // "still asking me to sign in" while a perfectly valid reconnect
+    // is in flight.
+    bool was_logged_on = (prev == ClientState::LoggedOn);
+    bool is_logged_on  = (s    == ClientState::LoggedOn);
+    if (was_logged_on != is_logged_on) {
+        wn_cm_bridge_dispatch_logon_state(is_logged_on);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,6 +2231,372 @@ void CMClient::library_populate_step_() {
                 a.app_id, a.name.c_str(), a.dlc_app_ids.size(),
                 pkg_summary.c_str());
         if (++shown >= 10) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ISteamMatchmaking lobby browser (Phase A) — single-shot CMsgClient
+// MMSGetLobbyList → ClientMMSGetLobbyListResponse (EMsgs 6607/6608).
+// Mirror of get_user_stats — same JobManager-tracked envelope-and-send
+// pattern, same synthetic-failure handling on timeout / disconnect.
+// ---------------------------------------------------------------------------
+void CMClient::lobby_get_list(
+        uint32_t app_id,
+        std::vector<pb::CMsgClientMMSGetLobbyListFilter> filters,
+        int32_t num_lobbies_requested,
+        LobbyListCallback cb,
+        std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_get_list: not logged on, app=%u", app_id);
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CMsgClientMMSGetLobbyList req;
+    req.app_id                = app_id;
+    req.num_lobbies_requested = num_lobbies_requested > 0
+                                    ? num_lobbies_requested
+                                    : 50;
+    req.filters               = std::move(filters);
+
+    const uint64_t job_id = jobs_.next_job_id();
+    jobs_.track(job_id, [app_id, cb = std::move(cb)](JobResult r) {
+        if (r.synthetic_failure) {
+            WN_LOGI("lobby_get_list: synthetic failure for app %u", app_id);
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        auto resp = pb::CMsgClientMMSGetLobbyListResponse::deserialize(r.body);
+        if (!resp) {
+            WN_LOGE("lobby_get_list: parse failed for app %u (%zu bytes)",
+                    app_id, r.body.size());
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        WN_LOGI("lobby_get_list: app %u eresult=%d lobbies=%zu",
+                app_id, resp->eresult, resp->lobbies.size());
+        if (cb) cb(std::move(resp));
+    }, timeout);
+
+    CMsgProtoBufHeader hdr;
+    hdr.steamid          = steam_id_.load();
+    hdr.client_sessionid = session_id_.load();
+    hdr.jobid_source     = job_id;
+    hdr.jobid_target     = kInvalidJobId;
+    auto wire = encode_proto_envelope(EMsg::ClientMMSGetLobbyList, hdr,
+                                       req.serialize());
+    WN_LOGI("outbound lobby_get_list: app=%u jobid=0x%llx filters=%zu n=%d",
+            app_id, static_cast<unsigned long long>(job_id),
+            req.filters.size(), req.num_lobbies_requested);
+    if (!channel_->send(wire)) {
+        WN_LOGE("lobby_get_list: channel send failed for app %u", app_id);
+        jobs_.deliver(job_id, -1, "channel send failed", {});
+    }
+}
+
+void CMClient::set_lobby_data_observer(LobbyDataObserver obs) {
+    lobby_data_observer_ = std::move(obs);
+}
+
+void CMClient::set_lobby_chat_msg_observer(LobbyChatMsgObserver obs) {
+    lobby_chat_msg_observer_ = std::move(obs);
+}
+
+void CMClient::set_lobby_membership_observer(LobbyMembershipObserver obs) {
+    lobby_membership_observer_ = std::move(obs);
+}
+
+void CMClient::lobby_send_chat(uint32_t app_id, uint64_t lobby_sid,
+                                std::vector<uint8_t> chat_bytes) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_send_chat: not logged on, dropping");
+        return;
+    }
+    pb::CMsgClientMMSSendLobbyChatMsg msg;
+    msg.app_id         = app_id;
+    msg.steam_id_lobby = lobby_sid;
+    msg.lobby_message  = std::move(chat_bytes);
+    if (send_proto_message(EMsg::ClientMMSSendLobbyChatMsg, msg.serialize(), app_id)) {
+        WN_LOGI("lobby_send_chat: sent (lobby=0x%llx body=%zuB)",
+                static_cast<unsigned long long>(lobby_sid), msg.lobby_message.size());
+    } else {
+        WN_LOGE("lobby_send_chat: send failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InviteToLobby — CMsgClientMMSInviteToLobby (6621). Fire-and-forget.
+// Steam routes the invite to the target user's online client (overlay
+// notification + Friends-list popup) or queues it as a Friends chat
+// message if they're offline.
+// ---------------------------------------------------------------------------
+void CMClient::lobby_invite_user(uint32_t app_id, uint64_t lobby_sid,
+                                  uint64_t invitee_sid) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_invite_user: not logged on, dropping");
+        return;
+    }
+    pb::CMsgClientMMSInviteToLobby msg;
+    msg.app_id                = app_id;
+    msg.steam_id_lobby        = lobby_sid;
+    msg.steam_id_user_invited = invitee_sid;
+    if (send_proto_message(EMsg::ClientMMSInviteToLobby, msg.serialize(), app_id)) {
+        WN_LOGI("lobby_invite_user: sent (lobby=0x%llx invitee=0x%llx)",
+                static_cast<unsigned long long>(lobby_sid),
+                static_cast<unsigned long long>(invitee_sid));
+    } else {
+        WN_LOGE("lobby_invite_user: send failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CreateLobby — CMsgClientMMSCreateLobby (6601) → response 6602
+// ---------------------------------------------------------------------------
+void CMClient::lobby_create(uint32_t app_id, int32_t lobby_type,
+                            int32_t max_members, LobbyCreateCallback cb,
+                            std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_create: not logged on, app=%u", app_id);
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CMsgClientMMSCreateLobby req;
+    req.app_id      = app_id;
+    req.lobby_type  = lobby_type;
+    req.max_members = max_members > 0 ? max_members : 4;
+
+    const uint64_t job_id = jobs_.next_job_id();
+    jobs_.track(job_id, [app_id, cb = std::move(cb)](JobResult r) {
+        if (r.synthetic_failure) {
+            WN_LOGI("lobby_create: synthetic failure for app %u", app_id);
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        auto resp = pb::CMsgClientMMSCreateLobbyResponse::deserialize(r.body);
+        if (!resp) {
+            WN_LOGE("lobby_create: parse failed (%zu bytes)", r.body.size());
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        WN_LOGI("lobby_create: app %u eresult=%d lobby=0x%llx",
+                app_id, resp->eresult,
+                static_cast<unsigned long long>(resp->steam_id_lobby));
+        if (cb) cb(std::move(resp));
+    }, timeout);
+
+    CMsgProtoBufHeader hdr;
+    hdr.steamid          = steam_id_.load();
+    hdr.client_sessionid = session_id_.load();
+    hdr.jobid_source     = job_id;
+    hdr.jobid_target     = kInvalidJobId;
+    auto wire = encode_proto_envelope(EMsg::ClientMMSCreateLobby, hdr,
+                                       req.serialize());
+    WN_LOGI("outbound lobby_create: app=%u type=%d max=%d jobid=0x%llx",
+            app_id, lobby_type, req.max_members,
+            static_cast<unsigned long long>(job_id));
+    if (!channel_->send(wire)) {
+        WN_LOGE("lobby_create: channel send failed for app %u", app_id);
+        jobs_.deliver(job_id, -1, "channel send failed", {});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JoinLobby — CMsgClientMMSJoinLobby (6603) → response 6604
+// ---------------------------------------------------------------------------
+void CMClient::lobby_join(uint32_t app_id, uint64_t lobby_sid,
+                          LobbyJoinCallback cb,
+                          std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_join: not logged on, lobby=0x%llx",
+                static_cast<unsigned long long>(lobby_sid));
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CMsgClientMMSJoinLobby req;
+    req.app_id         = app_id;
+    req.steam_id_lobby = lobby_sid;
+
+    const uint64_t job_id = jobs_.next_job_id();
+    jobs_.track(job_id, [lobby_sid, cb = std::move(cb)](JobResult r) {
+        if (r.synthetic_failure) {
+            WN_LOGI("lobby_join: synthetic failure for lobby=0x%llx",
+                    static_cast<unsigned long long>(lobby_sid));
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        auto resp = pb::CMsgClientMMSJoinLobbyResponse::deserialize(r.body);
+        if (!resp) {
+            WN_LOGE("lobby_join: parse failed (%zu bytes)", r.body.size());
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        WN_LOGI("lobby_join: lobby=0x%llx chat_resp=%d members=%zu owner=0x%llx",
+                static_cast<unsigned long long>(resp->steam_id_lobby),
+                resp->chat_room_enter_response, resp->members.size(),
+                static_cast<unsigned long long>(resp->steam_id_owner));
+        if (cb) cb(std::move(resp));
+    }, timeout);
+
+    CMsgProtoBufHeader hdr;
+    hdr.steamid          = steam_id_.load();
+    hdr.client_sessionid = session_id_.load();
+    hdr.jobid_source     = job_id;
+    hdr.jobid_target     = kInvalidJobId;
+    auto wire = encode_proto_envelope(EMsg::ClientMMSJoinLobby, hdr,
+                                       req.serialize());
+    WN_LOGI("outbound lobby_join: app=%u lobby=0x%llx jobid=0x%llx",
+            app_id, static_cast<unsigned long long>(lobby_sid),
+            static_cast<unsigned long long>(job_id));
+    if (!channel_->send(wire)) {
+        WN_LOGE("lobby_join: channel send failed for lobby=0x%llx",
+                static_cast<unsigned long long>(lobby_sid));
+        jobs_.deliver(job_id, -1, "channel send failed", {});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LeaveLobby — CMsgClientMMSLeaveLobby (6605), fire-and-forget.
+// Steam sends 6606 LeaveLobbyResponse but the SDK contract doesn't gate
+// any callback on it — the game has already moved on by the time the
+// ack arrives. We send through `send_proto_message` which doesn't track
+// the response.
+// ---------------------------------------------------------------------------
+void CMClient::lobby_leave(uint32_t app_id, uint64_t lobby_sid) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_leave: not logged on, dropping");
+        return;
+    }
+    pb::CMsgClientMMSLeaveLobby msg;
+    msg.app_id         = app_id;
+    msg.steam_id_lobby = lobby_sid;
+    if (send_proto_message(EMsg::ClientMMSLeaveLobby, msg.serialize(), app_id)) {
+        WN_LOGI("lobby_leave: sent (app=%u lobby=0x%llx)", app_id,
+                static_cast<unsigned long long>(lobby_sid));
+    } else {
+        WN_LOGE("lobby_leave: send failed (app=%u lobby=0x%llx)", app_id,
+                static_cast<unsigned long long>(lobby_sid));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetLobbyData — CMsgClientMMSSetLobbyData (6609) → response 6610.
+// Same recipe as lobby_create / lobby_join. Steam also fires a 6612
+// LobbyData push to every member after a successful SetLobbyData; the
+// existing LobbyData observer arm handles that — no extra wiring
+// needed here.
+// ---------------------------------------------------------------------------
+void CMClient::lobby_set_data(uint32_t app_id, uint64_t lobby_sid,
+                              uint64_t steam_id_member,
+                              std::vector<uint8_t> metadata,
+                              int32_t max_members, int32_t lobby_type,
+                              int32_t lobby_flags,
+                              LobbySetDataCallback cb,
+                              std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_set_data: not logged on, lobby=0x%llx",
+                static_cast<unsigned long long>(lobby_sid));
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CMsgClientMMSSetLobbyData req;
+    req.app_id          = app_id;
+    req.steam_id_lobby  = lobby_sid;
+    req.steam_id_member = steam_id_member;
+    req.max_members     = max_members;
+    req.lobby_type      = lobby_type;
+    req.lobby_flags     = lobby_flags;
+    req.metadata        = std::move(metadata);
+
+    const uint64_t job_id = jobs_.next_job_id();
+    jobs_.track(job_id, [lobby_sid, cb = std::move(cb)](JobResult r) {
+        if (r.synthetic_failure) {
+            WN_LOGI("lobby_set_data: synthetic failure for lobby=0x%llx",
+                    static_cast<unsigned long long>(lobby_sid));
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        auto resp = pb::CMsgClientMMSSetLobbyDataResponse::deserialize(r.body);
+        if (!resp) {
+            WN_LOGE("lobby_set_data: parse failed (%zu bytes)", r.body.size());
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        WN_LOGI("lobby_set_data: lobby=0x%llx eresult=%d",
+                static_cast<unsigned long long>(resp->steam_id_lobby),
+                resp->eresult);
+        if (cb) cb(std::move(resp));
+    }, timeout);
+
+    CMsgProtoBufHeader hdr;
+    hdr.steamid          = steam_id_.load();
+    hdr.client_sessionid = session_id_.load();
+    hdr.jobid_source     = job_id;
+    hdr.jobid_target     = kInvalidJobId;
+    auto wire = encode_proto_envelope(EMsg::ClientMMSSetLobbyData, hdr,
+                                       req.serialize());
+    WN_LOGI("outbound lobby_set_data: app=%u lobby=0x%llx member=0x%llx meta=%zuB",
+            app_id, static_cast<unsigned long long>(lobby_sid),
+            static_cast<unsigned long long>(steam_id_member),
+            req.metadata.size());
+    if (!channel_->send(wire)) {
+        WN_LOGE("lobby_set_data: channel send failed");
+        jobs_.deliver(job_id, -1, "channel send failed", {});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetLobbyOwner — CMsgClientMMSSetLobbyOwner (6615) → response 6616.
+// Host-only operation. On success Steam pushes a 6612 LobbyData with the
+// updated owner_sid; the existing LobbyData observer mirrors that back
+// into pushed().active_lobbies so GetLobbyOwner re-reads cleanly.
+// ---------------------------------------------------------------------------
+void CMClient::lobby_set_owner(uint32_t app_id, uint64_t lobby_sid,
+                                uint64_t new_owner_sid,
+                                LobbySetOwnerCallback cb,
+                                std::chrono::seconds timeout) {
+    if (state_.load() != ClientState::LoggedOn) {
+        WN_LOGI("lobby_set_owner: not logged on, lobby=0x%llx",
+                static_cast<unsigned long long>(lobby_sid));
+        if (cb) cb(std::nullopt);
+        return;
+    }
+    pb::CMsgClientMMSSetLobbyOwner req;
+    req.app_id             = app_id;
+    req.steam_id_lobby     = lobby_sid;
+    req.steam_id_new_owner = new_owner_sid;
+
+    const uint64_t job_id = jobs_.next_job_id();
+    jobs_.track(job_id, [lobby_sid, cb = std::move(cb)](JobResult r) {
+        if (r.synthetic_failure) {
+            WN_LOGI("lobby_set_owner: synthetic failure for lobby=0x%llx",
+                    static_cast<unsigned long long>(lobby_sid));
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        auto resp = pb::CMsgClientMMSSetLobbyOwnerResponse::deserialize(r.body);
+        if (!resp) {
+            WN_LOGE("lobby_set_owner: parse failed (%zu bytes)", r.body.size());
+            if (cb) cb(std::nullopt);
+            return;
+        }
+        WN_LOGI("lobby_set_owner: lobby=0x%llx eresult=%d",
+                static_cast<unsigned long long>(resp->steam_id_lobby),
+                resp->eresult);
+        if (cb) cb(std::move(resp));
+    }, timeout);
+
+    CMsgProtoBufHeader hdr;
+    hdr.steamid          = steam_id_.load();
+    hdr.client_sessionid = session_id_.load();
+    hdr.jobid_source     = job_id;
+    hdr.jobid_target     = kInvalidJobId;
+    auto wire = encode_proto_envelope(EMsg::ClientMMSSetLobbyOwner, hdr,
+                                       req.serialize());
+    WN_LOGI("outbound lobby_set_owner: app=%u lobby=0x%llx new_owner=0x%llx",
+            app_id, static_cast<unsigned long long>(lobby_sid),
+            static_cast<unsigned long long>(new_owner_sid));
+    if (!channel_->send(wire)) {
+        WN_LOGE("lobby_set_owner: channel send failed");
+        jobs_.deliver(job_id, -1, "channel send failed", {});
     }
 }
 

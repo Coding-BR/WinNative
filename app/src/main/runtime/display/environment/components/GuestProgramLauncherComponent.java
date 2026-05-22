@@ -995,6 +995,19 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
     };
     ld_preload = appendFirstExistingPreload(ld_preload, cryptoCandidates);
 
+    // NOTE 2026-05-20: an earlier revision tried to LD_PRELOAD libsteamclient.so
+    // here so its __attribute__((constructor)) would run at box64 exec time and
+    // seed pushed_state from STEAMID/SteamAppId env. That broke every Bionic
+    // launch — libsteamclient.so has DT_NEEDED libwnsteam.so (the linker-merged
+    // sibling from the CM-bridge work) which the dynamic linker can't resolve
+    // in box64's namespace before the imagefs lib dir is on LD_LIBRARY_PATH:
+    //   F linker: CANNOT LINK EXECUTABLE ".../usr/bin/box64": library
+    //   "libwnsteam.so" not found: needed by .../lib/arm64/libsteamclient.so
+    // The env-seed-in-guest-process design now needs a different load trigger
+    // (Wine PE bridge auto-load, or imagefs/usr/lib mirror with siblings in
+    // path) — tracked as a follow-up; do NOT re-add this LD_PRELOAD without
+    // first resolving the libwnsteam.so dependency in the guest process.
+
     File devInputDir = new File(imageFs.getRootDir(), "dev/input");
     devInputDir.mkdirs();
     FakeInputWriter.prepareRingSlots(devInputDir, 4);

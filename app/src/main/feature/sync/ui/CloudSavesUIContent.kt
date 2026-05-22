@@ -94,7 +94,9 @@ import com.winlator.cmod.shared.ui.dialog.WinNativeDialogButton
 import com.winlator.cmod.shared.ui.dialog.WinNativeDialogShell
 import com.winlator.cmod.shared.ui.outlinedSwitchColors
 import com.winlator.cmod.shared.ui.toast.WinToast
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val PageBg = Color(0xFF12121B)
 private val SurfaceDark = Color(0xFF1C1C2A)
@@ -134,6 +136,9 @@ internal fun CloudSavesContent(
     var historyRefreshKey by remember { mutableStateOf(0) }
     var historyLoading by remember { mutableStateOf(false) }
     var historyEntries by remember { mutableStateOf<List<GameSaveBackupManager.BackupHistoryEntry>>(emptyList()) }
+    // True when the Steam Cloud listing couldn't be fetched (renders
+    // the reconnect message instead of the empty-state copy).
+    var historySteamUnreachable by remember { mutableStateOf(false) }
     var entryPendingRestore by remember {
         mutableStateOf<GameSaveBackupManager.BackupHistoryEntry?>(null)
     }
@@ -147,23 +152,31 @@ internal fun CloudSavesContent(
 
     LaunchedEffect(gameSource, gameId, historyRefreshKey) {
         historyLoading = true
-        historyEntries =
-            if (gameSource == GameSaveBackupManager.GameSource.STEAM) {
-                val appId = gameId.toIntOrNull()
+        historySteamUnreachable = false
+        if (gameSource == GameSaveBackupManager.GameSource.STEAM) {
+            val appId = gameId.toIntOrNull()
+            historyEntries =
                 if (appId != null) {
-                    SteamCloudHistoryProvider
-                        .listCloudSaveGroups(context, appId)
+                    when (val r = SteamCloudHistoryProvider.listCloudSaveGroupsDetailed(context, appId)) {
+                        is SteamCloudHistoryProvider.HistoryResult.Entries -> r.list
+                        SteamCloudHistoryProvider.HistoryResult.Empty -> emptyList()
+                        SteamCloudHistoryProvider.HistoryResult.Unreachable -> {
+                            historySteamUnreachable = true
+                            emptyList()
+                        }
+                    }.sortedByDescending { it.timestampMs }
                 } else {
                     emptyList()
                 }
-            } else {
+        } else {
+            historyEntries =
                 GameSaveBackupManager.listBackupHistory(
                     activity,
                     gameSource,
                     gameId,
                     gameName,
-                )
-            }
+                ).sortedByDescending { it.timestampMs }
+        }
         historyLoading = false
     }
 
@@ -230,7 +243,8 @@ internal fun CloudSavesContent(
         TogglePairCard(
             cloudSyncEnabled = cloudSyncEnabled,
             offlineModeEnabled = offlineModeEnabled,
-            showCloudSync = !steamManagedCloud,
+            showOfflineMode = !steamManagedCloud,
+            cloudSyncDisableSemantics = steamManagedCloud,
             onCloudSyncToggle = onCloudSyncToggle,
             onOfflineModeToggle = onOfflineModeToggle,
         )
@@ -437,6 +451,8 @@ internal fun CloudSavesContent(
             val steamSyncFailed = stringResource(R.string.cloud_saves_steam_sync_failed)
             val steamBrowseNoBrowser = stringResource(R.string.cloud_saves_steam_browse_no_browser)
             val steamImportPickerUnavailable = stringResource(R.string.cloud_saves_steam_import_picker_unavailable)
+            val steamPushSuccess = stringResource(R.string.cloud_saves_steam_push_success)
+            val steamPushFailed = stringResource(R.string.cloud_saves_steam_push_failed)
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val compact = maxWidth < 520.dp
                 val syncAction: @Composable (Modifier) -> Unit = { mod ->
@@ -513,6 +529,39 @@ internal fun CloudSavesContent(
                         },
                     )
                 }
+                // Force-upload local save to Steam Cloud.
+                val pushAction: @Composable (Modifier) -> Unit = { mod ->
+                    ActionWithHelper(
+                        icon = Icons.Outlined.CloudUpload,
+                        label = stringResource(R.string.cloud_saves_steam_push_label),
+                        helper = stringResource(R.string.cloud_saves_steam_push_helper),
+                        tint = CloudAccent,
+                        modifier = mod,
+                        enabled = !steamBusy && shortcut != null && steamAppIdInt != null,
+                        onClick = {
+                            val sc = shortcut ?: return@ActionWithHelper
+                            if (steamBusy) return@ActionWithHelper
+                            scope.launch {
+                                steamBusy = true
+                                try {
+                                    val ok =
+                                        withContext(Dispatchers.IO) {
+                                            SteamCloudSyncHelper
+                                                .uploadLocalSavesBlocking(activity, sc)
+                                        }
+                                    WinToast.show(
+                                        context,
+                                        if (ok) steamPushSuccess else steamPushFailed,
+                                        Toast.LENGTH_SHORT,
+                                    )
+                                } finally {
+                                    steamBusy = false
+                                    historyRefreshKey++
+                                }
+                            }
+                        },
+                    )
+                }
                 if (compact) {
                     Column(
                         modifier = Modifier.fillMaxWidth(),
@@ -523,14 +572,14 @@ internal fun CloudSavesContent(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             syncAction(Modifier.weight(1f))
-                            browseAction(Modifier.weight(1f))
+                            pushAction(Modifier.weight(1f))
                         }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
+                            browseAction(Modifier.weight(1f))
                             importAction(Modifier.weight(1f))
-                            Spacer(Modifier.weight(1f))
                         }
                     }
                 } else {
@@ -539,6 +588,7 @@ internal fun CloudSavesContent(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         syncAction(Modifier.weight(1f))
+                        pushAction(Modifier.weight(1f))
                         browseAction(Modifier.weight(1f))
                         importAction(Modifier.weight(1f))
                     }
@@ -549,6 +599,7 @@ internal fun CloudSavesContent(
         SaveHistorySection(
             loading = historyLoading,
             entries = historyEntries,
+            steamUnreachable = historySteamUnreachable,
             onRefresh = {
                 historyRefreshKey++
             },
@@ -883,6 +934,7 @@ internal fun CloudSavesContent(
 private fun SaveHistorySection(
     loading: Boolean,
     entries: List<GameSaveBackupManager.BackupHistoryEntry>,
+    steamUnreachable: Boolean = false,
     onRefresh: () -> Unit,
     onRestore: (GameSaveBackupManager.BackupHistoryEntry) -> Unit,
     onRename: (GameSaveBackupManager.BackupHistoryEntry) -> Unit,
@@ -921,6 +973,15 @@ private fun SaveHistorySection(
                 loading -> {
                     Text(
                         stringResource(R.string.cloud_saves_history_loading),
+                        color = TextSecondary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
+
+                entries.isEmpty() && steamUnreachable -> {
+                    Text(
+                        stringResource(R.string.cloud_saves_history_steam_unreachable),
                         color = TextSecondary,
                         fontSize = 12.sp,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -1187,24 +1248,41 @@ private fun TogglePairCard(
     cloudSyncEnabled: Boolean,
     offlineModeEnabled: Boolean,
     showCloudSync: Boolean = true,
+    showOfflineMode: Boolean = true,
+    cloudSyncDisableSemantics: Boolean = false,
     onCloudSyncToggle: (Boolean) -> Unit,
     onOfflineModeToggle: (Boolean) -> Unit,
 ) {
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val stacked = maxWidth < 380.dp
+        val offlineGates = showOfflineMode && offlineModeEnabled
+        // Disable semantics: checked = cloud OFF. Enable semantics: checked = cloud ON.
         val cloudSyncCell: @Composable (Modifier) -> Unit = { mod ->
             TogglePaneCell(
                 modifier = mod,
-                title = stringResource(R.string.cloud_sync_title),
+                title = stringResource(
+                    if (cloudSyncDisableSemantics) {
+                        R.string.cloud_sync_disable_title
+                    } else {
+                        R.string.cloud_sync_title
+                    },
+                ),
                 summary =
                     if (cloudSyncEnabled) {
                         stringResource(R.string.cloud_sync_enabled_summary)
                     } else {
                         stringResource(R.string.cloud_sync_disabled_summary)
                     },
-                checked = cloudSyncEnabled && !offlineModeEnabled,
-                enabled = !offlineModeEnabled,
-                onCheckedChange = onCloudSyncToggle,
+                checked =
+                    if (cloudSyncDisableSemantics) {
+                        !cloudSyncEnabled
+                    } else {
+                        cloudSyncEnabled && !offlineGates
+                    },
+                enabled = !offlineGates,
+                onCheckedChange = { value ->
+                    onCloudSyncToggle(if (cloudSyncDisableSemantics) !value else value)
+                },
             )
         }
         val offlineCell: @Composable (Modifier) -> Unit = { mod ->
@@ -1220,6 +1298,10 @@ private fun TogglePairCard(
         }
         if (!showCloudSync) {
             offlineCell(Modifier.fillMaxWidth())
+            return@BoxWithConstraints
+        }
+        if (!showOfflineMode) {
+            cloudSyncCell(Modifier.fillMaxWidth())
             return@BoxWithConstraints
         }
         if (stacked) {

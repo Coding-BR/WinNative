@@ -48,87 +48,121 @@ object SteamCloudHistoryProvider {
     /** SharedPrefs file for user-set group labels (Steam Cloud has no native label support). */
     private const val LABEL_PREFS = "steam_cloud_history_labels"
 
+    /** Distinguishes "no cloud saves" from "Steam unreachable" for the UI. */
+    sealed class HistoryResult {
+        data class Entries(val list: List<BackupHistoryEntry>) : HistoryResult()
+        object Empty : HistoryResult()
+        object Unreachable : HistoryResult()
+    }
+
     /**
-     * Fetch the current Steam Cloud file listing for [appId] and group the files into
-     * "save events" by timestamp clusters. Returns the [MAX_GROUPS] newest groups as
-     * [BackupHistoryEntry] rows with `storage = BackupStorage.STEAM_CLOUD`.
-     *
-     * Returns an empty list if Steam is unavailable, the user isn't signed in, or the
-     * cloud listing is empty.
+     * Fetch the Steam Cloud file list for [appId] and group the files into
+     * "save events" by timestamp clusters. Detailed variant returns
+     * [HistoryResult.Unreachable] when wn-session can't be reached so the
+     * UI can distinguish that from a genuinely empty save list.
      */
+    suspend fun listCloudSaveGroupsDetailed(
+        context: Context,
+        appId: Int,
+    ): HistoryResult =
+        withContext(Dispatchers.IO) {
+            try {
+                val response = SteamService.fetchCloudFileList(appId, 0L)
+                    ?: return@withContext HistoryResult.Unreachable
+                val list = buildEntries(context, appId, response)
+                if (list.isEmpty()) HistoryResult.Empty else HistoryResult.Entries(list)
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "listCloudSaveGroupsDetailed failed for appId=%d", appId)
+                HistoryResult.Unreachable
+            }
+        }
+
+    /** Flat-list shim — empty list for both Empty + Unreachable. */
     suspend fun listCloudSaveGroups(
         context: Context,
         appId: Int,
     ): List<BackupHistoryEntry> =
-        withContext(Dispatchers.IO) {
-            try {
-                val response = SteamService.fetchCloudFileList(appId, 0L) ?: return@withContext emptyList()
-
-                val persistedFiles: List<SteamAutoCloud.CloudFileInfo> =
-                    response.files
-                        .filter { it.isPersisted }
-                        .sortedByDescending { it.timestamp }
-
-                if (persistedFiles.isEmpty()) return@withContext emptyList()
-
-                // Cluster files by timestamp proximity. Walk sorted-DESC files; each new file
-                // either joins the open cluster (if its timestamp is within GROUP_WINDOW_MS of
-                // the cluster's most-recent member) or starts a fresh cluster.
-                class FileCluster {
-                    val files = mutableListOf<SteamAutoCloud.CloudFileInfo>()
-                    val timestamps = mutableListOf<Long>()
-                    fun representativeTs(): Long = timestamps.maxOrNull() ?: 0L
-                    fun earliestTs(): Long = timestamps.minOrNull() ?: 0L
-                }
-
-                val clusters = mutableListOf<FileCluster>()
-                for (file in persistedFiles) {
-                    val ts: Long = file.timestamp.takeIf { it > 0L } ?: continue
-                    val current: FileCluster? = clusters.lastOrNull()
-                    val joinsCurrent: Boolean =
-                        current != null && (current.representativeTs() - ts) <= GROUP_WINDOW_MS
-                    val target: FileCluster =
-                        if (joinsCurrent) {
-                            current!!
-                        } else {
-                            FileCluster().also { clusters += it }
-                        }
-                    target.files += file
-                    target.timestamps += ts
-                }
-
-                val labelPrefs = context.getSharedPreferences(LABEL_PREFS, Context.MODE_PRIVATE)
-
-                clusters
-                    .take(MAX_GROUPS)
-                    .map { cluster ->
-                        val sortedFilenames = cluster.files.map { it.filename }.sorted()
-                        val groupId = buildGroupId(sortedFilenames, cluster.earliestTs())
-                        val totalSize = cluster.files.sumOf { it.rawFileSize }
-                        val timestampMs = cluster.representativeTs()
-                        val label = labelPrefs.getString("$appId:$groupId", null)
-                        val firstFile = cluster.files.first().filename
-                        val fileName =
-                            if (cluster.files.size == 1) {
-                                firstFile
-                            } else {
-                                "$firstFile (+${cluster.files.size - 1} more)"
-                            }
-                        BackupHistoryEntry(
-                            fileId = "$appId:$groupId",
-                            fileName = fileName,
-                            timestampMs = timestampMs,
-                            origin = BackupOrigin.CLOUD,
-                            sizeBytes = totalSize,
-                            label = label,
-                            storage = BackupStorage.STEAM_CLOUD,
-                        )
-                    }
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "listCloudSaveGroups failed for appId=%d", appId)
-                emptyList()
-            }
+        when (val r = listCloudSaveGroupsDetailed(context, appId)) {
+            is HistoryResult.Entries -> r.list
+            HistoryResult.Empty, HistoryResult.Unreachable -> emptyList()
         }
+
+    // Normalize a cloud file timestamp to epoch millis (files report seconds, millis, or double-scaled).
+    private fun toMillis(v: Long): Long =
+        when {
+            v <= 0L -> 0L
+            v < 100_000_000_000L -> v * 1000L
+            v > 100_000_000_000_000L -> v / 1000L
+            else -> v
+        }
+
+    /** Shared cluster + group-entry builder for both variants. */
+    private fun buildEntries(
+        context: Context,
+        appId: Int,
+        response: SteamAutoCloud.CloudFileChangeList,
+    ): List<BackupHistoryEntry> {
+        val persistedFiles: List<SteamAutoCloud.CloudFileInfo> =
+            response.files
+                .filter { it.isPersisted }
+                .sortedByDescending { toMillis(it.timestamp) }
+
+        if (persistedFiles.isEmpty()) return emptyList()
+
+        // Cluster files by timestamp proximity. Walk sorted-DESC files; each new file
+        // either joins the open cluster (if its timestamp is within GROUP_WINDOW_MS of
+        // the cluster's most-recent member) or starts a fresh cluster.
+        class FileCluster {
+            val files = mutableListOf<SteamAutoCloud.CloudFileInfo>()
+            val timestamps = mutableListOf<Long>()
+            fun representativeTs(): Long = timestamps.maxOrNull() ?: 0L
+            fun earliestTs(): Long = timestamps.minOrNull() ?: 0L
+        }
+
+        val clusters = mutableListOf<FileCluster>()
+        for (file in persistedFiles) {
+            val ts: Long = toMillis(file.timestamp).takeIf { it > 0L } ?: continue
+            val current: FileCluster? = clusters.lastOrNull()
+            val joinsCurrent: Boolean =
+                current != null && (current.representativeTs() - ts) <= GROUP_WINDOW_MS
+            val target: FileCluster =
+                if (joinsCurrent) {
+                    current!!
+                } else {
+                    FileCluster().also { clusters += it }
+                }
+            target.files += file
+            target.timestamps += ts
+        }
+
+        val labelPrefs = context.getSharedPreferences(LABEL_PREFS, Context.MODE_PRIVATE)
+
+        return clusters
+            .take(MAX_GROUPS)
+            .map { cluster ->
+                val sortedFilenames = cluster.files.map { it.filename }.sorted()
+                val groupId = buildGroupId(sortedFilenames, cluster.earliestTs())
+                val totalSize = cluster.files.sumOf { it.rawFileSize }
+                val timestampMs = cluster.representativeTs()
+                val label = labelPrefs.getString("$appId:$groupId", null)
+                val firstFile = cluster.files.first().filename
+                val fileName =
+                    if (cluster.files.size == 1) {
+                        firstFile
+                    } else {
+                        "$firstFile (+${cluster.files.size - 1} more)"
+                    }
+                BackupHistoryEntry(
+                    fileId = "$appId:$groupId",
+                    fileName = fileName,
+                    timestampMs = timestampMs,
+                    origin = BackupOrigin.CLOUD,
+                    sizeBytes = totalSize,
+                    label = label,
+                    storage = BackupStorage.STEAM_CLOUD,
+                )
+            }
+    }
 
     /**
      * Restore the cloud state by syncing the entire current cloud file set to local.

@@ -4,6 +4,24 @@
 
 namespace wn_steam::pb {
 
+std::vector<uint8_t> CPlayer_SetRichPresence_Request::serialize() const {
+    std::vector<uint8_t> out;
+    proto::Writer w(out);
+    // appid is REQUIRED on this method even when 0 — appid==0 is the
+    // launcher context (no game bound), which Steam still routes. Use
+    // the force-emit variant so a no-game RP clear works.
+    w.uint32_field_force(1, appid);
+    for (const auto& kv : rich_presence) {
+        // Each KV is a length-delimited nested message under field 2.
+        std::vector<uint8_t> sub;
+        proto::Writer sw(sub);
+        sw.string_field(1, kv.key);
+        sw.string_field(2, kv.value);
+        w.submessage_field(2, sub);
+    }
+    return out;
+}
+
 std::vector<uint8_t> CPlayer_GetOwnedGames_Request::serialize() const {
     std::vector<uint8_t> out;
     proto::Writer w(out);

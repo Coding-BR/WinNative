@@ -169,6 +169,51 @@ object PrefManager {
             setInt("steam_user_account_id", value)
         }
 
+    /**
+     * libsteamclient.so primary mode (was "Hybrid Steam client mode").
+     *
+     * Default TRUE — `libsteamclient.so` is the SINGLE process-wide
+     * Steam logon for the whole app lifetime. After wn-session signs
+     * in successfully, the refresh token is handed off to the
+     * libsteamclient.so-backed bootstrap; wn-session is then suspended
+     * (suspendedForBionic=true). SteamService backend ops route through
+     * `WnSteamBootstrap` JNI accessors which dispatch to the .so's
+     * ISteam* vtables.
+     *
+     * The flag remains as a debug kill-switch — flipping it OFF rolls
+     * back to "wn-session is the live session, libsteamclient.so is a
+     * passive mirror". The hand-off path has a try/catch that releases
+     * the hand-off and resumes wn-session if libsteamclient.so's
+     * `prewarm` fails, so default-on is safe even on a flaky boot.
+     *
+     * Pre-existing user prefs with `wn_hybrid_mode=false` survive (read
+     * returns the stored value, not the default); only fresh installs
+     * get the new TRUE default.
+     */
+    var wnHybridMode: Boolean
+        get() = getBoolean("wn_hybrid_mode", true)
+        set(value) {
+            setBoolean("wn_hybrid_mode", value)
+        }
+
+    /**
+     * Steam Launcher kill-switch. When TRUE, Bionic Steam mode launches the game
+     * through `wn-steam-launcher.exe` (Wine-side, in-process Valve Steam
+     * host) instead of `wn-steam-helper.exe` (cross-process bridge). Plan
+     * W eliminates the IPC step that blocks Steam Networking Sockets /
+     * SDR / P2P callbacks under the helper path.
+     *
+     * Default TRUE: Bionic Steam mode without Steam Launcher has no online
+     * matchmaking, so the helper path is only useful for offline /
+     * single-player diagnosis. Flip OFF (`wn_plan_w=false`) to fall back
+     * to the helper if a Steam Launcher launch can't reach a Steam logon.
+     */
+    var wnPlanW: Boolean
+        get() = getBoolean("wn_plan_w", true)
+        set(value) {
+            setBoolean("wn_plan_w", value)
+        }
+
     var cellId: Int
         get() = getInt("cell_id", 0)
         set(value) {
@@ -197,6 +242,25 @@ object PrefManager {
         get() = getString("steam_user_avatar_hash", "")
         set(value) {
             setString("steam_user_avatar_hash", value)
+        }
+
+    /**
+     * JSON snapshot of the most-recently observed friend personas
+     * (sid/name/state/app/avatarHash quartets — the same shape
+     * wn-session's nativeGetFriendPersonas emits). Refreshed on every
+     * SteamService friend-personas push; replayed on cold-boot via
+     * [com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
+     * .seedFromPrefManager] so games' friend overlays render
+     * immediately rather than 5-10s after wn-session reconnects.
+     *
+     * Empty string when no snapshot has been observed yet (fresh
+     * install or signed-out). No TTL — wn-session's authoritative
+     * push later in the session displaces stale entries wholesale.
+     */
+    var friendsSnapshotJson: String
+        get() = getString("friends_snapshot_json", "")
+        set(value) {
+            setString("friends_snapshot_json", value)
         }
 
     var personaState: Int

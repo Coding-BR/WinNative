@@ -192,5 +192,18 @@
             android:name="com.google.android.gms.games.provider.PlayGamesInitProvider"
             tools:node="remove" />
 
+        <!-- Hybrid Steam mode adb-driven control receiver. Lets the cron
+             test loop flip wn_hybrid_mode + observe state without UI
+             navigation. Exported = true for `adb shell am broadcast`;
+             no permission gate because the behavior is reachable from
+             Settings > Debug anyway. See HybridModeReceiver.kt. -->
+        <receiver
+            android:name="com.winlator.cmod.feature.stores.steam.service.HybridModeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.winnative.cmod.action.HYBRID_MODE" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>

@@ -1163,7 +1163,15 @@ Installed path:
     <string name="cloud_saves_sync_summary">Pull the version %1$s has right now.</string>
     <string name="cloud_saves_sync_summary_generic">Pull the current cloud version.</string>
     <string name="cloud_saves_no_backups">No backups yet for this game.</string>
-    <string name="cloud_sync_title">Auto Cloud Sync</string>
+    <string name="cloud_sync_title">Cloud Saves</string>
+    <string name="cloud_sync_disable_title">Disable Cloud Saves</string>
+    <string name="cloud_saves_steam_push_label">Push to Steam Cloud</string>
+    <string name="cloud_saves_steam_push_helper">Force-upload local save</string>
+    <string name="cloud_saves_steam_push_success">Save pushed to Steam Cloud.</string>
+    <string name="cloud_saves_steam_push_failed">Could not push save to Steam Cloud.</string>
+    <string name="cloud_saves_history_steam_unreachable">Steam Cloud is unreachable right now. Reconnecting in the background… tap refresh once you’re back online.</string>
+    <string name="steam_real_session_expired_toast">Steam session expired — please sign in again before launching Real Steam Client</string>
+    <string name="steam_session_refused_event">Steam refused the cached session (EResult=%1$d). Please sign in again.</string>
     <string name="cloud_sync_enabled_summary">Download on launch, push on exit.</string>
     <string name="cloud_sync_disabled_summary">Launch without cloud save download or exit sync.</string>
     <string name="cloud_saves_offline_mode">Disable Cloud Sync</string>

@@ -187,6 +187,11 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private static final long STEAM_TERMINATION_POLL_MS = 1000L;
     private static final long STEAM_PROCESS_RESPONSE_TIMEOUT_MS = 2000L;
     private static final long STEAM_TERMINATION_TIMEOUT_MS = 30000L;
+    // Steam Launcher exit: how long to wait for wn-steam-launcher.exe to finish its
+    // STEP 6 cloud-save upload and self-exit before forcing teardown. Generous
+    // — the upload is a real transfer (saves can be tens of MB) with up to 3
+    // retry attempts; killing it early would lose the just-played progress.
+    private static final long PLANW_EXIT_UPLOAD_TIMEOUT_MS = 150000L;
     private static final String STEAM_REGISTRY_KEY = "Software\\Valve\\Steam";
     private static final String STEAM_ROOT_PATH = "C:\\Program Files (x86)\\Steam";
     private static final String STEAM_EXE_PATH = STEAM_ROOT_PATH + "\\steam.exe";
@@ -199,6 +204,11 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private static final String PREVIOUS_CONTAINER_STEAM_CLIENT_STORE_RELATIVE_PATH = ".wine/.steam-client-store";
     private static final String LEGACY_STEAM_CLIENT_STORE_RELATIVE_PATH = ".wine/drive_c/WinNative/SteamClient";
     public static final String EXTRA_LAUNCHED_FROM_PINNED_SHORTCUT = "launched_from_pinned_shortcut";
+
+    // Steam Launcher: basename of the game exe (e.g. "MHST.exe") for the current
+    // launch. Set when a Steam Launcher Steam game starts; used at exit to terminate
+    // the game so wn-steam-launcher.exe can run its cloud-save upload.
+    private volatile String planWGameProcessName;
 
     // Real Steam launch flags — see the launchRealSteam branch in
     // getWineStartCommand for the full analysis. Mirrors GameNative's command
@@ -542,6 +552,32 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         super.onNewIntent(intent);
         if (intent == null) return;
 
+        // Debug RPC: programmatically inject a pointer click at Wine coords.
+        // The InputControlsView + TouchpadView chain doesn't pass adb-driven
+        // taps cleanly through to the wine renderer for some games' menus,
+        // so this skips the input-overlay stack entirely and calls the
+        // XServer injection API directly. Coords are in wine logical-pixel
+        // space (e.g. 1280x720 for a default Wine desktop).
+        //   adb shell am start -a com.winnative.cmod.DEBUG_INJECT_TAP \
+        //     -n com.winnative.cmod/com.winlator.cmod.runtime.display.XServerDisplayActivity \
+        //     --ei x 155 --ei y 280
+        if ("com.winnative.cmod.DEBUG_INJECT_TAP".equals(intent.getAction())) {
+            handleDebugInjectTap(intent);
+            return;
+        }
+
+        // Companion to DEBUG_INJECT_TAP — injects an X keypress + release.
+        //   adb shell am start -a com.winnative.cmod.DEBUG_INJECT_KEY \
+        //     -n com.winnative.cmod/com.winlator.cmod.runtime.display.XServerDisplayActivity \
+        //     --es key DOWN
+        // Supported `key` values: name of an XKeycode enum without
+        // the "KEY_" prefix (DOWN, UP, LEFT, RIGHT, ENTER, ESC, TAB,
+        // SPACE, etc.).
+        if ("com.winnative.cmod.DEBUG_INJECT_KEY".equals(intent.getAction())) {
+            handleDebugInjectKey(intent);
+            return;
+        }
+
         String incomingShortcutPath = intent.getStringExtra("shortcut_path");
         String incomingShortcutUuid = intent.getStringExtra("shortcut_uuid");
         int incomingContainerId = intent.getIntExtra("container_id", 0);
@@ -565,6 +601,104 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             Log.d("XServerDisplayActivity", "onNewIntent: launch target changed, cleaning up before recreation");
             switchLaunchTargetAfterCleanup(intent);
         }
+    }
+
+    private void handleDebugInjectKey(Intent intent) {
+        if (xServer == null) {
+            Log.w("XServerDisplayActivity", "DEBUG_INJECT_KEY: xServer not ready");
+            return;
+        }
+        String key = intent.getStringExtra("key");
+        if (key == null || key.isEmpty()) {
+            Log.w("XServerDisplayActivity", "DEBUG_INJECT_KEY: missing `key` extra");
+            return;
+        }
+        com.winlator.cmod.runtime.display.xserver.XKeycode kc;
+        try {
+            kc = com.winlator.cmod.runtime.display.xserver.XKeycode
+                    .valueOf("KEY_" + key.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            Log.w("XServerDisplayActivity", "DEBUG_INJECT_KEY: unknown key " + key);
+            return;
+        }
+        int holdMs = intent.getIntExtra("hold_ms", 80);
+        Log.i("XServerDisplayActivity", "DEBUG_INJECT_KEY: " + kc + " hold=" + holdMs);
+        xServer.injectKeyPress(kc);
+        final com.winlator.cmod.runtime.display.xserver.XKeycode finalKc = kc;
+        new android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(() -> xServer.injectKeyRelease(finalKc), holdMs);
+    }
+
+    private void handleDebugInjectTap(Intent intent) {
+        if (xServer == null) {
+            Log.w("XServerDisplayActivity", "DEBUG_INJECT_TAP: xServer not ready");
+            return;
+        }
+        int x = intent.getIntExtra("x", -1);
+        int y = intent.getIntExtra("y", -1);
+        // Normalized coords (0.0-1.0) — easier to calibrate from a
+        // screenshot than absolute xServer pixel coords, since we don't
+        // know the xServer.screenInfo size at the caller. If nx/ny are
+        // present, they override absolute coords.
+        float nx = intent.getFloatExtra("nx", -1f);
+        float ny = intent.getFloatExtra("ny", -1f);
+        if (nx >= 0f && ny >= 0f) {
+            x = (int) (nx * xServer.screenInfo.width);
+            y = (int) (ny * xServer.screenInfo.height);
+        }
+        String button = intent.getStringExtra("button");
+        if (x < 0 || y < 0) {
+            Log.w("XServerDisplayActivity", "DEBUG_INJECT_TAP: bad coords x=" + x + " y=" + y);
+            return;
+        }
+        final Pointer.Button btn = "right".equalsIgnoreCase(button)
+                ? Pointer.Button.BUTTON_RIGHT
+                : Pointer.Button.BUTTON_LEFT;
+        // Optional "press_delay" + "hold_ms" extras let callers tune
+        // the move→press and press→release timing for games that don't
+        // accept instant programmatic clicks. Defaults match observed
+        // physical-tap timing (~80ms press-to-release window).
+        int pressDelay = intent.getIntExtra("press_delay", 80);
+        int holdMs = intent.getIntExtra("hold_ms", 80);
+        // `winhandler` extra (default true) drives the winHandler
+        // mouseEvent path in PARALLEL with the X-protocol injectPointer*
+        // path. Some wine apps (especially older wine launchers that
+        // don't use the X server's input grab) only see clicks
+        // delivered via the Win32 ABSOLUTE-mouse channel.
+        boolean useWinHandler = intent.getBooleanExtra("winhandler", true);
+        final int btnDown = btn == Pointer.Button.BUTTON_RIGHT
+                ? MouseEventFlags.RIGHTDOWN
+                : MouseEventFlags.LEFTDOWN;
+        final int btnUp = btn == Pointer.Button.BUTTON_RIGHT
+                ? MouseEventFlags.RIGHTUP
+                : MouseEventFlags.LEFTUP;
+        Log.i("XServerDisplayActivity",
+                "DEBUG_INJECT_TAP: x=" + x + " y=" + y + " btn=" + btn
+                        + " screen=" + xServer.screenInfo.width + "x" + xServer.screenInfo.height
+                        + " press_delay=" + pressDelay + " hold_ms=" + holdMs
+                        + " winhandler=" + useWinHandler);
+        xServer.injectPointerMove(x, y);
+        if (useWinHandler && xServer.getWinHandler() != null) {
+            xServer.getWinHandler().mouseEvent(
+                    MouseEventFlags.MOVE | MouseEventFlags.ABSOLUTE, x, y, 0);
+        }
+        final int finalX = x;
+        final int finalY = y;
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.postDelayed(() -> {
+            xServer.injectPointerButtonPress(btn);
+            if (useWinHandler && xServer.getWinHandler() != null) {
+                xServer.getWinHandler().mouseEvent(
+                        btnDown | MouseEventFlags.ABSOLUTE, finalX, finalY, 0);
+            }
+            h.postDelayed(() -> {
+                xServer.injectPointerButtonRelease(btn);
+                if (useWinHandler && xServer.getWinHandler() != null) {
+                    xServer.getWinHandler().mouseEvent(
+                            btnUp | MouseEventFlags.ABSOLUTE, finalX, finalY, 0);
+                }
+            }, holdMs);
+        }, pressDelay);
     }
 
     private void switchLaunchTargetAfterCleanup(Intent intent) {
@@ -601,6 +735,51 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         super.onCreate(savedInstanceState);
         AppUtils.hideSystemUI(this);
         AppUtils.keepScreenOn(this);
+        // Allow the X server / Wine renderer to attach a Surface while the
+        // device is on the secure keyguard. Without this, the lockscreen
+        // hides our Surface, the renderer reports "no windows remain", and
+        // the WinHandler watcher exits the session before the game can
+        // even draw its first frame — observed booting Among Us at 17:07
+        // where Among Us.exe loaded all Wine DLLs + lsteamclient.dll, then
+        // the session torn-down at "Hiding hud as no renderer windows
+        // remain" because the lockscreen was on top. Per Android SDK:
+        // setShowWhenLocked(true) draws the Activity above the keyguard;
+        // setTurnScreenOn(true) wakes the display when the Activity comes
+        // to front. The keyguard still gates user input (taps reach the
+        // keyguard not the game) but the renderer keeps a viewport so the
+        // game proceeds with its boot — which is what we need for adb-
+        // driven test runs where the developer's screen is locked.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        } else {
+            getWindow().addFlags(
+                android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                | android.view.WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
+        }
+        // setShowWhenLocked alone leaves mKeyguardOccluded=false on some
+        // OEM skins (observed on OPLUS — keyguard rendered above our
+        // SurfaceView, X server gets no usable buffer, Wine renderer
+        // tears down within ~16s). requestDismissKeyguard asks the
+        // KeyguardManager to actually remove the keyguard for this
+        // activity's lifetime; on a non-secure lock it dismisses, on a
+        // secure lock it lights up the PIN/biometric prompt with the
+        // activity behind it (still better than the activity behind
+        // the full lockscreen). Best-effort: silently ignored on
+        // pre-26 + when no keyguard service.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            try {
+                android.app.KeyguardManager km = (android.app.KeyguardManager)
+                    getSystemService(Context.KEYGUARD_SERVICE);
+                if (km != null && km.isKeyguardLocked()) {
+                    km.requestDismissKeyguard(this, null);
+                }
+            } catch (Throwable t) {
+                Log.w("XServerDisplayActivity",
+                    "requestDismissKeyguard failed: " + t.getMessage());
+            }
+        }
         // Clean up any shared debug logs and prepare for fresh session logging
         DebugFragment.Companion.cleanupSharedLogs();
         com.winlator.cmod.runtime.system.LogManager.prepareForNewSession(this);
@@ -1322,11 +1501,18 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 UpdateChecker.INSTANCE.cancelPostGameCheck();
 
                 if (!sessionToReuse) {
-                    SteamLaunchCloudSync.syncBeforeLaunch(
-                            this,
-                            shortcut,
-                            isCloudSyncEnabledForShortcut(),
-                            this::showLaunchPreloader);
+                    // Steam Launcher runs its own cloud download; skip the
+                    // Android-side launch sync when it owns the game.
+                    boolean steamLauncherActive = isBionicSteamEnabledForShortcut()
+                            && com.winlator.cmod.feature.stores.steam.utils
+                                    .PrefManager.INSTANCE.getWnPlanW();
+                    if (!steamLauncherActive) {
+                        SteamLaunchCloudSync.syncBeforeLaunch(
+                                this,
+                                shortcut,
+                                isCloudSyncEnabledForShortcut(),
+                                this::showLaunchPreloader);
+                    }
                     EpicLaunchCloudSync.syncBeforeLaunch(
                             this,
                             shortcut,
@@ -2096,6 +2282,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private boolean beginSessionCleanup(String trigger) {
         if (sessionCleanupStarted.compareAndSet(false, true)) {
             Log.d("XServerDisplayActivity", "Starting session cleanup from " + trigger);
+            com.winlator.cmod.feature.steamcloudsync.SteamLauncherConflictWatcher.stop();
             try {
                 if (perfController != null) perfController.stop();
             } catch (Throwable t) {
@@ -2488,6 +2675,20 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             return;
         }
 
+        // Steam Launcher Steam games run cloud sync inside wn-steam-launcher.exe
+        // (download at launch, upload at exit), independent of the Android-side
+        // cloud system and its offline_mode / cloud_sync_disabled extras. The
+        // launcher already downloaded saves at launch regardless of those
+        // flags, so its exit upload must run too — gating it behind them would
+        // download saves but never write play progress back. Handle it before
+        // the Android-side gate, which only governs the legacy cloud path.
+        if ("STEAM".equals(shortcut.getExtra("game_source"))
+                && com.winlator.cmod.feature.stores.steam.utils
+                        .PrefManager.INSTANCE.getWnPlanW()) {
+            syncPlanWCloudOnExit(onComplete);
+            return;
+        }
+
         if (!isCloudSyncEnabledForShortcut() || com.winlator.cmod.feature.sync.CloudSyncHelper.isOfflineMode(shortcut)) {
             onComplete.run();
             return;
@@ -2759,6 +2960,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             return;
         }
 
+        // Goldberg path only — Steam Launcher exit sync runs in
+        // syncStoreCloudOnExit, ahead of the Android-side cloud gate.
         runExitUploadWithRetries(
                 "Steam cloud sync for appId=" + appId,
                 "Cloud Sync Uploading...",
@@ -2774,6 +2977,68 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                                                         result.getMessage(),
                                                         result.getRetryable()))),
                 onComplete);
+    }
+
+    /**
+     * Steam Launcher exit cloud sync. wn-steam-launcher.exe hosts the only live Steam
+     * session and uploads cloud saves (its STEP 6) once the game process is
+     * gone. Terminate the game to trigger that, then wait for the launcher to
+     * finish and self-exit before container teardown kills it.
+     */
+    private void syncPlanWCloudOnExit(Runnable onComplete) {
+        final String launcherProc = "wn-steam-launcher.exe";
+        final String gameProc = planWGameProcessName;
+        preloaderDialog.showOnUiThread("Cloud Sync Uploading...");
+
+        Executors.newSingleThreadExecutor().execute(() -> {
+            try {
+                if (!isPlanWProcessRunning(launcherProc)) {
+                    Log.i("XServerDisplayActivity",
+                            "Steam Launcher exit: wn-steam-launcher.exe not running — "
+                                    + "no cloud upload to wait for");
+                    return;
+                }
+                if (winHandler != null && gameProc != null && !gameProc.isEmpty()) {
+                    Log.i("XServerDisplayActivity",
+                            "Steam Launcher exit: terminating " + gameProc
+                                    + " to trigger launcher cloud upload");
+                    winHandler.killProcess(gameProc);
+                }
+                long deadline = System.currentTimeMillis()
+                        + PLANW_EXIT_UPLOAD_TIMEOUT_MS;
+                while (System.currentTimeMillis() < deadline) {
+                    Thread.sleep(700);
+                    if (!isPlanWProcessRunning(launcherProc)) {
+                        Log.i("XServerDisplayActivity",
+                                "Steam Launcher exit: wn-steam-launcher.exe finished — "
+                                        + "cloud upload complete");
+                        return;
+                    }
+                }
+                Log.w("XServerDisplayActivity",
+                        "Steam Launcher exit: wn-steam-launcher.exe still running after "
+                                + PLANW_EXIT_UPLOAD_TIMEOUT_MS
+                                + "ms — proceeding with teardown");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                Log.w("XServerDisplayActivity",
+                        "Steam Launcher exit cloud upload wait failed", e);
+            } finally {
+                runOnUiThread(onComplete);
+            }
+        });
+    }
+
+    /** True if a Wine process with the given exe name is currently running. */
+    private boolean isPlanWProcessRunning(String exeName) {
+        ArrayList<ProcessInfo> snapshot = captureWinHandlerProcessSnapshot();
+        if (snapshot == null) return false;
+        String target = normalizeProcessName(exeName);
+        for (ProcessInfo info : snapshot) {
+            if (normalizeProcessName(info.name).equals(target)) return true;
+        }
+        return false;
     }
 
     private void syncEpicCloudOnExit(Runnable onComplete) {
@@ -2906,12 +3171,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             } catch (Exception ignored) {}
         }
 
-        // LEAK FIX: Explicitly destroy the renderer to unregister listeners from the persistent XServer
-        if (xServerView != null) {
-            VulkanRenderer renderer = xServerView.getRenderer();
-            if (renderer != null) renderer.destroy();
-        }
-
         if (exitRequested.get()) {
             SessionKeepAliveService.stopSession(this);
         }
@@ -2984,19 +3243,71 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
     private boolean isBionicSteamEnabledForShortcut() {
         if (!isSteamShortcut()) return false;
-        return shortcut != null
+        // Real Steam + ColdClient outrank Bionic — if either is on,
+        // Bionic is suppressed (matches the launch-time precedence
+        // resolver in getWineStartCommand).
+        if (isRealSteamLaunchEnabledForShortcut()) return false;
+        boolean cold = shortcut != null
+                ? parseBoolean(getShortcutSetting("useColdClient", container.isUseColdClient() ? "1" : "0"))
+                : container != null && container.isUseColdClient();
+        if (cold) return false;
+        boolean explicit = shortcut != null
                 ? parseBoolean(getShortcutSetting("launchBionicSteam", container.isLaunchBionicSteam() ? "1" : "0"))
                 : container != null && container.isLaunchBionicSteam();
+        if (explicit) return true;
+
+        // Steam Launcher self-heal / auto-promote.
+        //
+        // The Forest shortcuts created before Steam Launcher shipped don't have
+        // `launchBionicSteam=1` in their .desktop extras. Without that
+        // flag, the Bionic-Steam branch in onCreate doesn't fire and
+        // Steam Launcher's asset stage (Valve steamclient64.dll, Steam.dll,
+        // wn-steam-launcher.exe, …) never gets written into the
+        // container's Steam dir — verified on .144 after 4 launches:
+        // the Steam dir still had no wn-steam-launcher.exe.
+        //
+        // When the user has opted into Steam Launcher (wnPlanW pref true,
+        // default) AND is signed into Steam (refresh token + steamId),
+        // auto-promote any Steam shortcut that hasn't been explicitly
+        // pinned to ColdClient or RealSteam into Bionic Steam mode.
+        // ColdClient/RealSteam users keep their explicit choice; only
+        // the implicit-Goldberg case gets pulled into Steam Launcher.
+        //
+        // Without this gate the Steam Launcher self-heal won't reach existing
+        // user shortcuts, which is what the user explicitly flagged
+        // 2026-05-21.
+        boolean planW = com.winlator.cmod.feature.stores.steam.utils
+                .PrefManager.INSTANCE.getWnPlanW();
+        if (planW) {
+            String tok = com.winlator.cmod.feature.stores.steam.utils
+                    .PrefManager.INSTANCE.getRefreshToken();
+            long sid = com.winlator.cmod.feature.stores.steam.utils
+                    .PrefManager.INSTANCE.getSteamUserSteamId64();
+            if (tok != null && !tok.isEmpty() && sid > 0) {
+                Log.i("XServerDisplayActivity",
+                        "Steam Launcher auto-promote: Steam shortcut without explicit "
+                        + "Bionic flag, user signed in — routing through Steam Launcher "
+                        + "(set wn_plan_w=false to opt out)");
+                return true;
+            } else {
+                Log.w("XServerDisplayActivity",
+                        "Steam Launcher auto-promote: skipped (signed-in check failed) "
+                        + "tokEmpty=" + (tok == null || tok.isEmpty())
+                        + " sidIsZero=" + (sid == 0));
+            }
+        }
+        return false;
     }
 
     private boolean isColdClientEnabledForShortcut() {
         if (!isSteamShortcut()) return false;
         if (isRealSteamLaunchEnabledForShortcut()) return false; // mutually exclusive
-        // "Bionic Steam" mode is routed through the ColdClient/Goldberg path:
-        // gbe_fork's steamclient.dll + StubDRM give DRM-wrapped games their
-        // DRM handshake and achievements — the old raw-exe + libsteamclient.so
-        // launch could not do either.
-        if (isBionicSteamEnabledForShortcut()) return true;
+        // ColdClient and Bionic Steam are mutually exclusive launch modes,
+        // but ColdClient WINS when explicitly enabled — it's the only path
+        // that runs Steamless / Runtime DRM Injection, which the user
+        // would have toggled on specifically for DRM-troublesome games.
+        // The launch-time precedence resolver in getWineStartCommand
+        // forces launchBionicSteam=false in that case.
         return shortcut != null
                 ? parseBoolean(getShortcutSetting("useColdClient", container.isUseColdClient() ? "1" : "0"))
                 : container != null && container.isUseColdClient();
@@ -4148,9 +4459,31 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             containerDataChanged = true;
         }
 
-        if (!dxwrapper.equals(container.getExtra("dxwrapper")) || firstTimeBoot) {
+        // Compose the DXVK/VKD3D install gate to include the current Wine arch
+        // (x86_64 vs arm64ec). Without this, when a user switches a container's
+        // Wine version between archs (e.g. Proton 11 arm64ec → Proton 9 x86_64)
+        // the dxwrapper version-string can stay identical but the underlying
+        // DXVK/VKD3D content is arch-specific — leaving stale arm64ec dxgi.dll
+        // / d3d12.dll in an x86_64 prefix's system32, which box64 then can't
+        // execute (illegal-instruction crash in dxgi process_attach, c000001d).
+        // Verified 2026-05-21 with Little Nightmares EE: prefix had arm64ec
+        // DXVK 2.4.1-1-* + VKD3D 3.0.1-arm64ec-* despite container being on
+        // Proton-9.0-x86_64-0, because the dxwrapper string never changed.
+        // Mixing the arch into the gate forces a fresh extract on arch flip.
+        String wineArchKey = wineVersion != null && wineVersion.contains("arm64ec") ? "arm64ec" : "x86_64";
+        String dxwrapperGateKey = dxwrapper + "|arch=" + wineArchKey;
+        if (!dxwrapperGateKey.equals(container.getExtra("dxwrapper")) || firstTimeBoot) {
+            Log.i("XServerDisplayActivity",
+                    "DXVK/VKD3D extract: gate fired (key='" + dxwrapperGateKey
+                            + "' prev='" + container.getExtra("dxwrapper")
+                            + "' firstTimeBoot=" + firstTimeBoot + ")");
+            // Wipe any pre-existing DXVK/VKD3D DLLs from system32/syswow64 before
+            // re-extract so an arch flip can't leave half-old half-new files.
+            // Touches only the DLL names DXVK/VKD3D ship; original Wine builtin
+            // DLLs are restored automatically by the extract step that follows.
+            wipeDxwrapperDllsForReextract();
             extractDXWrapperFiles(dxwrapper);
-            container.putExtra("dxwrapper", dxwrapper);
+            container.putExtra("dxwrapper", dxwrapperGateKey);
             containerDataChanged = true;
         }
 
@@ -4224,12 +4557,22 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             ? parseBoolean(getShortcutSetting("runtimePatcher", container.isRuntimePatcher() ? "1" : "0"))
                             : container.isRuntimePatcher();
 
-                    // Get encrypted app ticket once for all setup
+                    // Get encrypted app ticket once for all setup paths
+                    // that consume it (ColdClient/Goldberg/Bionic write it
+                    // into steam_settings/configs.user.ini for gbe_fork).
+                    // The Real Steam Client path runs steam.exe which
+                    // fetches its own ticket via the CM logon flow — so
+                    // we skip the fetch entirely there. This matters
+                    // because the fetch now waits up to 15s for wn-
+                    // session logon (cold-start race recovery); blocking
+                    // Real Steam launches on that wait adds nothing.
                     String ticketBase64 = null;
-                    try {
-                        ticketBase64 = SteamBridge.getEncryptedAppTicketBase64(appId);
-                    } catch (Exception e) {
-                        Log.w("XServerDisplayActivity", "Failed to get encrypted app ticket", e);
+                    if (!launchRealSteamSetup) {
+                        try {
+                            ticketBase64 = SteamBridge.getEncryptedAppTicketBase64(appId);
+                        } catch (Exception e) {
+                            Log.w("XServerDisplayActivity", "Failed to get encrypted app ticket", e);
+                        }
                     }
 
                     if (gameDir.exists()) {
@@ -4249,6 +4592,18 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_COLDCLIENT_USED);
                             MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DRM_PATCHED);
                             MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DRM_UNPACK_CHECKED);
+
+                            // Scrub Bionic-mode contamination before launching real Steam. If the
+                            // container ever ran in Bionic mode, lsteamclient.dll sits in system32
+                            // / syswow64 and the HKCU SteamClientDll64 redirector points at it.
+                            // Real steam.exe then asserts on startup (verified on CPH2749) when it
+                            // detects the foreign Steam impl alongside its own. Bionic mode reinstalls
+                            // both on every launch, so the scrub is reversible.
+                            clearBionicActiveProcessRegistry();
+                            new File(container.getRootDir(),
+                                    ".wine/drive_c/windows/system32/lsteamclient.dll").delete();
+                            new File(container.getRootDir(),
+                                    ".wine/drive_c/windows/syswow64/lsteamclient.dll").delete();
 
                             // Clean up a side-effect of an old "MoveSteamExe" hack: if a game
                             // dir still has a local steam.exe copy, real Steam's integrity
@@ -4275,6 +4630,21 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             // steamclient.dll/steamclient64.dll. The game's ORIGINAL steam_api.dll
                             // must stay intact — ColdClientLoader routes its calls through the
                             // emulated steamclient.
+
+                            // Scrub Bionic-mode contamination before launch. If the container
+                            // ever ran in Bionic mode, lsteamclient.dll sits in system32 + the
+                            // HKCU SteamClientDll64 redirector points at it — the game's
+                            // steam_api64.dll then LoadLibrarys our open-source libsteamclient.so
+                            // instead of Goldberg's steamclient64.dll, fighting Goldberg for the
+                            // same Steam surface and breaking games that depend on Goldberg's
+                            // emulated answers (BIsSubscribedApp, GetCurrentBetaName,
+                            // RequestEncryptedAppTicket, etc.). Bionic mode rewrites both on
+                            // every launch, so this scrub is safe.
+                            clearBionicActiveProcessRegistry();
+                            new File(container.getRootDir(),
+                                    ".wine/drive_c/windows/system32/lsteamclient.dll").delete();
+                            new File(container.getRootDir(),
+                                    ".wine/drive_c/windows/syswow64/lsteamclient.dll").delete();
 
                             // Remove conflicting Goldberg markers/state
                             MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DLL_REPLACED);
@@ -4329,6 +4699,178 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             }
 
                             MarkerUtils.INSTANCE.addMarker(gameInstallPath, Marker.STEAM_COLDCLIENT_USED);
+                        } else if (isBionicSteamEnabledForShortcut()) {
+                            // ── Bionic Steam mode ───────────────────────────────
+                            // The game keeps its ORIGINAL steam_api(64).dll. The
+                            // Proton lsteamclient bridge (lsteamclient.dll, real
+                            // name) goes into THIS container's system32/syswow64,
+                            // and the HKCU ActiveProcess registry points the
+                            // game's steam_api straight at it — so Steamworks
+                            // calls route lsteamclient.dll → lsteamclient.so →
+                            // libsteamclient.so → the in-process authenticated
+                            // master (WnSteamBootstrap, pre-warmed at sign-in).
+                            // No Goldberg emulation, no ColdClient loader.
+                            MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DLL_REPLACED);
+                            MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_COLDCLIENT_USED);
+                            MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DRM_PATCHED);
+                            MarkerUtils.INSTANCE.removeMarker(gameInstallPath, Marker.STEAM_DRM_UNPACK_CHECKED);
+
+                            // Restore the Steamless exe swap — we want the
+                            // genuine binary. The steam_api*.dll handling is
+                            // mode-specific and happens below: Steam Launcher keeps the
+                            // GENUINE Valve steam_api*.dll (GameHub model);
+                            // non-Steam Launcher Bionic mode swaps in the steampipe bridge.
+                            SteamUtils.restoreOriginalExecutable(this, appId);
+
+                            // Stage the native runtime (libsteamclient.so +
+                            // siblings) and place the lsteamclient bridge DLL
+                            // into THIS container's system32/syswow64 — keyed
+                            // per-container, not the global install stamp.
+                            //
+                            // Steam Launcher: the BRIDGE must NOT be in system32 —
+                            // Valve's real steamclient64.dll auto-detects
+                            // `lsteamclient.dll` on disk (Proton-compat
+                            // probe) and LoadLibrary's it, which makes
+                            // lsteamclient's DllMain export-patch Valve's
+                            // own functions and route them all to its
+                            // unimplemented stubs. With Steam Launcher on, we skip
+                            // the bridge install AND scrub any stale copy
+                            // that a prior helper-mode launch left behind.
+                            boolean planWActive = com.winlator.cmod.feature.stores.steam.utils
+                                    .PrefManager.INSTANCE.getWnPlanW();
+                            boolean bionicRuntimeOk = com.winlator.cmod.feature.stores.steam.wnsteam
+                                    .WnSteamAssetsInstaller.INSTANCE.installBionicRuntime(this);
+                            boolean bionicBridgeOk;
+                            if (planWActive) {
+                                // Remove any pre-existing bridge from this
+                                // container's system32/syswow64 so Valve's
+                                // Proton-compat probe finds nothing.
+                                File sys32Bridge = new File(container.getRootDir(),
+                                        ".wine/drive_c/windows/system32/lsteamclient.dll");
+                                File syswow64Bridge = new File(container.getRootDir(),
+                                        ".wine/drive_c/windows/syswow64/lsteamclient.dll");
+                                int scrubbed = 0;
+                                if (sys32Bridge.exists() && sys32Bridge.delete()) scrubbed++;
+                                if (syswow64Bridge.exists() && syswow64Bridge.delete()) scrubbed++;
+                                Log.i("XServerDisplayActivity",
+                                        "Steam Launcher: scrubbed " + scrubbed
+                                        + " stale lsteamclient.dll bridge file(s) from system32/syswow64");
+                                bionicBridgeOk = false;  // bridge is intentionally absent
+                            } else {
+                                bionicBridgeOk = com.winlator.cmod.feature.stores.steam.wnsteam
+                                        .WnSteamAssetsInstaller.INSTANCE
+                                        .installSteamclientBridgeIntoContainer(this, container);
+                            }
+
+                            // steam_api*.dll handling, mode-specific:
+                            //  - Steam Launcher (GameHub model): keep the game's GENUINE
+                            //    Valve steam_api*.dll. Valve's real steam_api
+                            //    loads Valve's real steamclient64.dll the correct
+                            //    way — SetDllDirectory(SteamPath) so tier0_s64 /
+                            //    vstdlib_s64 resolve — and connects to the global
+                            //    Steam session wn-steam-launcher.exe created. No
+                            //    hybrid bridge, no gbe_fork in the game process.
+                            //    restoreSteamApiDlls undoes any prior bridge swap.
+                            //  - non-Steam Launcher Bionic: swap in the steampipe bridge.
+                            if (planWActive) {
+                                restoreSteamApiDlls(gameDir);
+                                Log.d("XServerDisplayActivity",
+                                        "Steam Launcher: game uses genuine Valve steam_api*.dll "
+                                        + "(no steampipe bridge)");
+                            } else {
+                                int steampipeSwapped = com.winlator.cmod.feature.stores.steam.wnsteam
+                                        .WnSteamAssetsInstaller.INSTANCE
+                                        .installSteampipeBridgeIntoApp(this, gameDir);
+                                Log.d("XServerDisplayActivity",
+                                        "Bionic Steam: " + steampipeSwapped
+                                        + " steam_api*.dll(s) replaced with steampipe bridge");
+                            }
+
+                            // Point HKCU\...\Valve\Steam\ActiveProcess at the
+                            // bridge so steam_api loads it and sees Steam as
+                            // "running".
+                            writeBionicActiveProcessRegistry();
+
+                            File bionicSteamDir = new File(container.getRootDir(),
+                                    ".wine/drive_c/Program Files (x86)/Steam");
+                            bionicSteamDir.mkdirs();
+                            WineUtils.ensureSteamappsCommonSymlink(container, gameInstallPath);
+
+                            // Game-side stock steam_api(64).dll loads steamclient(64).dll
+                            // via SetDllDirectory(SteamPath) + LoadLibrary, which finds the
+                            // SteamPath copy BEFORE the system32 bridge we placed earlier.
+                            // The SteamPath symlink points at .shared/steam-client-store
+                            // which holds the user's REAL Valve binaries; loading them in
+                            // Bionic mode fails because there is no real steam.exe IPC
+                            // master — game shows "STEAM NOT INITIALIZED". Verified live
+                            // on The Forest (PID 15312, /proc/maps had zero steam-mappings)
+                            // 2026-05-20.
+                            //
+                            // Overlay the bridge as steamclient.dll + steamclient64.dll
+                            // inside this container's SteamPath so stock steam_api*.dll's
+                            // LoadLibrary search hits our bridge first. The shared store
+                            // stays pristine for Real Steam / ColdClient modes.
+                            // Steam Launcher skips the overlay because the overlay
+                            // hard-copies the lsteamclient.dll bridge AS
+                            // steamclient*.dll into the Steam dir, which
+                            // would then be Valve-detected by our staged
+                            // real steamclient64.dll's Proton-compat
+                            // probe and crash the process. Steam Launcher's
+                            // staging below provides Valve's real DLLs
+                            // directly — the overlay's other job
+                            // (symlinking non-DLL store entries) is
+                            // useful but non-essential for Forest's
+                            // launch path; we can revisit if a game
+                            // turns out to require GameOverlayRenderer
+                            // or similar from the store.
+                            boolean bionicOverlayOk;
+                            if (planWActive) {
+                                Log.i("XServerDisplayActivity",
+                                        "Steam Launcher: skipping installBionicSteamPathOverlay "
+                                        + "(bridge-copy step would clobber Valve's real "
+                                        + "steamclient64.dll); will stage Valve binaries below");
+                                bionicOverlayOk = false;
+                            } else {
+                                bionicOverlayOk = installBionicSteamPathOverlay(
+                                        container, bionicSteamDir);
+                            }
+
+                            // ── Steam Launcher file staging ─────────────────────
+                            // Extract Valve's REAL Windows Steam binaries
+                            // (steamclient64.dll, Steam.dll, Steam2.dll,
+                            // tier0_s64.dll, vstdlib_s64.dll + 32-bit set)
+                            // OVER TOP of the bridge file the overlay just
+                            // wrote — wn-steam-launcher.exe LoadLibraries
+                            // these to host Valve's client in-process with
+                            // the game. Without this Steam Launcher can't run.
+                            // Also drop wn-steam-launcher.exe next to them.
+                            boolean planWValveOk = false;
+                            boolean planWLauncherOk = false;
+                            if (com.winlator.cmod.feature.stores.steam.utils
+                                    .PrefManager.INSTANCE.getWnPlanW()) {
+                                try {
+                                    planWValveOk = com.winlator.cmod.feature.stores.steam.wnsteam
+                                            .WnSteamAssetsInstaller.INSTANCE
+                                            .installPlanWValveSteam(this, container);
+                                    planWLauncherOk = com.winlator.cmod.feature.stores.steam.wnsteam
+                                            .WnSteamAssetsInstaller.INSTANCE
+                                            .installPlanWLauncher(this, container);
+                                    Log.i("XServerDisplayActivity",
+                                            "Steam Launcher asset stage: valveSteam=" + planWValveOk
+                                            + " launcher=" + planWLauncherOk);
+                                } catch (Exception e) {
+                                    Log.e("XServerDisplayActivity",
+                                            "Steam Launcher asset stage failed", e);
+                                }
+                            }
+
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic Steam game-side setup complete for appId=" + appId
+                                            + " runtime=" + bionicRuntimeOk
+                                            + " bridge=" + bionicBridgeOk
+                                            + " steamPathOverlay=" + bionicOverlayOk
+                                            + " planWValve=" + planWValveOk
+                                            + " planWLauncher=" + planWLauncherOk);
                         } else {
                             // ── Goldberg mode (default) ─────────────────────────
                             // Replace steam_api DLLs with Goldberg/steampipe stubs.
@@ -4410,6 +4952,25 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         // injection. Anything the user's patch (Goldberg, OnlineFix, CreamAPI, etc.) ships
         // inside the game directory is its own and stays intact.
 
+        // Teardown-race guard. setupWineSystemFiles() runs on a background
+        // thread (pool-15). performForcedSessionCleanup() — fired from
+        // onStop() when the activity finishes or is recreated — nulls
+        // `xServer` (line ~2529). If the user backs out / relaunches a
+        // game mid-setup, the stale thread reaches the xServer.screenInfo
+        // deref below and NPE-crashes the whole process. Steam Launcher's asset
+        // staging adds noticeable latency to this method, widening that
+        // window — observed on .144 relaunching MONSTER HUNTER RISE
+        // (2026-05-21). Bail out cleanly instead of crashing.
+        if (xServer == null || isFinishing() || isDestroyed()) {
+            Log.w("XServerDisplayActivity",
+                    "setupWineSystemFiles: activity torn down mid-setup (xServer="
+                    + (xServer == null ? "null" : "ok")
+                    + " finishing=" + isFinishing()
+                    + " destroyed=" + isDestroyed()
+                    + ") — aborting stale background setup, no crash");
+            return;
+        }
+
         String desktopTheme = shortcut != null ? getShortcutSetting("desktopTheme", container.getDesktopTheme()) : container.getDesktopTheme();
         if (!(desktopTheme+","+xServer.screenInfo).equals(container.getExtra("desktopTheme"))) {
             WineThemeManager.apply(this, new WineThemeManager.ThemeInfo(desktopTheme), xServer.screenInfo);
@@ -4437,6 +4998,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         }
         // Proton-version flips repair controller detection because they rebuild the prefix and
         // restore controller DllOverrides. Keep that correction narrow and explicit here.
+        WineUtils.ensureControllerDllOverrides(container);
         WineUtils.setJoystickRegistryKeys(container, dinputEnabled, exclusiveXInput);
         WineUtils.ensureWinebusConfig(container);
 
@@ -4654,6 +5216,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             wineDebugValue = "-all";
         }
         envVars.put("WINEDEBUG", wineDebugValue);
+        Log.i("XServerDisplayActivity",
+                "WINEDEBUG resolved: enable=" + enableWineDebug
+                        + " channels='" + wineDebugChannels + "' value='" + wineDebugValue + "'");
 
         // Clear any temporary directory
         String rootPath = imageFs.getRootDir().getPath();
@@ -4750,7 +5315,10 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             boolean currentLaunchRealSteam = shortcut != null
                                     ? parseBoolean(getShortcutSetting("launchRealSteam", container.isLaunchRealSteam() ? "1" : "0"))
                                     : container.isLaunchRealSteam();
-                            if (currentLaunchRealSteam) {
+                            // Bionic Steam, like Real Steam, runs the game's
+                            // GENUINE exe against a real authenticated session —
+                            // no Steamless DRM unpacking.
+                            if (currentLaunchRealSteam || isBionicSteamEnabledForShortcut()) {
                                 return;
                             }
 
@@ -4853,6 +5421,230 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
 
+        // Bionic Steam: publish the IPC + identity env vars the Wine-side
+        // libsteamclient.so reads at module init. Steam3Master /
+        // SteamClientService point at the 127.0.0.1:57343/57344 listeners
+        // the WnSteamBootstrap master (started in setupSteamEnvironment)
+        // already stood up — so the game's Steamworks calls, bridged
+        // through lsteamclient, reach the authenticated session.
+        if (isBionicSteamEnabledForShortcut()) {
+            try {
+                long bsSteamId = com.winlator.cmod.feature.stores.steam.utils
+                        .PrefManager.INSTANCE.getSteamUserSteamId64();
+                String bsUser = com.winlator.cmod.feature.stores.steam.utils
+                        .PrefManager.INSTANCE.getUsername();
+                int bsAppId = -1;
+                try {
+                    if (shortcut != null) bsAppId = Integer.parseInt(shortcut.getExtra("app_id"));
+                } catch (Exception ignored) {}
+                // IPC endpoints — the Wine-side libsteamclient.so connects
+                // to the master daemon the bootstrap stood up here.
+                envVars.put("Steam3Master", "127.0.0.1:57343");
+                envVars.put("SteamClientService", "127.0.0.1:57344");
+                // lsteamclient.dll loader hints (our patched lsteamclient.so
+                // resolves libsteamclient.so itself, but Proton's loader and
+                // some games still read these).
+                String bridgeLib = com.winlator.cmod.feature.stores.steam.wnsteam
+                        .WnSteamAssetsInstaller.INSTANCE.bridgeLibPath(this).getAbsolutePath();
+                envVars.put("WINESTEAMCLIENTPATH64", bridgeLib);
+                envVars.put("WINESTEAMCLIENTPATH", bridgeLib);
+                // libsteamclient.so module-init handshake group.
+                envVars.put("_STEAM_SETENV_MANAGER", "1");
+                String steamRootLinux = imageFs.wineprefix
+                        + "/drive_c/Program Files (x86)/Steam";
+                envVars.put("STEAM_BASE_FOLDER", steamRootLinux);
+                File bsBreakpad = new File(imageFs.getRootDir(), "usr/tmp/breakpad");
+                bsBreakpad.mkdirs();
+                envVars.put("BREAKPAD_DUMP_LOCATION", bsBreakpad.getAbsolutePath());
+                envVars.put("STEAMVIDEOTOKEN", "1");
+                envVars.put("ENABLE_VK_LAYER_VALVE_steam_overlay_1", "0");
+                // Wine-side Steam identity expected by Steamworks games.
+                envVars.put("SteamEnv", "1");
+                envVars.put("SteamClientLaunch", "1");
+                if (bsUser != null && !bsUser.isEmpty()) {
+                    envVars.put("SteamUser", bsUser);
+                    envVars.put("SteamAppUser", bsUser);
+                }
+                if (bsSteamId > 0) envVars.put("STEAMID", String.valueOf(bsSteamId));
+                if (bsAppId > 0) {
+                    envVars.put("SteamAppId", String.valueOf(bsAppId));
+                    envVars.put("SteamGameId", String.valueOf(bsAppId));
+                }
+                envVars.put("SteamPath", "C:\\Program Files (x86)\\Steam");
+                envVars.put("ValvePlatformMutex", "c:\\Program Files (x86)\\Steam/");
+                // Wine module-loader diagnostic — when the Settings-UI
+                // wine-debug toggle is off (default), we still want a
+                // signal of which game-side DLLs Wine resolves vs fails.
+                // The Forest debug 2026-05-20 found TheForest.exe's
+                // /proc/maps had ZERO steam-related libs loaded even
+                // though the game reached the "STEAM NOT INITIALIZED"
+                // screen — meaning the Steamworks.NET DllImport on
+                // steam_api64.dll itself was failing. +module logs
+                // every LoadLibrary attempt + path search; +loaddll
+                // logs final resolution. Keep this in Bionic mode only
+                // (Real Steam / ColdClient paths are validated and
+                // verbose logs would just spam logcat). The existing
+                // user pref still overrides if explicitly set.
+                String currentWineDebug = envVars.get("WINEDEBUG");
+                if (currentWineDebug == null || currentWineDebug.equals("-all")) {
+                    envVars.put("WINEDEBUG", "+module,+loaddll");
+                }
+                Log.i("XServerDisplayActivity",
+                        "Bionic Steam: published bridge env (Steam3Master=127.0.0.1:57343, appId="
+                                + bsAppId + ", steamBase=" + steamRootLinux
+                                + ", WINEDEBUG=" + envVars.get("WINEDEBUG") + ")");
+
+                // Install the small Proton-style steam_helper.exe (176 KB,
+                // shipped at assets/wnsteam/bionic/wn-steam-helper.exe).
+                // Wrapped over the game launch (see Goldberg launch path
+                // below) this kicks Wine's stock lsteamclient.dll into life
+                // and lets the wine guest talk to the Android-side
+                // libsteamclient.so via the Steam3Master/SteamClientService
+                // TCP loopback. Mirrors GameNative XServerScreen.kt:3733.
+                try {
+                    File steamDirPrefix = new File(container.getRootDir(),
+                            ".wine/drive_c/Program Files (x86)/Steam");
+                    if (steamDirPrefix.isDirectory()) {
+                        File helperDst = new File(steamDirPrefix, "wn-steam-helper.exe");
+                        if (!helperDst.exists() || helperDst.length() != 176128) {
+                            try (java.io.InputStream in = getAssets().open(
+                                        "wnsteam/bionic/wn-steam-helper.exe");
+                                 java.io.FileOutputStream out =
+                                        new java.io.FileOutputStream(helperDst)) {
+                                byte[] buf = new byte[64 * 1024];
+                                int n; while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                            }
+                            Log.i("XServerDisplayActivity",
+                                  "Bionic Steam: installed wn-steam-helper.exe ("
+                                  + helperDst.length() + " B) at " + helperDst.getPath());
+                        }
+                    } else {
+                        Log.w("XServerDisplayActivity",
+                              "Bionic Steam: container Steam dir missing, helper not staged: "
+                              + steamDirPrefix.getPath());
+                    }
+                } catch (Exception e) {
+                    Log.e("XServerDisplayActivity",
+                          "Bionic Steam: helper install failed", e);
+                }
+
+                // ── Steam Launcher env-var publication ───────────────────────
+                // The Valve binaries + launcher.exe are already staged in
+                // the 4519 branch above. Here we just publish the token +
+                // identity env vars that wn-steam-launcher.exe reads at
+                // startup to drive its IClientUser refresh-token logon.
+                // (The launcher hosts Valve's Windows steamclient64.dll
+                // IN-PROCESS with the game — no cross-process bridge —
+                // which unblocks Steam Networking Sockets / SDR / P2P
+                // callbacks that the wn-steam-helper.exe path drops at
+                // the IPC boundary.)
+                if (com.winlator.cmod.feature.stores.steam.utils
+                        .PrefManager.INSTANCE.getWnPlanW()) {
+                    // Disable Wine's `lsteamclient.dll` for the Steam Launcher
+                    // process tree. lsteamclient is Proton's
+                    // steamclient*.dll forwarder — its DllMain patches the
+                    // EXPORT TABLE of any loaded steamclient64.dll to
+                    // forward all exports to itself (look for
+                    // LSTEAMCLIENT_PATCH_BUILD_MARKER_v1 in wine_stderr).
+                    // That kills Steam Launcher because the launcher's
+                    // GetProcAddress(steamclient64.dll, "Steam_CreateGlobalUser")
+                    // ends up calling lsteamclient's unimplemented stub
+                    // instead of Valve's real implementation. Setting
+                    // `lsteamclient=` disables Wine's builtin (and any
+                    // file under system32), letting Valve's real DLL
+                    // expose its real exports. The game's steam_api64.dll
+                    // (steampipe bridge) then loads Valve's real
+                    // steamclient64.dll from the Steam dir directly.
+                    String currentOverrides = envVars.get("WINEDLLOVERRIDES");
+                    String planWOverride = "lsteamclient=";
+                    if (currentOverrides == null || currentOverrides.isEmpty()) {
+                        envVars.put("WINEDLLOVERRIDES", planWOverride);
+                    } else if (!currentOverrides.contains("lsteamclient=")) {
+                        envVars.put("WINEDLLOVERRIDES",
+                                currentOverrides + ";" + planWOverride);
+                    }
+                    Log.i("XServerDisplayActivity",
+                            "Steam Launcher: WINEDLLOVERRIDES set to '"
+                            + envVars.get("WINEDLLOVERRIDES")
+                            + "' to disable lsteamclient export-hijack");
+                    // Cloud Saves toggle gates the launcher's cloud sync.
+                    if (!isCloudSyncEnabledForShortcut()) {
+                        envVars.put("WN_STEAM_NO_CLOUD", "1");
+                        Log.i("XServerDisplayActivity",
+                                "Steam Launcher: cloud saves disabled — WN_STEAM_NO_CLOUD=1");
+                    }
+                    String planWUser = com.winlator.cmod.feature.stores.steam.utils
+                            .PrefManager.INSTANCE.getUsername();
+                    String planWSid  = String.valueOf(com.winlator.cmod.feature.stores.steam.utils
+                            .PrefManager.INSTANCE.getSteamUserSteamId64());
+                    // Steam Launcher follows GameHub's two-parallel-sessions model:
+                    // the app's wn-steam-client and the in-Wine launcher
+                    // both stay logged on at once, sharing the SAME refresh
+                    // token, distinguished by distinct login_id /
+                    // client_instance_id. No hand-off, no logoff, no
+                    // pre-launch token renewal — the launcher just logs on
+                    // with the stored refresh token in parallel.
+                    String planWTok = com.winlator.cmod.feature.stores.steam.utils
+                            .PrefManager.INSTANCE.getRefreshToken();
+                    if (planWTok != null && !planWTok.isEmpty()
+                            && planWUser != null && !planWUser.isEmpty()
+                            && !planWSid.equals("0")
+                            && bsAppId > 0) {
+                        envVars.put("WN_STEAM_USERNAME", planWUser);
+                        envVars.put("WN_STEAM_STEAMID", planWSid);
+                        envVars.put("WN_STEAM_TOKEN", planWTok);
+                        envVars.put("WN_STEAM_APPID", String.valueOf(bsAppId));
+                        // STEAM_SSL_CERT_FILE — Valve's steamclient64.dll
+                        // needs a CA bundle to TLS-verify its CM
+                        // connection. Wine has no populated cert store,
+                        // and Valve's bionic client also needs this (see
+                        // steam_bootstrap.cpp). installPlanWLauncher
+                        // staged wnsteam_cacert.pem into the Steam dir;
+                        // point the env at the Windows path so the
+                        // launcher's in-process steamclient64.dll finds
+                        // it. Without it the launcher's logon times out
+                        // ("Steam Logon wasn't received within 10s").
+                        File planWCa = new File(container.getRootDir(),
+                                ".wine/drive_c/Program Files (x86)/Steam/wnsteam_cacert.pem");
+                        if (planWCa.exists() && planWCa.length() > 0) {
+                            envVars.put("STEAM_SSL_CERT_FILE",
+                                    "C:\\Program Files (x86)\\Steam\\wnsteam_cacert.pem");
+                            Log.i("XServerDisplayActivity",
+                                    "Steam Launcher: STEAM_SSL_CERT_FILE -> staged CA bundle ("
+                                    + planWCa.length() + " bytes)");
+                        } else {
+                            Log.w("XServerDisplayActivity",
+                                    "Steam Launcher: CA bundle not staged at " + planWCa.getPath()
+                                    + " — launcher CM logon may fail TLS verification");
+                        }
+                        Log.i("XServerDisplayActivity",
+                                "Steam Launcher: token+identity published (user=" + planWUser
+                                + " sid=" + planWSid
+                                + " appId=" + bsAppId
+                                + " tokenLen=" + planWTok.length() + ")");
+                    } else {
+                        Log.w("XServerDisplayActivity",
+                                "Steam Launcher: refresh token / user / steamId missing "
+                                + "(user='" + planWUser + "' sidIsZero="
+                                + planWSid.equals("0") + " tokenEmpty="
+                                + (planWTok == null || planWTok.isEmpty())
+                                + " bsAppId=" + bsAppId
+                                + ") — launcher will refuse to start; "
+                                + "sign into Steam first");
+                    }
+                    // Bridge launcher cloud-conflict requests to the dialog.
+                    if (isCloudSyncEnabledForShortcut()) {
+                        com.winlator.cmod.feature.steamcloudsync
+                                .SteamLauncherConflictWatcher.start(
+                                this,
+                                new File(container.getRootDir(), ".wine/drive_c"));
+                    }
+                }
+            } catch (Exception e) {
+                Log.e("XServerDisplayActivity", "Bionic Steam: failed to publish bridge env", e);
+            }
+        }
+
         // Pass final envVars to the launcher
         guestProgramLauncherComponent.setEnvVars(envVars);
         guestProgramLauncherComponent.setTerminationCallback((status) -> {
@@ -4861,6 +5653,54 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             // Keep A:\Steam persistence for Android 16 testing
             // User expressly requested: "don't remove the A:\Steam\ Folder unless the next game has the toggle off to not move it."
             // Removed MoveSteamExe cleanup hook from termination callback.
+
+            // Bionic hand-off release: the game session is over — log the
+            // bootstrap off and bring the wn-steam-client CM session back.
+            //
+            // SKIP in hybrid mode (wn_hybrid_mode=true): the bootstrap is
+            // intentionally the SOLE Steam session for the whole app
+            // lifetime; releasing it here would tear down libsteamclient.so
+            // mid-process. The next game launch would then try to
+            // RE-init libsteamclient.so in the same process, which
+            // SIGSEGVs (we deliberately don't dlclose to avoid zombie
+            // threads, but that leaves stale state that the second
+            // CreateGlobalUser/LogonWithRefreshToken crashes on).
+            // Observed 2026-05-19 21:25:58 — first game launch after
+            // sign-in crashed at nativeInit+5428 deep in libsteamclient.so
+            // because the release fired between sign-in and launch.
+            // In hybrid mode the bootstrap stays alive; release only
+            // happens on app sign-out (SteamService.logOut) or when the
+            // user explicitly toggles hybrid mode off.
+            // Steam Launcher (GameHub parallel-session model): no hand-off was
+            // taken before launch — the wn-steam-client session stayed
+            // logged on the whole time alongside the launcher's session,
+            // distinguished by login_id. So there is nothing to release
+            // here; wn-steam-client never went down.
+            //
+            // The branches below only apply to the OLD bionic bootstrap
+            // path (non-Steam Launcher) where libsteamclient.so is the persistent
+            // in-app session that needed an explicit release.
+            boolean planWActiveTerm = com.winlator.cmod.feature.stores.steam.utils
+                    .PrefManager.INSTANCE.getWnPlanW();
+            if (isBionicSteamEnabledForShortcut() && planWActiveTerm) {
+                Log.d("XServerDisplayActivity",
+                        "Steam Launcher: game exited — no hand-off to release "
+                        + "(wn-steam-client stayed online in parallel)");
+            } else if (isBionicSteamEnabledForShortcut()
+                    && !com.winlator.cmod.feature.stores.steam.utils
+                            .PrefManager.INSTANCE.getWnHybridMode()) {
+                try {
+                    com.winlator.cmod.feature.stores.steam.service.SteamService
+                            .Companion.bionicHandoffRelease();
+                } catch (Throwable t) {
+                    Log.w("XServerDisplayActivity", "Bionic hand-off release failed", t);
+                }
+            } else if (isBionicSteamEnabledForShortcut()) {
+                Log.d("XServerDisplayActivity",
+                        "Hybrid mode: keeping bootstrap alive past game end "
+                                + "(release skipped — bootstrap is the SOLE "
+                                + "Steam session for this app run)");
+            }
 
             if (shouldWatchSteamTermination(status)) {
                 return;
@@ -4881,11 +5721,42 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 String username = com.winlator.cmod.feature.stores.steam.utils.PrefManager.INSTANCE.getUsername();
                 String refreshToken = com.winlator.cmod.feature.stores.steam.utils.PrefManager.INSTANCE.getRefreshToken();
                 if (refreshToken != null && !refreshToken.isEmpty()) {
-                    com.winlator.cmod.feature.stores.steam.utils.SteamTokenLogin tokenLogin =
-                            new com.winlator.cmod.feature.stores.steam.utils.SteamTokenLogin(
-                                    steamId64, username, refreshToken, imageFs, guestProgramLauncherComponent);
-                    tokenLogin.setupSteamFiles(true);
-                    Log.d("XServerDisplayActivity", "SteamTokenLogin set up for real Steam mode");
+                    // Pre-flight JWT expiry check (audit #113 fix). Without
+                    // this, an expired refresh-token silently gets written
+                    // into config.vdf — Steam.exe boots into the login
+                    // dialog, the watchdog kills wineserver after 75s, and
+                    // the user sees a black screen with no explanation.
+                    // SteamTokenLogin's own check only compares the
+                    // incoming token to the on-disk token; it never decodes
+                    // the incoming token's exp.
+                    boolean tokenExpired = false;
+                    try {
+                        com.auth0.android.jwt.JWT jwt =
+                                new com.auth0.android.jwt.JWT(refreshToken);
+                        tokenExpired = jwt.isExpired(0);
+                    } catch (Throwable t) {
+                        Log.w("XServerDisplayActivity",
+                                "Real Steam: JWT decode failed; treating as expired", t);
+                        tokenExpired = true;
+                    }
+                    if (tokenExpired) {
+                        Log.w("XServerDisplayActivity",
+                                "Real Steam launch ABORTED: cached refresh-token is expired. " +
+                                        "User must re-sign-in to refresh. (Previous behavior was " +
+                                        "to silently launch steam.exe with the expired token, " +
+                                        "which hangs at the login dialog.)");
+                        // Surface to user via a runtime toast on the main thread.
+                        runOnUiThread(() -> android.widget.Toast.makeText(
+                                XServerDisplayActivity.this,
+                                R.string.steam_real_session_expired_toast,
+                                android.widget.Toast.LENGTH_LONG).show());
+                    } else {
+                        com.winlator.cmod.feature.stores.steam.utils.SteamTokenLogin tokenLogin =
+                                new com.winlator.cmod.feature.stores.steam.utils.SteamTokenLogin(
+                                        steamId64, username, refreshToken, imageFs, guestProgramLauncherComponent);
+                        tokenLogin.setupSteamFiles(true);
+                        Log.d("XServerDisplayActivity", "SteamTokenLogin set up for real Steam mode");
+                    }
                 }
             } catch (Exception e) {
                 Log.w("XServerDisplayActivity", "Failed to set up SteamTokenLogin", e);
@@ -4922,16 +5793,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         FrameLayout rootView = xServerDisplayFrame;
         xServerView = new XServerSurfaceView(this, xServer);
         final VulkanRenderer renderer = xServerView.getRenderer();
-        // Match the guest's libvulkan so imported AHBs share UBWC/tiling rules with the
-        // producer (otherwise the driver inserts an implicit layout copy on import).
-        String compositorGraphicsDriver =
-                graphicsDriverConfig != null ? graphicsDriverConfig.get("version") : null;
-        if (compositorGraphicsDriver == null || compositorGraphicsDriver.isEmpty()) {
-            compositorGraphicsDriver = "System";
-        }
-        Log.i("XServerDisplayActivity", "Compositor graphics driver='"
-                + compositorGraphicsDriver + "' from graphicsDriver='" + graphicsDriver + "'");
-        renderer.setGraphicsDriver(compositorGraphicsDriver);
         renderer.setCursorVisible(false);
         renderer.setNativeMode(isNativeRenderingEnabled);
         renderer.setPresentMode(VulkanRenderer.parsePresentMode(
@@ -5747,8 +6608,42 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
     private static final String TAG = "DXWrapperExtraction";
 
+    /** Names of every D3D / DXGI DLL that DXVK or VKD3D-Proton ships. */
+    private static final String[] DXWRAPPER_DLLS = {
+            "d3d10.dll", "d3d10_1.dll", "d3d10core.dll",
+            "d3d11.dll", "d3d12.dll", "d3d12core.dll",
+            "d3d8.dll", "d3d9.dll", "dxgi.dll",
+            "ddraw.dll", "d3dimm.dll"
+    };
+
+    /**
+     * Delete any DXVK/VKD3D DLLs from the prefix's system32 + syswow64 prior to
+     * re-extract. Used when the install gate has detected a config-or-arch flip
+     * and we need to guarantee a clean slate so a stale arm64ec dxgi.dll can't
+     * survive an x86_64 DXVK reinstall (DXVK ships dxgi but not d3d12; VKD3D
+     * ships d3d12 but not dxgi — partial overwrites otherwise leave a mix).
+     * Subsequent extractDXWrapperFiles call repopulates the matching-arch set.
+     */
+    private void wipeDxwrapperDllsForReextract() {
+        if (imageFs == null) return;
+        File rootDir = imageFs.getRootDir();
+        File system32 = new File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows/system32");
+        File syswow64 = new File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows/syswow64");
+        int deleted = 0;
+        for (String name : DXWRAPPER_DLLS) {
+            File a = new File(system32, name);
+            File b = new File(syswow64, name);
+            if (a.exists() && a.delete()) deleted++;
+            if (b.exists() && b.delete()) deleted++;
+        }
+        if (deleted > 0) {
+            Log.i("XServerDisplayActivity",
+                    "DXVK/VKD3D pre-extract wipe removed " + deleted + " stale DLL(s) from system32/syswow64");
+        }
+    }
+
     private void extractDXWrapperFiles(String dxwrapper) {
-        final String[] dlls = {"d3d10.dll", "d3d10_1.dll", "d3d10core.dll", "d3d11.dll", "d3d12.dll", "d3d12core.dll", "d3d8.dll", "d3d9.dll", "dxgi.dll", "ddraw.dll", "d3dimm.dll"};
+        final String[] dlls = DXWRAPPER_DLLS;
         final String[] d3d12Dlls = {"d3d12.dll", "d3d12core.dll"};
         final String[] nonD3D12WrapperDlls = {"d3d10.dll", "d3d10_1.dll", "d3d10core.dll", "d3d11.dll", "d3d8.dll", "d3d9.dll", "dxgi.dll", "ddraw.dll", "d3dimm.dll"};
 
@@ -6017,19 +6912,31 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
                 boolean useColdClient = parseBoolean(getShortcutSetting("useColdClient", container.isUseColdClient() ? "1" : "0"));
                 boolean launchRealSteam = parseBoolean(getShortcutSetting("launchRealSteam", container.isLaunchRealSteam() ? "1" : "0"));
-                boolean launchBionicSteam = parseBoolean(getShortcutSetting("launchBionicSteam", container.isLaunchBionicSteam() ? "1" : "0"));
-                // Both Steam-launch modes are mutually exclusive on the model
-                // side, but a stale shortcut override could have both on —
-                // give bionic priority if the user explicitly enabled it.
-                //
-                // "Bionic Steam" mode is routed through the ColdClient launch
-                // path: it runs steamclient_loader_x64.exe with gbe_fork's
-                // steamclient.dll + StubDRM so DRM-wrapped games clear their
-                // checks and achievements work. The old raw-exe +
-                // libsteamclient.so direct launch is gone.
-                if (launchBionicSteam) {
-                    launchRealSteam = false;
-                    useColdClient = true;
+                // Use the canonical resolver (which applies the Steam Launcher
+                // auto-promote rule) instead of re-reading the raw
+                // shortcut extra. The launch-wrapper selection at line
+                // ~6544 below picks wn-steam-launcher.exe based on
+                // `launchBionicSteam`, so without this sync the Steam Launcher
+                // promotion in isBionicSteamEnabledForShortcut() above
+                // would stage Valve binaries but still launch the game
+                // through the ColdClient / Goldberg wrapper, defeating
+                // the whole purpose.
+                boolean launchBionicSteam = isBionicSteamEnabledForShortcut();
+                // Three launch modes are mutually exclusive. Precedence:
+                //   Real Steam  >  ColdClient  >  Bionic Steam  >  Goldberg
+                // ColdClient sits above Bionic because games that need
+                // Steamless / Runtime DRM Injection (Capcom DRM titles
+                // etc.) only work inside the ColdClient loader path.
+                // Picking ColdClient is the user's explicit signal that
+                // they want the DRM-workaround stack — Bionic Steam
+                // would silently ignore those toggles.
+                if (launchRealSteam) {
+                    useColdClient = false;
+                    launchBionicSteam = false;
+                } else if (useColdClient) {
+                    launchBionicSteam = false;
+                } else if (launchBionicSteam) {
+                    useColdClient = false;
                 }
 
                 // Pre-resolve: ensure game install path and steamapps/common symlink exist
@@ -6139,12 +7046,37 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             Log.d("XServerDisplayActivity", "Goldberg working dir: " + actualWorkDir.getPath());
                         }
 
-                        args = "\"" + steamGameExe + "\"" + steamExtraArgs;
                         int lastBackslash = steamGameExe.lastIndexOf("\\");
                         if (lastBackslash > 0) {
                             envVars.put("WINEPATH", steamGameExe.substring(0, lastBackslash));
                         }
-                        Log.d("XServerDisplayActivity", "Goldberg launch: " + steamGameExe);
+                        if (launchBionicSteam) {
+                            // Bionic Steam: wrap the game in either Steam Launcher
+                            // (wn-steam-launcher.exe — in-process Valve Steam
+                            // host, online MP / P2P / SDR work) or the
+                            // legacy helper (wn-steam-helper.exe — cross-
+                            // process bridge to Android libsteamclient.so,
+                            // online MP blocked at IPC boundary). Steam Launcher is
+                            // default; flip wn_plan_w=false in PrefManager
+                            // for the helper fallback.
+                            boolean planW = com.winlator.cmod.feature.stores.steam.utils
+                                    .PrefManager.INSTANCE.getWnPlanW();
+                            String wrapperExe = planW
+                                    ? "wn-steam-launcher.exe" : "wn-steam-helper.exe";
+                            if (planW) {
+                                int gameSep = steamGameExe.lastIndexOf('\\');
+                                planWGameProcessName = gameSep >= 0
+                                        ? steamGameExe.substring(gameSep + 1) : steamGameExe;
+                            }
+                            args = "\"C:\\Program Files (x86)\\Steam\\" + wrapperExe
+                                    + "\" \"" + steamGameExe + "\"" + steamExtraArgs;
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic Steam launch via " + wrapperExe
+                                    + " (planW=" + planW + "): " + steamGameExe);
+                        } else {
+                            args = "\"" + steamGameExe + "\"" + steamExtraArgs;
+                            Log.d("XServerDisplayActivity", "Goldberg launch: " + steamGameExe);
+                        }
                     } else {
                         // Fallback: try direct drive-letter path via findGameExeWinPath
                         String gameExeWinPath = findGameExeWinPath(appId,
@@ -6479,37 +7411,94 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         String perGameExecArgs = shortcut != null ? shortcut.getSettingExtra("execArgs", container.getExecArgs()) : container.getExecArgs();
         String exeCommandLine = perGameExecArgs != null ? perGameExecArgs : "";
 
-        // IgnoreLoaderArchDifference=1 lets the x64 loader SPAWN x86 games.
-        // DllsToInjectFolder is only included when the user opts into the
-        // Runtime DRM Patcher — that injects extra_dlls/StubDRM64.dll, the
-        // legacy in-memory SteamStub patcher. It is x64-only, so it patches
-        // 64-bit games only. (gbe_fork's newer "steamclient_extra" patcher is
-        // not used: it regressed SteamStub games — "Application load error
-        // 3:0000065432".) Non-DRM games don't benefit from injection and pay
-        // per-frame hook overhead, hence the opt-in toggle.
-        StringBuilder injectionBuilder = new StringBuilder("[Injection]\nIgnoreLoaderArchDifference=1\n");
-        if (runtimePatcher) {
-            injectionBuilder.append("DllsToInjectFolder=extra_dlls\n");
-        }
-        String injectionSection = injectionBuilder.toString();
-
-        String iniContent = "[SteamClient]\n" +
-                "\n" +
-                "Exe=" + exePath + "\n" +
-                "ExeRunDir=" + exeRunDir + "\n" +
-                "ExeCommandLine=" + exeCommandLine + "\n" +
-                "AppId=" + appId + "\n" +
-                "\n" +
-                "# path to the steamclient dlls, both must be set, absolute paths or relative to the loader directory\n" +
-                "SteamClientDll=steamclient.dll\n" +
-                "SteamClient64Dll=steamclient64.dll\n" +
-                "\n" +
-                injectionSection;
+        String iniContent = buildColdClientIni(appId, exePath, exeRunDir, exeCommandLine, runtimePatcher);
 
         FileUtils.writeString(iniFile, iniContent);
+        if (runtimePatcher) ensureExtraDllsLoadOrder();
         Log.d("XServerDisplayActivity",
                 "Wrote ColdClientLoader.ini: Exe=" + exePath + " ExeRunDir=" + exeRunDir
                         + " AppId=" + appId + " runtimePatcher=" + runtimePatcher);
+    }
+
+    /**
+     * Build a complete ColdClientLoader.ini body for gbe_fork's loader.
+     *
+     * Every key gbe_fork understands is set explicitly so behavior doesn't drift on
+     * upstream default changes. Decisions worth remembering:
+     *
+     *   [Persistence] Mode=0 keeps the loader alive (WaitForSingleObject on the
+     *   game's main thread) for the game's whole lifetime — required, since
+     *   Goldberg's in-process steamclient.dll lives in the loader's process tree.
+     *
+     *   IgnoreInjectionError=1 — the loader logs and continues if a single injected
+     *   DLL fails. Set to 0 only when debugging an injection failure (it triggers
+     *   TerminateProcess+MessageBox, which kills the game we're trying to test).
+     *
+     *   ForceInjectSteamClient=0 — when the game ships its own steam_api{64}.dll,
+     *   we want the standard HKCU SteamClientDll64 redirector path so steamclient
+     *   isn't injected BEFORE StubDRM64 (which must run first per gbe_fork changelog).
+     *
+     *   DllsToInjectFolder uses an absolute Windows path. The loader resolves
+     *   relative paths against its own exe directory, which works for our layout,
+     *   but writing the absolute path removes any room for CWD-based confusion.
+     *
+     *   load_order.txt next to StubDRM64.dll pins it to slot 0 so the SteamStub
+     *   in-memory patch runs before steamclient64.dll loads. ensureExtraDllsLoadOrder()
+     *   drops the file; without it, recursive_directory_iterator ordering is
+     *   filesystem-defined.
+     */
+    private String buildColdClientIni(int appId, String exePath, String exeRunDir,
+                                       String exeCommandLine, boolean runtimePatcher) {
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append("[SteamClient]\n\n");
+        sb.append("Exe=").append(exePath).append('\n');
+        sb.append("ExeRunDir=").append(exeRunDir).append('\n');
+        sb.append("ExeCommandLine=").append(exeCommandLine).append('\n');
+        sb.append("AppId=").append(appId).append('\n');
+        sb.append('\n');
+        sb.append("# path to the steamclient dlls, both must be set, absolute paths or relative to the loader directory\n");
+        sb.append("SteamClientDll=steamclient.dll\n");
+        sb.append("SteamClient64Dll=steamclient64.dll\n");
+        sb.append('\n');
+        sb.append("[Injection]\n");
+        sb.append("ForceInjectSteamClient=0\n");
+        sb.append("ForceInjectGameOverlayRenderer=0\n");
+        if (runtimePatcher) {
+            // Absolute Windows path — wine resolves to <prefix>/drive_c/Program Files (x86)/Steam/extra_dlls,
+            // independent of whatever CWD the loader inherited.
+            sb.append("DllsToInjectFolder=C:\\Program Files (x86)\\Steam\\extra_dlls\n");
+        }
+        sb.append("IgnoreInjectionError=1\n");
+        // IgnoreLoaderArchDifference=1 lets the x64 loader SPAWN x86 games.
+        sb.append("IgnoreLoaderArchDifference=1\n");
+        sb.append('\n');
+        sb.append("[Persistence]\n");
+        // Mode=0: loader waits on the game's main thread; Goldberg's in-process steamclient
+        // stays mapped for the game's whole lifetime. Anything else loses Steam IPC mid-game.
+        sb.append("Mode=0\n");
+        sb.append('\n');
+        sb.append("[Debug]\n");
+        sb.append("ResumeByDebugger=0\n");
+        return sb.toString();
+    }
+
+    /**
+     * Drop a load_order.txt next to StubDRM64.dll so gbe_fork's loader injects the
+     * SteamStub in-memory patcher before any other extra_dlls — required for the
+     * patch to run before steamclient64.dll's DllMain (see CHANGELOG: "must be
+     * injected first"). Without this file, the loader's recursive_directory_iterator
+     * order is filesystem-defined and the patcher may land too late.
+     */
+    private void ensureExtraDllsLoadOrder() {
+        File extraDlls = new File(container.getRootDir(),
+                ".wine/drive_c/Program Files (x86)/Steam/extra_dlls");
+        File stubDrm = new File(extraDlls, "StubDRM64.dll");
+        if (!stubDrm.exists()) return;
+        File loadOrder = new File(extraDlls, "load_order.txt");
+        String body = "StubDRM64.dll\n";
+        if (loadOrder.exists() && body.equals(FileUtils.readString(loadOrder))) return;
+        FileUtils.writeString(loadOrder, body);
+        Log.d("XServerDisplayActivity", "Wrote " + loadOrder.getAbsolutePath());
     }
 
     /**
@@ -6546,35 +7535,11 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         String perGameExecArgs = shortcut != null ? shortcut.getSettingExtra("execArgs", container.getExecArgs()) : container.getExecArgs();
         String exeCommandLine = perGameExecArgs != null ? perGameExecArgs : "";
 
-        // IgnoreLoaderArchDifference=1 lets the x64 loader SPAWN x86 games.
-        // DllsToInjectFolder is only included when the user opts into the
-        // Runtime DRM Patcher — that injects extra_dlls/StubDRM64.dll, the
-        // legacy in-memory SteamStub patcher. It is x64-only, so it patches
-        // 64-bit games only. (gbe_fork's newer "steamclient_extra" patcher is
-        // not used: it regressed SteamStub games — "Application load error
-        // 3:0000065432".) Non-DRM games don't benefit from injection and pay
-        // per-frame hook overhead, hence the opt-in toggle.
-        StringBuilder injectionBuilder = new StringBuilder("[Injection]\nIgnoreLoaderArchDifference=1\n");
-        if (runtimePatcher) {
-            injectionBuilder.append("DllsToInjectFolder=extra_dlls\n");
-        }
-        String injectionSection = injectionBuilder.toString();
-
-        String iniContent = "[SteamClient]\n" +
-                "\n" +
-                "Exe=" + exePath + "\n" +
-                "ExeRunDir=" + exeRunDir + "\n" +
-                "ExeCommandLine=" + exeCommandLine + "\n" +
-                "AppId=" + appId + "\n" +
-                "\n" +
-                "# path to the steamclient dlls, both must be set, absolute paths or relative to the loader directory\n" +
-                "SteamClientDll=steamclient.dll\n" +
-                "SteamClient64Dll=steamclient64.dll\n" +
-                "\n" +
-                injectionSection;
+        String iniContent = buildColdClientIni(appId, exePath, exeRunDir, exeCommandLine, runtimePatcher);
 
         FileUtils.writeString(iniFile, iniContent);
-        Log.d("XServerDisplayActivity", "Wrote ColdClientLoader.ini: Exe=" + exePath + " ExeRunDir=" + exeRunDir + " AppId=" + appId);
+        if (runtimePatcher) ensureExtraDllsLoadOrder();
+        Log.d("XServerDisplayActivity", "Wrote ColdClientLoader.ini: Exe=" + exePath + " ExeRunDir=" + exeRunDir + " AppId=" + appId + " runtimePatcher=" + runtimePatcher);
 
         // Also update any ColdClientLoader.ini inside the game directory's embedded Steam/ folder.
         // The experimental-drm extraction creates a full Steam directory inside the game folder
@@ -7366,15 +8331,22 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         // Step 2: Install redistributables for this game if not already done in this container
         installRedistributablesIfNeeded(launcher);
 
-        // Step 3: Run Steamless DRM stripping.
-        // Runtime DRM Patcher (extra_dlls) handles most games automatically when
-        // enabled, but Steamless is needed as a fallback for stubborn SteamStub
-        // variants. Single-exe unpacking runs by default for Steam games when
-        // needsUnpacking is set; the "Unpack Files" toggle also enables multi-exe
-        // scanning so additional exes/dlls in the game dir are unpacked too.
+        // Step 3: Run Steamless DRM stripping — strictly gated on the
+        // "Unpack Files" per-shortcut toggle. The toggle is the single source of
+        // truth: unchecked = Steamless never runs (even if heuristics would have
+        // suggested it), checked = Steamless runs every launch until an unpacked
+        // copy is staged. Older logic that triggered Steamless on heuristic
+        // `needsUnpacking` flags or "no unpacked exe yet" produced surprising
+        // behaviour (e.g. Steamless running on games without SteamStub at all,
+        // wasting ~5-10s per launch and leaving stale `.unpacked.exe` files).
         if (launchRealSteam) {
             Log.d("XServerDisplayActivity",
                     "Skipping Steamless/unpack flow because Launch Steam Client is enabled");
+            return;
+        }
+        if (!unpackFiles) {
+            Log.d("XServerDisplayActivity",
+                    "Skipping Steamless: 'Unpack Files' shortcut toggle is OFF");
             return;
         }
         if (!monoReady) {
@@ -7385,15 +8357,12 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             Log.d("XServerDisplayActivity", "Skipping Steamless/unpack check; executable already handled");
             return;
         }
-        boolean unpackedExeExists = doesUnpackedExeExist();
-        if (needsUnpacking || unpackFiles || !unpackedExeExists) {
-            if (needsUnpacking || !unpackedExeExists) {
-                runSteamlessOnExe(launcher);
-            } else {
-                // Steamless already ran on a prior launch. Ensure the unpacked exe is active
-                // in case something (e.g. mode switch) restored the original.
-                ensureUnpackedExeActive();
-            }
+        if (doesUnpackedExeExist()) {
+            // Steamless already ran on a prior launch. Ensure the unpacked exe is active
+            // in case something (e.g. mode switch) restored the original.
+            ensureUnpackedExeActive();
+        } else {
+            runSteamlessOnExe(launcher);
         }
     }
 
@@ -8313,6 +9282,187 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
      * Sets up the Steam environment: steamapps/common symlink, ACF manifest,
      * Wine registry entries for Steam paths, and steam.cfg for bootstrap inhibit.
      */
+    /**
+     * Bionic Steam: write HKCU\Software\Valve\Steam\ActiveProcess so a
+     * launched game's steam_api(64).dll finds the lsteamclient bridge and
+     * believes a Steam client is active. SteamClientDll{,64} point
+     * straight at lsteamclient.dll (kept by its real name in
+     * system32/syswow64 so Wine pairs it with its unix side
+     * lsteamclient.so — renaming to steamclient64.dll would break that).
+     */
+    private void writeBionicActiveProcessRegistry() {
+        try {
+            long steamId64 = com.winlator.cmod.feature.stores.steam.utils
+                    .PrefManager.INSTANCE.getSteamUserSteamId64();
+            int accountId = (int) (steamId64 & 0xFFFFFFFFL);
+            File userReg = new File(container.getRootDir(), ".wine/user.reg");
+            // Forest probes HKCU\...\ActiveProcess\pid to decide "is Steam
+            // running" BEFORE attempting any [DllImport] into steam_api*.dll
+            // or CSteamworks.dll. If pid is 0/missing the game synthesizes
+            // "STEAM NOT INITIALIZED" without ever loading a Steam DLL —
+            // Wine's loaddll trace shows zero steam_api/csteamworks attempts
+            // (verified live 2026-05-20). Write our app's own PID as a
+            // non-zero placeholder so the running-check passes; the bridge
+            // takes over from there. Real Steam writes its steam.exe PID
+            // here, but any non-zero value satisfies the SDK helpers.
+            int steamPid = android.os.Process.myPid();
+            try (com.winlator.cmod.runtime.wine.WineRegistryEditor editor =
+                         new com.winlator.cmod.runtime.wine.WineRegistryEditor(userReg)) {
+                editor.setCreateKeyIfNotExist(true);
+                String key = "Software\\Valve\\Steam\\ActiveProcess";
+                editor.setDwordValue(key, "ActiveUser", accountId);
+                editor.setDwordValue(key, "pid", steamPid);
+                editor.setStringValue(key, "SteamClientDll",
+                        "C:\\windows\\syswow64\\lsteamclient.dll");
+                editor.setStringValue(key, "SteamClientDll64",
+                        "C:\\windows\\system32\\lsteamclient.dll");
+                editor.setStringValue(key, "Universe", "Public");
+            }
+            Log.d("XServerDisplayActivity",
+                    "Bionic: wrote ActiveProcess registry (ActiveUser=" + accountId
+                            + " pid=" + steamPid + ")");
+        } catch (Exception e) {
+            Log.e("XServerDisplayActivity", "Bionic: ActiveProcess registry write failed", e);
+        }
+    }
+
+    /**
+     * Inverse of {@link #writeBionicActiveProcessRegistry()}. Removes HKCU
+     * {@code Software\Valve\Steam\ActiveProcess\SteamClientDll{,64}} so that
+     * the game's steam_api{64}.dll stops resolving to our lsteamclient.dll
+     * bridge. ColdClient launches need this — the ColdClientLoader registers
+     * its own redirector pointing at Goldberg's steamclient64.dll, but if a
+     * prior Bionic launch already set the keys to lsteamclient.dll, the game
+     * loads our bridge instead and the wrong Steam impl answers.
+     *
+     * Safe to call when the keys don't exist; the editor no-ops on missing
+     * values.
+     */
+    /**
+     * Drop our Wine bridge as steamclient.dll + steamclient64.dll inside the
+     * container's SteamPath so the game's stock steam_api(64).dll loads OUR
+     * bridge first when it does SetDllDirectory(SteamPath) + LoadLibrary("steamclient64.dll").
+     *
+     * Background: SteamPath ("C:\\Program Files (x86)\\Steam") is a symlink to
+     * .shared/steam-client-store/ — the user's real Valve client install
+     * (used by Real Steam mode). Real Valve steamclient64.dll expects steam.exe
+     * IPC; in Bionic mode there is no steam.exe, so SteamAPI_Init returns
+     * false → game shows "STEAM NOT INITIALIZED".
+     *
+     * Fix: replace the SteamPath symlink with a per-container directory
+     * populated by symlinks back to every entry in steam-client-store
+     * EXCEPT steamclient.dll/steamclient64.dll, then write our bridge as
+     * those two names. The shared store stays pristine for non-Bionic modes.
+     *
+     * On the next launch in Real Steam or ColdClient mode, the existing
+     * updateSteamDirectoryVisibility() call deletes whatever's at SteamPath
+     * and recreates the symlink — undoing our overlay automatically.
+     */
+    private boolean installBionicSteamPathOverlay(Container container, File bionicSteamDir) {
+        try {
+            File sharedStore = getSharedSteamStore();
+            if (!sharedStore.isDirectory()) {
+                Log.w("XServerDisplayActivity",
+                        "installBionicSteamPathOverlay: shared steam-client-store missing at "
+                                + sharedStore.getAbsolutePath()
+                                + " — falling back to bridge-in-system32 only (game may fail to "
+                                + "find steamclient64.dll because stock steam_api64.dll searches "
+                                + "SteamPath first)");
+                return false;
+            }
+            File bridge64Src = new File(container.getRootDir(),
+                    ".wine/drive_c/windows/system32/lsteamclient.dll");
+            File bridge32Src = new File(container.getRootDir(),
+                    ".wine/drive_c/windows/syswow64/lsteamclient.dll");
+            if (!bridge64Src.exists()) {
+                Log.w("XServerDisplayActivity",
+                        "installBionicSteamPathOverlay: bridge missing at "
+                                + bridge64Src.getAbsolutePath());
+                return false;
+            }
+            // If bionicSteamDir is still a symlink to the shared store,
+            // replace it with a real directory. Use Files.isSymbolicLink so
+            // we don't accidentally rm -rf the shared store via the link.
+            java.nio.file.Path bionicPath = bionicSteamDir.toPath();
+            if (java.nio.file.Files.isSymbolicLink(bionicPath)) {
+                java.nio.file.Files.delete(bionicPath);
+            }
+            if (!bionicSteamDir.exists()) {
+                bionicSteamDir.mkdirs();
+            }
+            // Mirror every entry in steam-client-store as a symlink in our
+            // per-container SteamPath, except steamclient.dll and
+            // steamclient64.dll which we'll write ourselves. Symlink rather
+            // than copy so a future steam-client-store update is reflected
+            // without re-running setup. Idempotent — skip entries that
+            // already exist with the right link target.
+            File[] storeEntries = sharedStore.listFiles();
+            int symlinkedCount = 0;
+            if (storeEntries != null) {
+                for (File entry : storeEntries) {
+                    String name = entry.getName();
+                    if (name.equalsIgnoreCase("steamclient.dll")
+                            || name.equalsIgnoreCase("steamclient64.dll")
+                            || name.equalsIgnoreCase("steamapps")) {
+                        // steamclient*.dll: we'll write the bridge below.
+                        // steamapps: handled by ensureSteamappsCommonSymlink.
+                        continue;
+                    }
+                    File dest = new File(bionicSteamDir, name);
+                    if (dest.exists() || java.nio.file.Files.isSymbolicLink(dest.toPath())) {
+                        continue;
+                    }
+                    java.nio.file.Files.createSymbolicLink(
+                            dest.toPath(), entry.toPath().toAbsolutePath());
+                    ++symlinkedCount;
+                }
+            }
+            // Write the bridge as steamclient.dll + steamclient64.dll. Real
+            // copies (not symlinks) so an accidental "rm bridge from system32"
+            // doesn't break the overlay. ~1.5 MB each — cheap.
+            File dest64 = new File(bionicSteamDir, "steamclient64.dll");
+            FileUtils.copy(bridge64Src, dest64);
+            File dest32 = new File(bionicSteamDir, "steamclient.dll");
+            if (bridge32Src.exists()) {
+                FileUtils.copy(bridge32Src, dest32);
+            } else {
+                // 32-bit bridge missing — copy 64-bit as a placeholder so
+                // 32-bit games at least don't crash on LoadLibrary failure;
+                // they'll fail later on SteamAPI vtable dispatch because the
+                // ABI mismatches. Most modern games use the 64-bit path.
+                FileUtils.copy(bridge64Src, dest32);
+            }
+            Log.d("XServerDisplayActivity",
+                    "installBionicSteamPathOverlay: " + symlinkedCount + " store entries"
+                            + " symlinked, bridge written as steamclient64.dll ("
+                            + dest64.length() + "B) + steamclient.dll ("
+                            + dest32.length() + "B)");
+            return true;
+        } catch (Exception e) {
+            Log.e("XServerDisplayActivity",
+                    "installBionicSteamPathOverlay failed", e);
+            return false;
+        }
+    }
+
+    private void clearBionicActiveProcessRegistry() {
+        try {
+            File userReg = new File(container.getRootDir(), ".wine/user.reg");
+            if (!userReg.exists()) return;
+            try (com.winlator.cmod.runtime.wine.WineRegistryEditor editor =
+                         new com.winlator.cmod.runtime.wine.WineRegistryEditor(userReg)) {
+                String key = "Software\\Valve\\Steam\\ActiveProcess";
+                editor.removeValue(key, "SteamClientDll");
+                editor.removeValue(key, "SteamClientDll64");
+                editor.removeValue(key, "ActiveUser");
+                editor.removeValue(key, "Universe");
+            }
+            Log.d("XServerDisplayActivity", "Cleared Bionic ActiveProcess registry redirector");
+        } catch (Exception e) {
+            Log.e("XServerDisplayActivity", "Failed to clear Bionic ActiveProcess registry", e);
+        }
+    }
+
     private void setupSteamEnvironment(int appId, File gameDir) {
         try {
             File winePrefix = container.getRootDir();
@@ -8502,6 +9652,208 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                         Log.w("XServerDisplayActivity",
                                 "Failed to clear remote/ save directory for appId=" + appId);
                     }
+                }
+            }
+
+            // --- Bionic Steam native bootstrap (experimental test wiring) -----
+            // When Bionic Steam mode is active, stage Valve's libsteamclient.so
+            // and run WnSteamBootstrap.nativeInit in-process. This exercises
+            // wn-steam-bootstrap's dlopen + Steam_CreateGlobalUser + IClientUser
+            // logon (SetLoginInformation/SetLoginToken/LogOn) + Steam_BLoggedOn
+            // poll, with the STEAM_SSL_CERT_FILE env + corrected vtable offsets.
+            // The bootstrap logs its own verdict to logcat tag "WnSteamBoot";
+            // libsteamclient.so's own connection_log.txt shows whether the TLS
+            // session to the CM servers actually connects. The game still
+            // launches via the normal path below — this only runs the bootstrap
+            // alongside it so we can observe the result.
+            //
+            // Steam Launcher: SKIP this entire Android-side bootstrap. PLAN_W.md
+            // marks `wn-steam-bootstrap` as DELETE-for-game-launches — the
+            // Wine-side wn-steam-launcher.exe now hosts Valve's real client
+            // in-process with the game, so the Android-side libsteamclient.so
+            // dlopen is redundant. Running it anyway:
+            //   1. Starts a SECOND Steam logon on the same account (the
+            //      launcher already does one) → logon-throttle risk
+            //      (see [[feedback_steam_logon_throttle]]).
+            //   2. Runs the "Bionic stage2" JNI diagnostic block below,
+            //      whose nativeISteamUserStatsListAchievements call
+            //      SIGSEGVs inside libwnsteambootstrap.so — a native crash
+            //      a Java try/catch CANNOT trap, so it kills the whole
+            //      launch (observed on .144, 2026-05-21).
+            // Steam Launcher is the single Steam session; skip the rest.
+            boolean planWActiveBootstrapSkip = com.winlator.cmod.feature.stores.steam.utils
+                    .PrefManager.INSTANCE.getWnPlanW();
+            if (isBionicSteamEnabledForShortcut() && planWActiveBootstrapSkip) {
+                Log.i("XServerDisplayActivity",
+                        "Steam Launcher: skipping Android-side WnSteamBootstrap + stage2 "
+                        + "diagnostics — wn-steam-launcher.exe is the sole Steam "
+                        + "session (avoids double-logon + the listAchievements "
+                        + "native crash)");
+            } else if (isBionicSteamEnabledForShortcut()) {
+                try {
+                    boolean staged = com.winlator.cmod.feature.stores.steam.wnsteam
+                            .WnSteamAssetsInstaller.INSTANCE.install(this, container);
+                    File libSteamClientSo =
+                            new File(imageFs.getRootDir(), "usr/lib/libsteamclient.so");
+                    Log.d("XServerDisplayActivity",
+                            "Bionic Steam bootstrap: staged=" + staged
+                                    + " libsteamclient.so exists=" + libSteamClientSo.exists()
+                                    + " (" + libSteamClientSo.getAbsolutePath() + ")");
+                    if (libSteamClientSo.exists()) {
+                        String bsAccount = com.winlator.cmod.feature.stores.steam.utils
+                                .PrefManager.INSTANCE.getUsername();
+                        String bsToken = com.winlator.cmod.feature.stores.steam.utils
+                                .PrefManager.INSTANCE.getRefreshToken();
+                        long bsSteamId = com.winlator.cmod.feature.stores.steam.utils
+                                .PrefManager.INSTANCE.getSteamUserSteamId64();
+                        File bsHome = new File(imageFs.getRootDir(), "home");
+                        Log.d("XServerDisplayActivity",
+                                "Bionic Steam bootstrap: account=" + bsAccount
+                                        + " tokenLen="
+                                        + (bsToken == null ? 0 : bsToken.length())
+                                        + " steamId=" + bsSteamId);
+                        // libsteamclient.so's IClientUser.LogonWithRefreshToken
+                        // is a stub that flips set_logged_on(true) in pushed
+                        // state — no Steam round-trip — so the bootstrap and
+                        // wn-session coexist on the same refresh token without
+                        // a hand-off. Game-side queries route back to wn-session
+                        // via cm_bridge.
+                        // Bionic launch — pass the launching game's appId so
+                        // libsteamclient.so binds ISteamApps/RemoteStorage/
+                        // UserStats to this game's context. Previously
+                        // hardcoded to The Forest (242760); now per-game.
+                        int rc = com.winlator.cmod.feature.stores.steam.wnsteam
+                                .WnSteamBootstrap.INSTANCE.start(
+                                        this,
+                                        libSteamClientSo.getAbsolutePath(),
+                                        bsHome.getAbsolutePath(),
+                                        "127.0.0.1:57343",
+                                        "127.0.0.1:57344",
+                                        new String[0],
+                                        bsAccount,
+                                        bsToken,
+                                        bsSteamId,
+                                        appId);
+                        Log.d("XServerDisplayActivity",
+                                "Bionic Steam bootstrap: start() rc=" + rc
+                                        + " appId=" + appId);
+                        // Also push the AppID into our open-source
+                        // libsteamclient.so so ISteamUtils.GetAppID
+                        // and any app-scoped queries from game-side
+                        // consumers see the launching game's context.
+                        com.winlator.cmod.feature.stores.steam.wnsteam
+                                .WnLibSteamClient.INSTANCE.setAppId(appId);
+                        // Encrypted-app-ticket + ownership-ticket prefetch.
+                        // The Bionic branch historically skipped this (it's
+                        // tucked inside enrichSteamSettings which only the
+                        // ColdClient/Goldberg branches reach). Without it,
+                        // games that call ISteamUser.RequestEncryptedAppTicket
+                        // through our .so get the synthetic 32B "WNETKT"
+                        // placeholder and any Capcom-style DRM that validates
+                        // it rejects the session (silent boot failure —
+                        // observed with Monster Hunter Stories + Monster
+                        // Hunter Rise). Run blocking — we want the tickets
+                        // landed in pushed-state BEFORE the game queries.
+                        try {
+                            com.winlator.cmod.feature.stores.steam.service.SteamService
+                                    .prepareLibSteamClientForLaunchBlocking(appId);
+                        } catch (Throwable t) {
+                            Log.w("XServerDisplayActivity",
+                                    "Bionic Steam: prepareLibSteamClientForLaunch failed for app "
+                                            + appId, t);
+                        }
+                        // Hybrid stage-2 cross-check: read the bootstrap's
+                        // OWN view of the SteamID + AppID via the public
+                        // ISteam* surface and log it next to PrefManager's
+                        // values. liveSteamId == bsSteamId proves the
+                        // bootstrap is authenticated as the SAME account
+                        // wn-steam-client is using (i.e., the hand-off
+                        // and the refresh-token-driven logon both landed
+                        // on the same account, no silent identity drift).
+                        // currentAppId verifies the SteamAppId env we set
+                        // before dlopen actually propagated.
+                        com.winlator.cmod.feature.stores.steam.wnsteam.WnSteamBootstrap bs =
+                                com.winlator.cmod.feature.stores.steam.wnsteam.WnSteamBootstrap.INSTANCE;
+                        long liveSid = bs.liveSteamId();
+                        int  liveApp = bs.currentAppId();
+                        Log.d("XServerDisplayActivity",
+                                "Bionic Steam bootstrap: live ISteamUser.steamId="
+                                        + liveSid + " (prefmgr=" + bsSteamId
+                                        + " match=" + (liveSid == bsSteamId)
+                                        + ") ISteamUtils.appId=" + liveApp);
+
+                        // Hybrid stage-2 — exercise the FULL JNI surface as a
+                        // diagnostic on every Bionic launch. Confirms each
+                        // public-API accessor returns real data once the
+                        // bootstrap is authenticated. Pure read-side, no
+                        // behavior change — log lines only. Look for
+                        // discrepancies between bootstrap and existing
+                        // wn-session views to catch silent drift early.
+                        try {
+                            boolean subscribed = bs.isSubscribedApp(appId);
+                            int     license   = bs.userHasLicenseForApp(liveSid, appId);
+                            boolean installed = bs.isAppInstalled(appId);
+                            String  installDir = bs.appInstallDir(appId);
+                            int[]   depots    = bs.installedDepots(appId);
+                            String  lang      = bs.currentGameLanguage();
+                            boolean publicLogged = bs.loggedOnPublic();
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic stage2 apps/user: subscribed=" + subscribed
+                                            + " license=" + license + " (0=ok 1=no 2=noauth)"
+                                            + " installed=" + installed
+                                            + " installDir=" + installDir
+                                            + " depots=" + (depots == null ? 0 : depots.length)
+                                            + " lang=" + lang
+                                            + " loggedOnPublic=" + publicLogged);
+
+                            boolean cloudAcct = bs.cloudEnabledForAccount();
+                            boolean cloudApp  = bs.cloudEnabledForApp();
+                            int     cloudCnt  = bs.cloudFileCount();
+                            long[]  cloudQ    = bs.cloudQuota();
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic stage2 cloud: account=" + cloudAcct
+                                            + " app=" + cloudApp
+                                            + " files=" + cloudCnt
+                                            + " quota=" + cloudQ[1] + "/" + cloudQ[0]);
+
+                            int numAch = bs.numAchievements();
+                            java.util.List<String> achNames = bs.listAchievements();
+                            String firstAch = achNames.isEmpty() ? "(none)" : achNames.get(0);
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic stage2 stats: numAch=" + numAch
+                                            + " firstName=" + firstAch);
+
+                            String  pname  = bs.personaName();
+                            int     pstate = bs.personaState();
+                            int     fcount = bs.friendCount(
+                                    com.winlator.cmod.feature.stores.steam.wnsteam
+                                            .WnSteamBootstrap.FriendFlags.Immediate);
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic stage2 friends: personaName=" + pname
+                                            + " personaState=" + pstate
+                                            + " friendCount(immediate)=" + fcount);
+
+                            int  purchaseTime = bs.earliestPurchaseUnixTime(appId);
+                            int  numDlc       = bs.dlcCount(appId);
+                            long owner        = bs.appOwner();
+                            boolean famShared = bs.isSubscribedFromFamilySharing();
+                            Log.d("XServerDisplayActivity",
+                                    "Bionic stage2 perApp: earliestPurchase=" + purchaseTime
+                                            + " dlcCount=" + numDlc
+                                            + " appOwner=" + owner
+                                            + " (familySharing=" + famShared + ")");
+                        } catch (Throwable t) {
+                            // Diagnostic — never break the launch.
+                            Log.w("XServerDisplayActivity",
+                                    "Bionic stage2 diagnostic failed", t);
+                        }
+                    } else {
+                        Log.w("XServerDisplayActivity",
+                                "Bionic Steam bootstrap: libsteamclient.so missing, "
+                                        + "skipping nativeInit");
+                    }
+                } catch (Throwable t) {
+                    Log.e("XServerDisplayActivity", "Bionic Steam bootstrap failed", t);
                 }
             }
 

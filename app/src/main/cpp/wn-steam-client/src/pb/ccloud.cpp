@@ -12,6 +12,39 @@ std::vector<uint8_t> CCloud_GetAppFileChangelist_Request::serialize() const {
     return out;
 }
 
+std::vector<uint8_t> CCloud_GetUserQuota_Request::serialize() const {
+    // Empty body — the Cloud service derives the user from the
+    // authenticated CM session.
+    return {};
+}
+
+std::optional<CCloud_GetUserQuota_Response>
+CCloud_GetUserQuota_Response::deserialize(std::span<const uint8_t> body) noexcept {
+    proto::Reader r(body);
+    CCloud_GetUserQuota_Response m;
+    while (!r.eof()) {
+        auto t = r.next_tag();
+        if (!t) {
+            if (!r.ok()) return std::nullopt;
+            break;
+        }
+        switch (t->field_number) {
+            case 1:
+                if (auto v = r.u64(); v) m.total_bytes = *v;
+                else return std::nullopt;
+                break;
+            case 2:
+                if (auto v = r.u64(); v) m.used_bytes = *v;
+                else return std::nullopt;
+                break;
+            default:
+                if (!r.skip(t->wire_type)) return std::nullopt;
+                break;
+        }
+    }
+    return m;
+}
+
 std::optional<CCloud_AppFileInfo>
 CCloud_AppFileInfo::deserialize(std::span<const uint8_t> body) noexcept {
     proto::Reader r(body);

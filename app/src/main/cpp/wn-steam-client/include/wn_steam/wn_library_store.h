@@ -51,6 +51,11 @@ struct OwnedApp {
     std::string           os_list;           // CSV "windows,linux,macos"
     uint32_t              parent_app_id     = 0;   // for DLC: the game it belongs to
     std::vector<uint32_t> dlc_app_ids;       // for games: known DLC children (from extended.listofdlc)
+    // PICS public-branch buildid (depots.branches.public.buildid).
+    // 0 when the app has no published build yet OR the PICS section
+    // hasn't been parsed. Surfaced by snapshot_json so the libsteamclient.so
+    // ISteamApps.GetAppBuildId can return it.
+    uint32_t              build_id          = 0;
     std::vector<uint32_t> source_package_ids;// which packages grant this app
     bool                  pics_fetched      = false;
     bool                  missing_token     = false;   // PICS reported missing_token → need access-token req

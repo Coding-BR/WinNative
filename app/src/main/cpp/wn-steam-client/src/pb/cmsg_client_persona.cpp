@@ -14,6 +14,38 @@ std::vector<uint8_t> CMsgClientRequestFriendData::serialize() const {
     return out;
 }
 
+namespace {
+// Parse one rich_presence KV submessage: { 1 string key, 2 string value }.
+// Returns the (key, value) pair on success, nullopt on parse failure /
+// missing fields.
+std::optional<std::pair<std::string, std::string>>
+parse_kv_submessage(std::span<const uint8_t> body) noexcept {
+    proto::Reader r(body);
+    std::string k, v;
+    bool got_k = false, got_v = false;
+    while (!r.eof()) {
+        auto t = r.next_tag();
+        if (!t) {
+            if (!r.ok()) return std::nullopt;
+            break;
+        }
+        if (t->field_number == 1) {
+            if (auto s = r.string(); s) { k = std::move(*s); got_k = true; }
+            else return std::nullopt;
+        } else if (t->field_number == 2) {
+            if (auto s = r.string(); s) { v = std::move(*s); got_v = true; }
+            else return std::nullopt;
+        } else if (!r.skip(t->wire_type)) {
+            return std::nullopt;
+        }
+    }
+    // Steam can send KV with empty value (signals "key removed"). Treat
+    // missing fields as empty strings — caller decides how to interpret.
+    (void)got_k; (void)got_v;
+    return std::make_pair(std::move(k), std::move(v));
+}
+}  // namespace
+
 std::optional<PersonaStateFriend>
 PersonaStateFriend::deserialize(std::span<const uint8_t> body) noexcept {
     proto::Reader r(body);
@@ -41,6 +73,15 @@ PersonaStateFriend::deserialize(std::span<const uint8_t> body) noexcept {
                 if (auto v = r.string(); v) m.player_name = std::move(*v);
                 else return std::nullopt;
                 break;
+            case 25: {
+                // CMsgClientPersonaState.Friend.rich_presence — repeated KV.
+                auto b = r.bytes();
+                if (!b) return std::nullopt;
+                auto kv = parse_kv_submessage(*b);
+                if (!kv) return std::nullopt;
+                m.rich_presence.push_back(std::move(*kv));
+                break;
+            }
             case 31: {
                 auto b = r.bytes();
                 if (!b) return std::nullopt;

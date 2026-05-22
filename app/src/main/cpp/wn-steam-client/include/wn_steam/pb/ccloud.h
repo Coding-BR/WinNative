@@ -22,6 +22,24 @@
 
 namespace wn_steam::pb {
 
+// Cloud.GetUserQuota#1 request (empty body — the Cloud service infers
+// the user from the CM session). Steam returns total + used bytes for
+// the signed-in account.
+struct CCloud_GetUserQuota_Request {
+    [[nodiscard]] std::vector<uint8_t> serialize() const;
+};
+
+// Cloud.GetUserQuota#1 response.
+//   1 uint64 total_bytes  (account quota cap)
+//   2 uint64 used_bytes   (currently consumed)
+struct CCloud_GetUserQuota_Response {
+    uint64_t total_bytes = 0;
+    uint64_t used_bytes  = 0;
+
+    [[nodiscard]] static std::optional<CCloud_GetUserQuota_Response>
+    deserialize(std::span<const uint8_t> body) noexcept;
+};
+
 // Cloud.GetAppFileChangelist#1 request.
 //   1 uint32 appid
 //   2 uint64 synced_change_number   (0 → full list)

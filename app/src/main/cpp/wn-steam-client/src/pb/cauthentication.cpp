@@ -363,4 +363,46 @@ CAuthentication_BeginAuthSessionViaQR_Response::deserialize(
     return m;
 }
 
+// ---------------------------------------------------------------------------
+// CAuthentication_AccessToken_GenerateForApp
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t>
+CAuthentication_AccessToken_GenerateForApp_Request::serialize() const {
+    std::vector<uint8_t> out;
+    proto::Writer w(out);
+    w.string_field( 1, refresh_token);
+    w.fixed64_field(2, steamid);
+    w.int32_field(  3, static_cast<int32_t>(renewal_type));
+    return out;
+}
+
+std::optional<CAuthentication_AccessToken_GenerateForApp_Response>
+CAuthentication_AccessToken_GenerateForApp_Response::deserialize(
+    std::span<const uint8_t> body) noexcept {
+    proto::Reader r(body);
+    CAuthentication_AccessToken_GenerateForApp_Response m;
+    while (!r.eof()) {
+        auto t = r.next_tag();
+        if (!t) {
+            if (!r.ok()) return std::nullopt;
+            break;
+        }
+        switch (t->field_number) {
+            case 1:
+                if (auto v = r.string(); v) m.access_token = std::move(*v);
+                else return std::nullopt;
+                break;
+            case 2:
+                if (auto v = r.string(); v) m.refresh_token = std::move(*v);
+                else return std::nullopt;
+                break;
+            default:
+                if (!r.skip(t->wire_type)) return std::nullopt;
+                break;
+        }
+    }
+    return m;
+}
+
 }  // namespace wn_steam::pb

@@ -139,8 +139,12 @@ add_library(wnsteam SHARED
     src/pb/cmsg_client_kick_playing_session.cpp
     src/pb/cmsg_client_change_status.cpp
     src/pb/cmsg_client_persona.cpp
+    src/pb/cmsg_client_friends_list.cpp
     src/pb/cmsg_client_playing_session_state.cpp
     src/pb/cmsg_client_get_depot_decryption_key.cpp
+    src/pb/cmsg_client_mms_get_lobby_list.cpp
+    src/pb/cmsg_client_mms_lobby_data.cpp
+    src/pb/cmsg_client_mms_lobby_ops.cpp
     src/pb/ccloud.cpp
     src/pb/cinventory.cpp
     src/pb/cpublishedfile.cpp
@@ -148,6 +152,7 @@ add_library(wnsteam SHARED
     src/pb/cplayer.cpp
     src/pb/ccontentserverdirectory.cpp
     src/pb/cauthentication.cpp
+    src/cm_bridge.cpp
     jni/wn_steam_jni.cpp
     jni/wn_session_jni.cpp
 )

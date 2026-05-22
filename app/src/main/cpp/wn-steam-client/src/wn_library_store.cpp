@@ -211,6 +211,20 @@ void WnLibraryStore::ingest_app_pics_response(
                     parse_csv_appids(dlc_csv->as_string(), app.dlc_app_ids);
                 }
             }
+            // PICS depots.branches.public.buildid — the public-branch
+            // build id used by ISteamApps.GetAppBuildId. Numeric VDF
+            // value. Falls back to 0 (no public branch / DLC apps that
+            // don't ship their own depots).
+            if (const auto* depots = appinfo->child("depots")) {
+                if (const auto* branches = depots->child("branches")) {
+                    if (const auto* pub = branches->child("public")) {
+                        if (const auto* buildid = pub->child("buildid")) {
+                            app.build_id =
+                                static_cast<uint32_t>(buildid->as_uint(0));
+                        }
+                    }
+                }
+            }
             // DLC linkage: if this app declares a parent, make sure the
             // parent knows it as a child.
             if (app.parent_app_id != 0) {
@@ -239,7 +253,7 @@ void WnLibraryStore::ingest_app_access_tokens(
             auto it = apps_.find(at.appid);
             if (it == apps_.end()) {
                 // Token grant for an app we don't track yet — create a stub.
-                apps_[at.appid] = OwnedApp{at.appid, 0, {}, {}, {}, {}, 0, {}, {}, false, false, at.access_token};
+                apps_[at.appid] = OwnedApp{at.appid, 0, {}, {}, {}, {}, 0, {}, 0, {}, false, false, at.access_token};
             } else {
                 it->second.access_token  = at.access_token;
                 it->second.missing_token = false;
@@ -370,6 +384,7 @@ std::string WnLibraryStore::snapshot_json() const {
         os << ",\"os_list\":"; write_json_string(os, a.os_list);
         os << ",\"parent\":"   << a.parent_app_id
            << ",\"access_token\":\"" << a.access_token << "\""
+           << ",\"build_id\":"   << a.build_id
            << ",\"dlc\":[";
         for (size_t i = 0; i < a.dlc_app_ids.size(); ++i) {
             if (i > 0) os.put(',');

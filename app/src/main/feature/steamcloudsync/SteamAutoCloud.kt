@@ -198,7 +198,19 @@ object SteamAutoCloud {
     }
 
     private fun hexToBytes(hex: String): ByteArray {
-        if (hex.isEmpty() || hex.length % 2 != 0) return ByteArray(0)
+        if (hex.isEmpty()) return ByteArray(0)
+        // Odd-length or non-hex hex strings used to silently return an
+        // empty array — combined with .contentEquals against a real
+        // SHA-1, every file then flagged as "differs", spawning a
+        // spurious "Use Cloud / Use Local" conflict dialog (audit
+        // bonus fix). Now: WARN + still return empty (skip-on-error
+        // semantics — better than throwing mid-sync and losing the
+        // batch). Reject any character outside 0-9a-fA-F.
+        if (hex.length % 2 != 0 || !hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            Timber.w("hexToBytes: malformed input (len=%d, sample='%s') — returning empty array",
+                hex.length, hex.take(16))
+            return ByteArray(0)
+        }
         return ByteArray(hex.length / 2) { i ->
             ((Character.digit(hex[i * 2], 16) shl 4) + Character.digit(hex[i * 2 + 1], 16)).toByte()
         }
@@ -779,6 +791,23 @@ object SteamAutoCloud {
                                 Files.move(tmpPath, actualFilePath, StandardCopyOption.ATOMIC_MOVE)
                             } catch (_: Exception) {
                                 Files.move(tmpPath, actualFilePath, StandardCopyOption.REPLACE_EXISTING)
+                            }
+                            // Preserve the cloud-side mtime — without this,
+                            // the next exit-sync's pathToUserFile baseline
+                            // captures "now" as the mtime, and a no-op
+                            // re-upload batch fires every time the game
+                            // exits even though nothing actually changed.
+                            // Cloud timestamps are unix seconds; convert
+                            // to FileTime in millis.
+                            try {
+                                if (file.timestamp > 0) {
+                                    java.nio.file.Files.setLastModifiedTime(
+                                        actualFilePath,
+                                        java.nio.file.attribute.FileTime.fromMillis(
+                                            file.timestamp * 1000L))
+                                }
+                            } catch (e: Exception) {
+                                Timber.d(e, "cloud download: failed to set mtime for ${file.filename}")
                             }
                             filesDownloaded++
                             bytesDownloaded += wnBytes.size.toLong()

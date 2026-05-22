@@ -467,6 +467,78 @@ object SteamUtils {
             Timber.d(e, "Workshop mods generation skipped for appId=$appId")
         }
 
+        // Push the live cloud-file list for this app into libsteamclient.so
+        // so its ISteamRemoteStorage vtable answers from real data the
+        // moment the game queries. CRITICAL: on failure we MUST clear the
+        // mirror; the cloud_files vector in pushed-state is global (not
+        // per-app), so a transient CM failure during launch of game B can
+        // otherwise leave game A's file list visible to game B — silent
+        // save-game cross-contamination. Log loudly on failure so the
+        // pattern is observable in production logcat.
+        val cloudPushed = runCatching {
+            runBlocking {
+                SteamService.pushCloudStateToLibSteamClient(appId)
+            }
+        }
+        if (cloudPushed.isFailure) {
+            Timber.w(cloudPushed.exceptionOrNull(),
+                "Cloud state push FAILED for appId=$appId — clearing mirror to " +
+                "prevent stale data leaking from a previously-launched app")
+            runCatching {
+                com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
+                    .setCloudFiles(emptyArray(), IntArray(0), LongArray(0))
+            }
+        }
+
+        // Push the per-app DLC list (PICS extended.listofdlc) so
+        // ISteamApps.GetDLCCount / BGetDLCDataByIndex serve real data
+        // to games that gate features on DLC ownership / availability.
+        runCatching {
+            runBlocking {
+                SteamService.pushAppDlcsToLibSteamClient(appId)
+            }
+        }.onFailure { e ->
+            Timber.d(e, "DLC list push skipped for appId=$appId")
+        }
+
+        // Push the per-app installed-depot list so
+        // ISteamApps.GetInstalledDepots answers from the Room registry.
+        runCatching {
+            SteamService.pushAppInstalledDepotsToLibSteamClient(appId)
+        }.onFailure { e ->
+            Timber.d(e, "Installed depots push skipped for appId=$appId")
+        }
+
+        // Pre-fetch the Encrypted App Ticket via wn-session's CM round-trip
+        // and push the bytes into libsteamclient.so so the moment the
+        // game calls ISteamUser.RequestEncryptedAppTicket / GetEncryptedApp
+        // Ticket through our .so, real ticket bytes are served instead of
+        // the synthetic "WNETKT" placeholder. Best-effort; requires Steam
+        // login (silent fall-back to synthetic if offline).
+        runCatching {
+            runBlocking {
+                SteamService.refreshEncryptedAppTicketForLibSteamClient(appId)
+            }
+        }.onFailure { e ->
+            Timber.d(e, "Encrypted app ticket push skipped for appId=$appId")
+        }
+
+        // Pre-fetch the per-app ownership ticket so a game's lsteamclient.
+        // dll → ISteamUser.GetAuthSessionTicket returns a real Steam-
+        // signed ticket wrapped with the SteamKit2-style 24-byte header
+        // (instead of the WNAT synthetic body). This is what online
+        // matchmaking servers validate via Steam Web API
+        // ISteamUserAuth.AuthenticateUserTicket — without it, the
+        // game can't join Internet multiplayer. Best-effort; requires
+        // Steam login.
+        runCatching {
+            runBlocking {
+                SteamService.prefetchOwnershipTicketForLibSteamClient(appId)
+            }
+        }.onFailure { e ->
+            Timber.d(e, "Ownership ticket pre-fetch skipped for appId=$appId")
+        }
+
         // Special save-location symlinks
         ensureSaveLocationsForGames(context, appId)
     }
@@ -1331,6 +1403,41 @@ object SteamUtils {
     ) {
         try {
             val exeCommandLine = container.execArgs
+
+            // Forward to libsteamclient.so so ISteamApps.GetLaunchCommandLine
+            // (slot 26) returns the same value the game's launch arguments
+            // carry.
+            com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
+                .setLaunchCommandLine(exeCommandLine)
+
+            // Family-share detection: look up the bound app's source
+            // license. If at least one of its ownerAccountId entries
+            // matches the local user's accountId, the app is directly
+            // owned. Otherwise — if there's a license whose owner is in
+            // the user's familyGroupMembers — the app is family-shared.
+            // PrefManager.steamUserAccountId is the low-32 bits of the
+            // user's SteamID64, same shape as license.ownerAccountId
+            // and familyGroupMembers entries.
+            val appIdInt = appId.toIntOrNull() ?: 0
+            val familyShared: Boolean =
+                if (appIdInt <= 0) {
+                    false
+                } else {
+                    val license = SteamService.getPkgInfoOf(appIdInt)
+                    val selfAcct = PrefManager.steamUserAccountId
+                    val owners   = license?.ownerAccountId.orEmpty()
+                    when {
+                        owners.isEmpty()         -> false
+                        owners.contains(selfAcct) -> false  // direct
+                        owners.any { it in SteamService.familyMembers } -> true
+                        else                     -> false
+                    }
+                }
+            com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
+                .setAppFamilyShared(familyShared)
+            if (familyShared) {
+                Timber.i("Bound app $appId is family-shared (owner outside self)")
+            }
 
             val steamPath = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
             val userDataPath = File(steamPath, "userdata/$steamUserId64")

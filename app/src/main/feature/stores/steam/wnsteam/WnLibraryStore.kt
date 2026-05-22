@@ -95,6 +95,7 @@ class WnLibraryStore(private val session: WnSteamSession) {
                         accessToken      = o.optString("access_token", "0"),
                         dlcAppIds        = o.optJSONArray("dlc").toIntList(),
                         sourcePackageIds = o.optJSONArray("src_packages").toIntList(),
+                        buildId          = o.optInt("build_id", 0),
                     )
                 }
             } ?: emptyList()

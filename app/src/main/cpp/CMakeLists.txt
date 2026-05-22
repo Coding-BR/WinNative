@@ -8,6 +8,7 @@ add_subdirectory(patchelf)
 add_subdirectory(adrenotools)
 add_subdirectory(wn-steam-client)
 add_subdirectory(wn-steam-bootstrap)
+add_subdirectory(wn-libsteamclient)
 
 find_package(curl REQUIRED CONFIG)
 

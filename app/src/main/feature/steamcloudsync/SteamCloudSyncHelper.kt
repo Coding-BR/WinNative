@@ -25,8 +25,21 @@ import java.util.Date
 import java.util.Locale
 
 object SteamCloudSyncHelper {
-    private fun formatTimestamp(timestampMs: Long?): String {
-        if (timestampMs == null || timestampMs <= 0L) return "Unknown"
+    // Sentinel labels for the conflict dialog. Rendered as-is in
+    // SteamCloudConflictUi so they need to be human-readable; we use them
+    // (instead of raw "Unknown") to disambiguate "cloud unreachable"
+    // from "no remote saves yet" and from "no local saves yet" — each
+    // tells the user something actionable instead of leaving them
+    // guessing which side actually exists.
+    private const val LABEL_NO_LOCAL_SAVES = "No local saves"
+    private const val LABEL_NO_CLOUD_SAVES = "No cloud saves"
+    private const val LABEL_CLOUD_UNREACHABLE = "Cloud unreachable"
+
+    private fun formatTimestamp(
+        timestampMs: Long?,
+        emptyLabel: String,
+    ): String {
+        if (timestampMs == null || timestampMs <= 0L) return emptyLabel
         return SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(timestampMs))
     }
 
@@ -76,11 +89,28 @@ object SteamCloudSyncHelper {
                         overrideLocalChangeNumber = -1,
                     ).await()
 
+            val ok = syncInfo?.syncResult == SyncResult.Success || syncInfo?.syncResult == SyncResult.UpToDate
+            // Refresh libsteamclient.so's cloud_files mirror after the
+            // download so a game launched immediately after the
+            // \"Restore\" (or any other forceDownloadById caller — the
+            // user-facing \"Sync from Steam Cloud\" button + the
+            // Cloud Saves history Restore button both land here) sees
+            // the freshly-downloaded file list via ISteamRemoteStorage
+            // .FileExists / GetFileCount. Without this, the mirror
+            // stays stale until the next launch path runs the full
+            // enrichSteamSettings.
+            if (ok) {
+                runCatching {
+                    SteamService.pushCloudStateToLibSteamClient(appId)
+                }.onFailure { e ->
+                    Timber.w(e, "forceDownloadById: libsteamclient mirror refresh failed for app=%d", appId)
+                }
+            }
             // Intentionally no snapshot capture here. The user-facing "Sync from Steam Cloud"
             // button and launch-time auto-downloads should just place files locally; an
             // automatic rollback snapshot on every download bloats local storage and isn't
             // what the user asked for. Exit-sync still snapshots via SteamExitCloudSync.
-            syncInfo?.syncResult == SyncResult.Success || syncInfo?.syncResult == SyncResult.UpToDate
+            ok
         } catch (e: Exception) {
             Timber.e(e, "Failed to force Steam cloud download for appId=%d", appId)
             false
@@ -213,7 +243,7 @@ object SteamCloudSyncHelper {
         if (appId == null || !hasLocalCloudSaves(context, shortcut)) {
             return CloudConflictProbe(
                 differs = false,
-                timestamps = SteamCloudConflictTimestamps("Unknown", "Unknown"),
+                timestamps = SteamCloudConflictTimestamps(LABEL_NO_LOCAL_SAVES, LABEL_NO_CLOUD_SAVES),
             )
         }
         // hasLocalCloudSaves can short-circuit on a `synced_STEAM_$appId` pref entry
@@ -226,23 +256,38 @@ object SteamCloudSyncHelper {
             try {
                 // Pass context so the snapshot can do a SHA-aware content check (not CN-only)
                 // and avoid spurious conflict dialogs when local matches cloud after a pull.
+                // Snapshot is null when wn-session can't reach the CM (cold start race,
+                // network drop, EResult 84/15). In that case we do NOT claim a
+                // conflict — popping a dialog with "Unknown" on the cloud side
+                // (the historical bug) tells the user nothing actionable and
+                // would force them to pick blind. Instead we let the game launch
+                // with local files; the user can use "Sync from Steam Cloud"
+                // manually once the connection comes back.
                 val snapshot = SteamService.fetchCloudConflictSnapshot(appId, context)
                 val localActual = getNewestActualLocalCloudSaveTimestamp(context, appId)
                 val localTracked =
                     SteamService.getTrackedCloudSaveFiles(appId)?.maxOfOrNull { it.timestamp }
+                val localTs = localActual ?: localTracked
+                val cloudLabel =
+                    when {
+                        snapshot == null -> LABEL_CLOUD_UNREACHABLE
+                        else -> formatTimestamp(snapshot.newestRemoteTimestamp, LABEL_NO_CLOUD_SAVES)
+                    }
                 CloudConflictProbe(
-                    differs = snapshot?.differs ?: true,
+                    differs = snapshot?.differs ?: false,
                     timestamps =
                         SteamCloudConflictTimestamps(
-                            localTimestampLabel = formatTimestamp(localActual ?: localTracked),
-                            cloudTimestampLabel = formatTimestamp(snapshot?.newestRemoteTimestamp),
+                            localTimestampLabel = formatTimestamp(localTs, LABEL_NO_LOCAL_SAVES),
+                            cloudTimestampLabel = cloudLabel,
                         ),
                 )
             } catch (e: Exception) {
                 Timber.e(e, "Steam cloud conflict probe failed for %s", shortcut.name)
                 CloudConflictProbe(
-                    differs = true,
-                    timestamps = SteamCloudConflictTimestamps("Unknown", "Unknown"),
+                    // Same fail-soft policy as the snapshot==null path —
+                    // don't claim conflict when we have no evidence either way.
+                    differs = false,
+                    timestamps = SteamCloudConflictTimestamps(LABEL_NO_LOCAL_SAVES, LABEL_CLOUD_UNREACHABLE),
                 )
             }
         }
@@ -261,16 +306,24 @@ object SteamCloudSyncHelper {
                     appId
                         ?.let { SteamService.getTrackedCloudSaveFiles(it) }
                         ?.maxOfOrNull { it.timestamp }
-                val remoteNewest =
-                    appId
-                        ?.let { SteamService.getNewestRemoteCloudSaveTimestamp(it) }
+                // getNewestRemoteCloudSaveTimestamp folds the same snapshot
+                // path used in probeCloudConflict; null here means the same
+                // "cloud unreachable" condition, so surface that to the UI
+                // rather than the ambiguous "Unknown".
+                val snapshot = appId?.let { SteamService.fetchCloudConflictSnapshot(it, context) }
+                val cloudLabel =
+                    when {
+                        appId == null -> LABEL_NO_CLOUD_SAVES
+                        snapshot == null -> LABEL_CLOUD_UNREACHABLE
+                        else -> formatTimestamp(snapshot.newestRemoteTimestamp, LABEL_NO_CLOUD_SAVES)
+                    }
                 SteamCloudConflictTimestamps(
-                    localTimestampLabel = formatTimestamp(localActual ?: localTracked),
-                    cloudTimestampLabel = formatTimestamp(remoteNewest),
+                    localTimestampLabel = formatTimestamp(localActual ?: localTracked, LABEL_NO_LOCAL_SAVES),
+                    cloudTimestampLabel = cloudLabel,
                 )
             } catch (e: Exception) {
                 Timber.e(e, "Failed to build Steam cloud conflict timestamps for %s", shortcut.name)
-                SteamCloudConflictTimestamps("Unknown", "Unknown")
+                SteamCloudConflictTimestamps(LABEL_NO_LOCAL_SAVES, LABEL_CLOUD_UNREACHABLE)
             }
         }
     }
@@ -282,7 +335,12 @@ object SteamCloudSyncHelper {
     ): Boolean {
         if (shortcut.getExtra("game_source") != "STEAM") return false
         val result = runBlocking { forceDownload(context, shortcut) }
-        if (result) markCloudSaveSynced(context, shortcut.getExtra("app_id"))
+        if (result) {
+            // forceDownloadById already refreshes the libsteamclient
+            // mirror on success, so the inline push that used to live
+            // here is redundant. Just mark the snapshot.
+            markCloudSaveSynced(context, shortcut.getExtra("app_id"))
+        }
         Timber.i("Steam cloud save download for %s: %s", shortcut.name, result)
         return result
     }

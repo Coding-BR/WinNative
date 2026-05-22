@@ -369,6 +369,13 @@ public abstract class FileUtils {
   }
 
   public static String getFilePathFromUriUsingSAF(Context context, Uri uri) {
+    // SAF tree-document IDs only exist under content:// URIs. The caller
+    // (getFilePathFromUri) falls through here for every scheme — short-
+    // circuit file:// / http:// / etc. so we don't burn a noisy
+    // IllegalArgumentException stack trace per game launch.
+    if (uri == null || !"content".equalsIgnoreCase(uri.getScheme())) {
+      return null;
+    }
     String documentId;
     try {
       documentId = DocumentsContract.getTreeDocumentId(uri);
