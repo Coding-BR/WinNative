@@ -99,11 +99,12 @@ object SteamSaveSnapshotManager {
         context: Context,
         appId: Int,
         origin: BackupOrigin,
+        containerHint: Container? = null,
     ): Boolean =
         withContext(Dispatchers.IO) {
             try {
                 mutexFor(appId).withLock {
-                    captureSnapshotLocked(context, appId, origin)
+                    captureSnapshotLocked(context, appId, origin, containerHint)
                 }
             } catch (e: Exception) {
                 Timber.tag(TAG).e(e, "recordSnapshot: outer failure for appId=%d", appId)
@@ -115,9 +116,14 @@ object SteamSaveSnapshotManager {
      * Capture-snapshot core; caller MUST already hold `mutexFor(appId)`. Returns true on a
      * successful write; false on dedup-skip or write failure.
      */
-    private fun captureSnapshotLocked(context: Context, appId: Int, origin: BackupOrigin): Boolean {
+    private fun captureSnapshotLocked(
+        context: Context,
+        appId: Int,
+        origin: BackupOrigin,
+        containerHint: Container? = null,
+    ): Boolean {
         cleanupPartialEntries(context, appId)
-        val sources = enumerateSaveSources(context, appId)
+        val sources = enumerateSaveSources(context, appId, containerHint = containerHint)
         if (sources.isEmpty()) {
             Timber.tag(TAG).i("captureSnapshotLocked: no save sources for appId=%d", appId)
             return false
@@ -279,6 +285,7 @@ object SteamSaveSnapshotManager {
         activity: Activity,
         appId: Int,
         uris: List<android.net.Uri>,
+        containerHint: Container? = null,
     ): BackupResult =
         withContext(Dispatchers.IO) {
             try {
@@ -290,7 +297,13 @@ object SteamSaveSnapshotManager {
                         return@withLock BackupResult(false, "Sign in to Steam before importing.")
                     }
                     val resolver = context.contentResolver
-                    val prefixResolver = steamPrefixResolver(context, appId)
+                    // Without containerHint, steamPrefixResolver falls into
+                    // ContainerUtils.getUsableContainerOrNull which prefers the
+                    // global "preferred game container" pref — appId-agnostic and
+                    // can route writes into the wrong wineprefix when the user
+                    // has a non-default container set for this game. The launcher
+                    // always passes shortcut.container; pass it here too.
+                    val prefixResolver = steamPrefixResolver(context, appId, containerHint)
 
                     // Cloud listing for basename → canonical-path reconstruction. If the local
                     // cache is empty (user never ran a Sync), we can't restore subdirectories for
@@ -392,7 +405,7 @@ object SteamSaveSnapshotManager {
                         return@withLock BackupResult(false, detail)
                     }
 
-                    captureSnapshotLocked(context, appId, BackupOrigin.MANUAL)
+                    captureSnapshotLocked(context, appId, BackupOrigin.MANUAL, containerHint)
                     // Try the upload up to 2x — if Steam reports `InProgress` we retry once after
                     // a short delay so a concurrent background sync doesn't silently strand the
                     // imported state out of cloud.
@@ -508,8 +521,14 @@ object SteamSaveSnapshotManager {
         return sources.values.toList()
     }
 
+    // Mirror SteamCloudSyncHelper.steamPrefixResolver / SteamService.syncCloudOnExit:
+    // derive accountId from steamUserSteamId64 BEFORE the steamUserAccountId pref so
+    // restores land in the same userdata/<accountId>/ subdir the in-Wine launcher
+    // writes (accId = WN_STEAM_STEAMID & 0xFFFFFFFF). A stale steamUserAccountId
+    // would otherwise point at a different folder than the game uses.
     private fun resolveAccountId(): Long =
         SteamService.userSteamId?.accountID?.toLong()
+            ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
             ?: 0L
 
@@ -547,10 +566,7 @@ object SteamSaveSnapshotManager {
         // wineprefix.
         activateContainerForCloudOp(context, appId, containerHint)
 
-        val accountId =
-            SteamService.userSteamId?.accountID?.toLong()
-                ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
-                ?: 0L
+        val accountId = resolveAccountId()
         return { pathTypeName ->
             val type = runCatching { PathType.valueOf(pathTypeName) }.getOrNull() ?: PathType.SteamUserData
             type.toAbsPath(context, appId, accountId)

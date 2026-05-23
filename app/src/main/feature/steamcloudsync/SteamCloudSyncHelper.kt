@@ -137,15 +137,16 @@ object SteamCloudSyncHelper {
         // symlink, then installPlanWValveSteam replaced the symlink with an
         // empty real dir — saves orphaned, pref still said "synced"). Disk
         // is the only honest answer.
-        return hasActualLocalSaves(context, appIdInt)
+        return hasActualLocalSaves(context, appIdInt, shortcut.container)
     }
 
     fun hasActualLocalSaves(
         context: Context,
         appId: Int,
+        containerHint: Container? = null,
     ): Boolean {
         val appInfo = SteamService.getAppInfoOf(appId) ?: return false
-        val prefixToPath = steamPrefixResolver(context, appId)
+        val prefixToPath = steamPrefixResolver(context, appId, containerHint)
 
         val userDataPath = Paths.get(prefixToPath(PathType.SteamUserData.name))
         if (FileUtils.anyFileMatches(userDataPath, "*", maxDepth = 5)) return true
@@ -190,9 +191,10 @@ object SteamCloudSyncHelper {
     private fun getNewestActualLocalCloudSaveTimestamp(
         context: Context,
         appId: Int,
+        containerHint: Container? = null,
     ): Long? {
         val appInfo = SteamService.getAppInfoOf(appId) ?: return null
-        val prefixToPath = steamPrefixResolver(context, appId)
+        val prefixToPath = steamPrefixResolver(context, appId, containerHint)
 
         val userDataNewest =
             newestTimestampInFiles(
@@ -286,7 +288,7 @@ object SteamCloudSyncHelper {
                 // with local files; the user can use "Sync from Steam Cloud"
                 // manually once the connection comes back.
                 val snapshot = SteamService.fetchCloudConflictSnapshot(appId, context)
-                val localActual = getNewestActualLocalCloudSaveTimestamp(context, appId)
+                val localActual = getNewestActualLocalCloudSaveTimestamp(context, appId, shortcut.container)
                 val localTracked =
                     SteamService.getTrackedCloudSaveFiles(appId)?.maxOfOrNull { it.timestamp }
                 val localTs = localActual ?: localTracked
@@ -325,7 +327,7 @@ object SteamCloudSyncHelper {
         val appId = shortcut.getExtra("app_id").toIntOrNull()
         return runBlocking {
             try {
-                val localActual = appId?.let { getNewestActualLocalCloudSaveTimestamp(context, it) }
+                val localActual = appId?.let { getNewestActualLocalCloudSaveTimestamp(context, it, shortcut.container) }
                 val localTracked =
                     appId
                         ?.let { SteamService.getTrackedCloudSaveFiles(it) }
@@ -403,6 +405,7 @@ object SteamCloudSyncHelper {
                             context,
                             appId,
                             GameSaveBackupManager.BackupOrigin.LOCAL,
+                            containerHint,
                         )
                     }.onFailure { Timber.w(it, "Snapshot after Use-Local upload failed for appId=%d", appId) }
                 }

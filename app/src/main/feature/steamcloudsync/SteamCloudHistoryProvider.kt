@@ -88,13 +88,18 @@ object SteamCloudHistoryProvider {
         }
 
     // Normalize a cloud file timestamp to epoch millis (files report seconds, millis, or double-scaled).
-    private fun toMillis(v: Long): Long =
-        when {
+    // Reject post-2100 results: Steam occasionally returns Long.MAX_VALUE-derived
+    // sentinel values (≈ 9.22e9 s ⇒ April 2262) for files with uninitialized
+    // time_stamp; clamp those to 0 so they don't dominate the sort.
+    private fun toMillis(v: Long): Long {
+        val ms = when {
             v <= 0L -> 0L
             v < 100_000_000_000L -> v * 1000L
             v > 100_000_000_000_000L -> v / 1000L
             else -> v
         }
+        return if (ms > 4_102_444_800_000L) 0L else ms
+    }
 
     /** Shared cluster + group-entry builder for both variants. */
     private fun buildEntries(
