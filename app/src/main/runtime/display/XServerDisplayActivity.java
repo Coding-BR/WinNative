@@ -187,11 +187,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private static final long STEAM_TERMINATION_POLL_MS = 1000L;
     private static final long STEAM_PROCESS_RESPONSE_TIMEOUT_MS = 2000L;
     private static final long STEAM_TERMINATION_TIMEOUT_MS = 30000L;
-    // Steam Launcher exit: how long to wait for wn-steam-launcher.exe to finish its
-    // STEP 6 cloud-save upload and self-exit before forcing teardown. Generous
-    // — the upload is a real transfer (saves can be tens of MB) with up to 3
-    // retry attempts; killing it early would lose the just-played progress.
-    private static final long PLANW_EXIT_UPLOAD_TIMEOUT_MS = 150000L;
     private static final String STEAM_REGISTRY_KEY = "Software\\Valve\\Steam";
     private static final String STEAM_ROOT_PATH = "C:\\Program Files (x86)\\Steam";
     private static final String STEAM_EXE_PATH = STEAM_ROOT_PATH + "\\steam.exe";
@@ -204,11 +199,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private static final String PREVIOUS_CONTAINER_STEAM_CLIENT_STORE_RELATIVE_PATH = ".wine/.steam-client-store";
     private static final String LEGACY_STEAM_CLIENT_STORE_RELATIVE_PATH = ".wine/drive_c/WinNative/SteamClient";
     public static final String EXTRA_LAUNCHED_FROM_PINNED_SHORTCUT = "launched_from_pinned_shortcut";
-
-    // Steam Launcher: basename of the game exe (e.g. "MHST.exe") for the current
-    // launch. Set when a Steam Launcher Steam game starts; used at exit to terminate
-    // the game so wn-steam-launcher.exe can run its cloud-save upload.
-    private volatile String planWGameProcessName;
 
     // Real Steam launch flags — see the launchRealSteam branch in
     // getWineStartCommand for the full analysis. Mirrors GameNative's command
@@ -1501,18 +1491,23 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 UpdateChecker.INSTANCE.cancelPostGameCheck();
 
                 if (!sessionToReuse) {
-                    // Steam Launcher runs its own cloud download; skip the
-                    // Android-side launch sync when it owns the game.
-                    boolean steamLauncherActive = isBionicSteamEnabledForShortcut()
-                            && com.winlator.cmod.feature.stores.steam.utils
-                                    .PrefManager.INSTANCE.getWnPlanW();
-                    if (!steamLauncherActive) {
-                        SteamLaunchCloudSync.syncBeforeLaunch(
-                                this,
-                                shortcut,
-                                isCloudSyncEnabledForShortcut(),
-                                this::showLaunchPreloader);
-                    }
+                    // Run the Android-side cloud download for every Steam game,
+                    // Steam Launcher included. Empirically the in-Wine
+                    // launcher's IClientRemoteStorage::BeginAppSync stays
+                    // declined (state=2 stable; the explicit launcher-side
+                    // sync never lands files on disk), so wn-steam-client
+                    // is the only path that actually downloads cloud saves
+                    // for planW launches — same path the in-app "Sync from
+                    // Cloud" button uses, which the user confirmed works.
+                    // Files land in the SAME userdata/<accountId>/<appId>/
+                    // subdir the in-Wine real Steam then reads from (the
+                    // accountId fallback fix in SteamCloudSyncHelper /
+                    // SteamUtils keeps both sides in agreement).
+                    SteamLaunchCloudSync.syncBeforeLaunch(
+                            this,
+                            shortcut,
+                            isCloudSyncEnabledForShortcut(),
+                            this::showLaunchPreloader);
                     EpicLaunchCloudSync.syncBeforeLaunch(
                             this,
                             shortcut,
@@ -2282,7 +2277,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private boolean beginSessionCleanup(String trigger) {
         if (sessionCleanupStarted.compareAndSet(false, true)) {
             Log.d("XServerDisplayActivity", "Starting session cleanup from " + trigger);
-            com.winlator.cmod.feature.steamcloudsync.SteamLauncherConflictWatcher.stop();
             try {
                 if (perfController != null) perfController.stop();
             } catch (Throwable t) {
@@ -2675,20 +2669,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             return;
         }
 
-        // Steam Launcher Steam games run cloud sync inside wn-steam-launcher.exe
-        // (download at launch, upload at exit), independent of the Android-side
-        // cloud system and its offline_mode / cloud_sync_disabled extras. The
-        // launcher already downloaded saves at launch regardless of those
-        // flags, so its exit upload must run too — gating it behind them would
-        // download saves but never write play progress back. Handle it before
-        // the Android-side gate, which only governs the legacy cloud path.
-        if ("STEAM".equals(shortcut.getExtra("game_source"))
-                && com.winlator.cmod.feature.stores.steam.utils
-                        .PrefManager.INSTANCE.getWnPlanW()) {
-            syncPlanWCloudOnExit(onComplete);
-            return;
-        }
-
+        // Steam Cloud upload runs natively on the Android side for every Steam
+        // game, Steam Launcher included (syncSteamCloudOnExit below) — the
+        // in-Wine launcher no longer touches cloud at all.
         if (!isCloudSyncEnabledForShortcut() || com.winlator.cmod.feature.sync.CloudSyncHelper.isOfflineMode(shortcut)) {
             onComplete.run();
             return;
@@ -2977,68 +2960,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                                                         result.getMessage(),
                                                         result.getRetryable()))),
                 onComplete);
-    }
-
-    /**
-     * Steam Launcher exit cloud sync. wn-steam-launcher.exe hosts the only live Steam
-     * session and uploads cloud saves (its STEP 6) once the game process is
-     * gone. Terminate the game to trigger that, then wait for the launcher to
-     * finish and self-exit before container teardown kills it.
-     */
-    private void syncPlanWCloudOnExit(Runnable onComplete) {
-        final String launcherProc = "wn-steam-launcher.exe";
-        final String gameProc = planWGameProcessName;
-        preloaderDialog.showOnUiThread("Cloud Sync Uploading...");
-
-        Executors.newSingleThreadExecutor().execute(() -> {
-            try {
-                if (!isPlanWProcessRunning(launcherProc)) {
-                    Log.i("XServerDisplayActivity",
-                            "Steam Launcher exit: wn-steam-launcher.exe not running — "
-                                    + "no cloud upload to wait for");
-                    return;
-                }
-                if (winHandler != null && gameProc != null && !gameProc.isEmpty()) {
-                    Log.i("XServerDisplayActivity",
-                            "Steam Launcher exit: terminating " + gameProc
-                                    + " to trigger launcher cloud upload");
-                    winHandler.killProcess(gameProc);
-                }
-                long deadline = System.currentTimeMillis()
-                        + PLANW_EXIT_UPLOAD_TIMEOUT_MS;
-                while (System.currentTimeMillis() < deadline) {
-                    Thread.sleep(700);
-                    if (!isPlanWProcessRunning(launcherProc)) {
-                        Log.i("XServerDisplayActivity",
-                                "Steam Launcher exit: wn-steam-launcher.exe finished — "
-                                        + "cloud upload complete");
-                        return;
-                    }
-                }
-                Log.w("XServerDisplayActivity",
-                        "Steam Launcher exit: wn-steam-launcher.exe still running after "
-                                + PLANW_EXIT_UPLOAD_TIMEOUT_MS
-                                + "ms — proceeding with teardown");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Exception e) {
-                Log.w("XServerDisplayActivity",
-                        "Steam Launcher exit cloud upload wait failed", e);
-            } finally {
-                runOnUiThread(onComplete);
-            }
-        });
-    }
-
-    /** True if a Wine process with the given exe name is currently running. */
-    private boolean isPlanWProcessRunning(String exeName) {
-        ArrayList<ProcessInfo> snapshot = captureWinHandlerProcessSnapshot();
-        if (snapshot == null) return false;
-        String target = normalizeProcessName(exeName);
-        for (ProcessInfo info : snapshot) {
-            if (normalizeProcessName(info.name).equals(target)) return true;
-        }
-        return false;
     }
 
     private void syncEpicCloudOnExit(Runnable onComplete) {
@@ -4846,6 +4767,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             // Also drop wn-steam-launcher.exe next to them.
                             boolean planWValveOk = false;
                             boolean planWLauncherOk = false;
+                            boolean planWServiceOk = false;
                             if (com.winlator.cmod.feature.stores.steam.utils
                                     .PrefManager.INSTANCE.getWnPlanW()) {
                                 try {
@@ -4855,9 +4777,20 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                                     planWLauncherOk = com.winlator.cmod.feature.stores.steam.wnsteam
                                             .WnSteamAssetsInstaller.INSTANCE
                                             .installPlanWLauncher(this, container);
+                                    // Stage steamservice.exe at <Steam>/bin/ so the in-Wine
+                                    // launcher (steam.exe) can install + start it as the
+                                    // "Steam Client Service" via SCM. That's the IPC backend
+                                    // IClientAppManager::LaunchApp's marshaled job needs to
+                                    // get drained — without it, LaunchApp returns a valid
+                                    // HSteamAPICall but never spawns the game, and the
+                                    // launcher falls through to CreateProcess.
+                                    planWServiceOk = com.winlator.cmod.feature.stores.steam.wnsteam
+                                            .WnSteamAssetsInstaller.INSTANCE
+                                            .installPlanWSteamService(this, container);
                                     Log.i("XServerDisplayActivity",
                                             "Steam Launcher asset stage: valveSteam=" + planWValveOk
-                                            + " launcher=" + planWLauncherOk);
+                                            + " launcher=" + planWLauncherOk
+                                            + " service=" + planWServiceOk);
                                 } catch (Exception e) {
                                     Log.e("XServerDisplayActivity",
                                             "Steam Launcher asset stage failed", e);
@@ -5567,12 +5500,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             "Steam Launcher: WINEDLLOVERRIDES set to '"
                             + envVars.get("WINEDLLOVERRIDES")
                             + "' to disable lsteamclient export-hijack");
-                    // Cloud Saves toggle gates the launcher's cloud sync.
-                    if (!isCloudSyncEnabledForShortcut()) {
-                        envVars.put("WN_STEAM_NO_CLOUD", "1");
-                        Log.i("XServerDisplayActivity",
-                                "Steam Launcher: cloud saves disabled — WN_STEAM_NO_CLOUD=1");
-                    }
                     String planWUser = com.winlator.cmod.feature.stores.steam.utils
                             .PrefManager.INSTANCE.getUsername();
                     String planWSid  = String.valueOf(com.winlator.cmod.feature.stores.steam.utils
@@ -5631,13 +5558,6 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                                 + " bsAppId=" + bsAppId
                                 + ") — launcher will refuse to start; "
                                 + "sign into Steam first");
-                    }
-                    // Bridge launcher cloud-conflict requests to the dialog.
-                    if (isCloudSyncEnabledForShortcut()) {
-                        com.winlator.cmod.feature.steamcloudsync
-                                .SteamLauncherConflictWatcher.start(
-                                this,
-                                new File(container.getRootDir(), ".wine/drive_c"));
                     }
                 }
             } catch (Exception e) {
@@ -7062,12 +6982,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             boolean planW = com.winlator.cmod.feature.stores.steam.utils
                                     .PrefManager.INSTANCE.getWnPlanW();
                             String wrapperExe = planW
-                                    ? "wn-steam-launcher.exe" : "wn-steam-helper.exe";
-                            if (planW) {
-                                int gameSep = steamGameExe.lastIndexOf('\\');
-                                planWGameProcessName = gameSep >= 0
-                                        ? steamGameExe.substring(gameSep + 1) : steamGameExe;
-                            }
+                                    ? "steam.exe" : "wn-steam-helper.exe";
                             args = "\"C:\\Program Files (x86)\\Steam\\" + wrapperExe
                                     + "\" \"" + steamGameExe + "\"" + steamExtraArgs;
                             Log.d("XServerDisplayActivity",

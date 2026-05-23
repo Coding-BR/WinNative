@@ -77,9 +77,10 @@ object WnSteamAssetsInstaller {
      */
     fun installBionicRuntime(context: Context): Boolean {
         val imageFs = ImageFs.find(context)
+        val apkId = apkStamp(context)
         val steamStamp = File(imageFs.libDir, ".wnsteam-androidarm64.stamp")
-        if (!steamStamp.exists()) {
-            Timber.tag(TAG).i("Installing $STEAM_TZST → ${imageFs.rootDir}")
+        if (stampStale(steamStamp, apkId)) {
+            Timber.tag(TAG).i("Installing $STEAM_TZST → ${imageFs.rootDir} (apk=$apkId)")
             val ok = TarCompressorUtils.extract(
                 TarCompressorUtils.Type.ZSTD,
                 context,
@@ -90,7 +91,7 @@ object WnSteamAssetsInstaller {
                 Timber.tag(TAG).e("Failed to extract $STEAM_TZST")
                 return false
             }
-            steamStamp.writeText(STEAM_TZST)
+            steamStamp.writeText(apkId)
         }
         // 2026-05-21: DISABLED. Keeping Valve's real bionic
         // libsteamclient.so (37 MB, shipped inside steam-androidarm64
@@ -215,6 +216,39 @@ object WnSteamAssetsInstaller {
         }
     }
 
+    /**
+     * Identity token that changes whenever the APK is (re)installed,
+     * updated, or sideloaded. `lastUpdateTime` is bumped by the package
+     * manager on every install — including an `adb install -r` of the
+     * same versionCode during development — so it is the precise signal
+     * for "the bundled assets may have changed, re-stage them."
+     *
+     * Staleness was a real bug: the tzst extractors below gated purely
+     * on a stamp file *existing*, so a freshly-installed APK silently
+     * reused the previous install's extracted binaries (a stale
+     * steamclient64.dll / launcher payload). On failure we return a
+     * unique value so the caller always re-extracts — never stale.
+     */
+    @Suppress("DEPRECATION")
+    private fun apkStamp(context: Context): String {
+        return try {
+            val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+            "apk-u${pi.lastUpdateTime}"
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "apkStamp: package info unavailable; forcing re-stage")
+            "apk-unknown-${System.currentTimeMillis()}"
+        }
+    }
+
+    /** True when [stamp] is missing or was written by a different APK. */
+    private fun stampStale(stamp: File, apkId: String): Boolean {
+        return try {
+            !stamp.exists() || stamp.readText().trim() != apkId
+        } catch (_: Exception) {
+            true
+        }
+    }
+
     fun install(context: Context, container: Container): Boolean {
         // 1) Linux/Android side — usr/lib/ libsteamclient.so + friends.
         if (!installBionicRuntime(context)) return false
@@ -229,8 +263,9 @@ object WnSteamAssetsInstaller {
             )
             return true   // .so side is fine; just no Wine bridge
         }
+        val apkId = apkStamp(context)
         val wineStamp = File(imageFs.libDir, ".wnsteam-${lscArchive}.stamp")
-        if (wineStamp.exists()) return true
+        if (!stampStale(wineStamp, apkId)) return true
 
         // Stage into a per-arch tmp dir, then copy the .dlls into the prefix
         // and (optionally) the .so onto the Wine lib path.
@@ -280,14 +315,170 @@ object WnSteamAssetsInstaller {
         }
 
         stagingRoot.deleteRecursively()
-        wineStamp.writeText(lscArchive)
-        Timber.tag(TAG).i("Wine bridge installed (variant=$lscArchive)")
+        wineStamp.writeText(apkId)
+        Timber.tag(TAG).i("Wine bridge installed (variant=$lscArchive, apk=$apkId)")
         return true
     }
 
     /** filesDir path the patched lsteamclient.so dlopens libsteamclient.so from. */
     fun bridgeLibPath(context: Context): File =
         File(context.filesDir, "libsteamclient.so")
+
+    /**
+     * Stage Valve's `steamservice.exe` (the Steam Client Service binary) at
+     * `<Steam>/bin/steamservice.exe` inside the container. The in-Wine
+     * launcher (steam.exe / main.cpp:start_steam_client_service) installs +
+     * starts this as a Win32 service so steamclient64.dll's IPC queue gets
+     * a consumer — that's the prerequisite for
+     * IClientAppManager::LaunchApp to actually spawn the game (otherwise
+     * the call is silently dropped and we fall through to CreateProcess).
+     * GameHub does the same; the binary lives at exactly the same relative
+     * path in their install.
+     *
+     * No-op (returns false) if the asset is not bundled in this APK. The
+     * launcher's bootstrap then logs "steamservice: binary not present"
+     * and falls through to CreateProcess.
+     */
+    fun installPlanWSteamService(context: Context, container: Container): Boolean {
+        // <Steam>/bin/ payload for the Steam Client Service:
+        //   steamservice.exe          — the service binary
+        //   steamservice.dll          — companion the service loads at runtime
+        //   service_current_versions.vdf  — Valve-signed manifest declaring
+        //                                   current versions of the service
+        //                                   binaries; the service refuses to
+        //                                   complete startup without it (its
+        //                                   own log: "Could not load version
+        //                                   info" / "Could not load required
+        //                                   version info" → ERROR), which
+        //                                   makes the SCM say RUNNING but
+        //                                   the IPC drainer never engages.
+        //   service_minimum_versions.vdf  — companion VDF for the minimum-
+        //                                   version check.
+        val exeAsset    = "$ASSET_DIR/bionic/steamservice.exe"
+        val dllAsset    = "$ASSET_DIR/bionic/steamservice.dll"
+        val curVdfAsset = "$ASSET_DIR/bionic/service_current_versions.vdf"
+        val minVdfAsset = "$ASSET_DIR/bionic/service_minimum_versions.vdf"
+        val exePresent = try { context.assets.open(exeAsset).close(); true } catch (_: Exception) { false }
+        if (!exePresent) {
+            Timber.tag(TAG).i("planW: steamservice.exe asset not bundled — "
+                + "LaunchApp will fall back to CreateProcess inside the launcher")
+            return false
+        }
+        val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
+        val binDir = File(steamDir, "bin").apply { mkdirs() }
+
+        fun stage(asset: String, dstFile: File): Boolean {
+            val present = try { context.assets.open(asset).close(); true } catch (_: Exception) { false }
+            if (!present) return false
+            return try {
+                context.assets.open(asset).use { input ->
+                    dstFile.outputStream().use { output -> input.copyTo(output) }
+                }
+                Timber.tag(TAG).i("planW: staged %s (%d bytes) at %s",
+                    dstFile.name, dstFile.length(), dstFile.absolutePath)
+                true
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "planW: failed to stage %s", dstFile.name)
+                false
+            }
+        }
+
+        return try {
+            val exeOk    = stage(exeAsset,    File(binDir, "steamservice.exe"))
+            val dllOk    = stage(dllAsset,    File(binDir, "steamservice.dll"))
+            val curVdfOk = stage(curVdfAsset, File(binDir, "service_current_versions.vdf"))
+            val minVdfOk = stage(minVdfAsset, File(binDir, "service_minimum_versions.vdf"))
+            Timber.tag(TAG).i("planW: steamservice bundle staged exe=%b dll=%b curVdf=%b minVdf=%b",
+                exeOk, dllOk, curVdfOk, minVdfOk)
+            exeOk
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "planW: failed to stage steamservice bundle")
+            false
+        }
+    }
+
+    /**
+     * Ensure the planW Steam dir is a container-local REAL directory, not a
+     * symlink into the shared steam-client-store. MUST be called before any
+     * cloud-save download path runs: if Steam dir is a symlink at write time,
+     * the cloud bytes land in the shared store, and the later (per-launch)
+     * installPlanWValveSteam-driven symlink → real-dir flip orphans them
+     * there. Also rescues any USERDATA that already got orphaned in the
+     * shared store from a prior launch — copies (doesn't move) so the
+     * shared store stays pristine for Bionic / ColdClient modes that
+     * legitimately use it as a symlink target.
+     *
+     * Idempotent: on a fresh container (real dir, no stale shared userdata)
+     * this is a no-op aside from the mkdirs.
+     */
+    fun ensureRealSteamDir(context: Context, container: Container) {
+        val imageFs = ImageFs.find(context)
+        val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
+        val steamPath = steamDir.toPath()
+        val sharedSteam = File(imageFs.rootDir, ".shared/steam-client-store")
+
+        val isLink = try {
+            java.nio.file.Files.isSymbolicLink(steamPath)
+        } catch (_: Exception) { false }
+        if (isLink) {
+            try {
+                java.nio.file.Files.delete(steamPath)
+                Timber.tag(TAG).i("ensureRealSteamDir: removed Steam-dir symlink at %s",
+                    steamDir.absolutePath)
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "ensureRealSteamDir: failed to delete Steam-dir symlink")
+                return
+            }
+        }
+        steamDir.mkdirs()
+
+        // Rescue orphaned userdata from the shared store. Game saves the
+        // user downloaded while Steam dir was a symlink live here and the
+        // in-Wine real Steam (planW) can no longer see them.
+        val sharedUserdata = File(sharedSteam, "userdata")
+        if (!sharedUserdata.isDirectory) return
+        val realUserdata = File(steamDir, "userdata").apply { mkdirs() }
+        var rescuedFiles = 0
+        var rescuedApps = 0
+        sharedUserdata.listFiles()?.forEach { accountDir ->
+            if (!accountDir.isDirectory) return@forEach
+            accountDir.listFiles()?.forEach { appDir ->
+                if (!appDir.isDirectory) return@forEach
+                val appIdName = appDir.name
+                // Migrate game userdata (numeric appId) only; skip Steam
+                // Client's own '7' / 'config' — those are legitimately
+                // owned by whichever mode last wrote them, and planW's
+                // real Steam will populate them fresh on logon.
+                if (appIdName == "7" || appIdName == "config") return@forEach
+                if (!appIdName.all { it.isDigit() }) return@forEach
+                val destAccountDir = File(realUserdata, accountDir.name)
+                val destAppDir = File(destAccountDir, appIdName)
+                // Skip if real dest already has any file — assume it's
+                // current and we shouldn't clobber it with the (possibly
+                // older) shared-store copy.
+                val destAlreadyPopulated = destAppDir.isDirectory &&
+                    destAppDir.walkTopDown().filter { it.isFile }.any()
+                if (destAlreadyPopulated) return@forEach
+                try {
+                    appDir.copyRecursively(destAppDir, overwrite = true)
+                    val n = destAppDir.walkTopDown().filter { it.isFile }.count()
+                    rescuedFiles += n
+                    rescuedApps += 1
+                    Timber.tag(TAG).i(
+                        "ensureRealSteamDir: rescued %d file(s) for app %s from shared store",
+                        n, appIdName)
+                } catch (e: Exception) {
+                    Timber.tag(TAG).e(e,
+                        "ensureRealSteamDir: failed to rescue userdata for app %s", appIdName)
+                }
+            }
+        }
+        if (rescuedApps > 0) {
+            Timber.tag(TAG).i(
+                "ensureRealSteamDir: rescued userdata for %d app(s), %d total file(s)",
+                rescuedApps, rescuedFiles)
+        }
+    }
 
     /**
      * Place the Proton lsteamclient bridge — by its REAL name
@@ -377,31 +568,23 @@ object WnSteamAssetsInstaller {
      */
     fun installPlanWValveSteam(context: Context, container: Container): Boolean {
         val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
-        // If the Bionic-mode setup left the Steam dir as a symlink to the
-        // shared steam-client-store, replace it with a real directory so
-        // our copies don't follow the link and pollute the shared store.
-        // (Normally installBionicSteamPathOverlay does this; Steam Launcher skips
-        // the overlay so we have to do it here.)
-        val steamPath = steamDir.toPath()
-        if (java.nio.file.Files.isSymbolicLink(steamPath)) {
-            try {
-                java.nio.file.Files.delete(steamPath)
-                Timber.tag(TAG).i("planW: replaced Steam-dir symlink with real dir at %s",
-                    steamDir.absolutePath)
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "planW: failed to delete Steam-dir symlink, copies may pollute shared store")
-            }
-        }
-        steamDir.mkdirs()
+        // Centralized real-dir flip + shared-store userdata rescue. This MUST
+        // run here, AFTER setSteamClientVisibility's
+        // moveSteamDirectoryIntoBackingStore pass which moves any prior
+        // real-dir Steam contents (including userdata!) into
+        // .shared/steam-client-store/ — without rescuing it back, the
+        // freshly-created planW Steam dir would be empty and the user
+        // would see "create new save" every launch even after a successful
+        // cloud download.
+        ensureRealSteamDir(context, container)
         // Cache extracted Valve binaries in filesDir/wnsteam-planw-cache/
-        // so we only pay the ~16 MB zstd unpack once. The
-        // `installBionicSteamPathOverlay` step that runs BEFORE us each
-        // launch always rewrites `steamclient64.dll` to the bridge, so we
-        // MUST copy from the cache into the Steam dir on every Steam Launcher
-        // launch — a stamp-file shortcut would leave the bridge in place.
+        // so we only pay the ~16 MB zstd unpack once.
+        val apkId = apkStamp(context)
         val cache = File(context.filesDir, "wnsteam-planw-cache")
         val cacheStamp = File(cache, ".planw-valve-steam.stamp")
-        if (!cacheStamp.exists()) {
+        if (stampStale(cacheStamp, apkId)) {
+            Timber.tag(TAG).i("planW: Valve Steam cache stale (apk=%s) — re-extracting %s",
+                apkId, VALVE_STEAM_X64)
             cache.deleteRecursively(); cache.mkdirs()
             val ok = TarCompressorUtils.extract(
                 TarCompressorUtils.Type.ZSTD, context,
@@ -411,10 +594,35 @@ object WnSteamAssetsInstaller {
                 cache.deleteRecursively()
                 return false
             }
-            try { cacheStamp.writeText("ok\n") } catch (_: Exception) {}
+            try { cacheStamp.writeText(apkId) } catch (_: Exception) {}
             Timber.tag(TAG).i("planW: cached Valve Steam DLLs at %s (%d entries)",
                 cache.absolutePath, cache.listFiles()?.size ?: 0)
         }
+
+        // Per-container stage stamp. The planW launch path explicitly skips
+        // installBionicSteamPathOverlay (XServerDisplayActivity.java sets
+        // bionicOverlayOk=false when planWActive), so no other step in planW
+        // mode rewrites steamclient64.dll between launches — repeating the
+        // ~50 MB cache → Steam dir copy + system32 dep copy on every launch
+        // is wasted work. Gate on apkStamp (re-stage after APK updates) AND
+        // on a size match between cached vs deployed steamclient64.dll
+        // (catches cross-mode reuse where Bionic mode's overlay shrunk it
+        // to the ~1.4 MB bridge), AND on the system32 tier0 dep still
+        // being present (system32 wipe → re-stage).
+        val stageStamp = File(steamDir, ".wn-planw-stage.stamp")
+        val cachedSc64 = File(cache, "steamclient64.dll")
+        val deployedSc64 = File(steamDir, "steamclient64.dll")
+        val sys32Tier0 = File(container.rootDir,
+            ".wine/drive_c/windows/system32/tier0_s64.dll")
+        if (!stampStale(stageStamp, apkId)
+            && cachedSc64.isFile && deployedSc64.isFile
+            && cachedSc64.length() == deployedSc64.length()
+            && sys32Tier0.isFile) {
+            Timber.tag(TAG).d("planW: Steam dir already staged (apk=%s, sc64=%d bytes) — skipping per-launch copy",
+                apkId, deployedSc64.length())
+            return true
+        }
+
         var copied = 0
         cache.listFiles()?.forEach { src ->
             if (!src.isFile || src.name.startsWith(".")) return@forEach
@@ -463,13 +671,22 @@ object WnSteamAssetsInstaller {
         }
         Timber.tag(TAG).i("planW: staged %d tier0/vstdlib dep(s) into system32", depCopied)
 
+        if (copied >= 5) {
+            try { stageStamp.writeText(apkId) } catch (_: Exception) {}
+        }
         return copied >= 5  // steamclient64 + Steam + Steam2 + tier0 + vstdlib (at minimum)
     }
 
     /**
-     * Steam Launcher — install our wn-steam-launcher.exe (the in-process Steam host
+     * Steam Launcher — install our `steam.exe` (the in-process Steam host
      * built from `app/src/main/cpp/wn-steam-launcher/`) into the container's
-     * Steam dir. Replaces the wn-steam-helper.exe path for Steam Launcher launches.
+     * Steam dir. Named `steam.exe` on disk because steamclient's
+     * IClientAppManager::LaunchApp / CGameLauncher path only spawns the
+     * game when the hosting process looks like real Steam (matches what
+     * GameHub does); under our older `wn-steam-launcher.exe` name LaunchApp
+     * queued the launch but never produced a child process and we had to
+     * fall through to CreateProcess. Replaces the wn-steam-helper.exe path
+     * for Steam Launcher launches.
      */
     fun installPlanWLauncher(context: Context, container: Container): Boolean {
         val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
@@ -481,17 +698,20 @@ object WnSteamAssetsInstaller {
             try { java.nio.file.Files.delete(steamPath) } catch (_: Exception) {}
         }
         steamDir.mkdirs()
-        val dst = File(steamDir, "wn-steam-launcher.exe")
+        val dst = File(steamDir, "steam.exe")
+        // Also remove any stale copy from the older binary name so a
+        // mid-rollout container doesn't end up with both files.
+        File(steamDir, "wn-steam-launcher.exe").let { if (it.exists()) it.delete() }
         if (dst.exists()) { try { dst.delete() } catch (_: Exception) {} }
         val ok = try {
-            context.assets.open("$ASSET_DIR/bionic/wn-steam-launcher.exe").use { input ->
+            context.assets.open("$ASSET_DIR/bionic/steam.exe").use { input ->
                 dst.outputStream().use { output -> input.copyTo(output) }
             }
-            Timber.tag(TAG).i("planW: installed wn-steam-launcher.exe (%d bytes) at %s",
+            Timber.tag(TAG).i("planW: installed steam.exe (%d bytes) at %s",
                 dst.length(), dst.absolutePath)
             true
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "planW: failed to install wn-steam-launcher.exe")
+            Timber.tag(TAG).e(e, "planW: failed to install steam.exe")
             false
         }
         // Copy the CA bundle into the Steam dir so Valve's steamclient64.dll
@@ -530,11 +750,19 @@ object WnSteamAssetsInstaller {
             return false
         }
         val dest = bridgeLibPath(context)
-        if (dest.exists() && dest.length() == src.length()) return true
+        val apkId = apkStamp(context)
+        val stamp = File(context.filesDir, ".wnsteam-bridge-lib.stamp")
+        // Re-copy when the APK changed even if the size is unchanged — a
+        // recompiled libsteamclient.so can land at the exact same byte
+        // count, so size-only would silently keep a stale bridge lib.
+        if (dest.exists() && dest.length() == src.length() && !stampStale(stamp, apkId)) {
+            return true
+        }
         return try {
             src.copyTo(dest, overwrite = true)
-            Timber.tag(TAG).i("stageBridge: libsteamclient.so → %s (%d bytes)",
-                dest.absolutePath, dest.length())
+            stamp.writeText(apkId)
+            Timber.tag(TAG).i("stageBridge: libsteamclient.so → %s (%d bytes, apk=%s)",
+                dest.absolutePath, dest.length(), apkId)
             true
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "stageBridge: copy failed")
@@ -616,6 +844,8 @@ object WnSteamAssetsInstaller {
             File(imageFs.libDir, ".wnsteam-androidarm64.stamp"),
             File(imageFs.libDir, ".wnsteam-$LSC_ARM64EC.stamp"),
             File(imageFs.libDir, ".wnsteam-$LSC_X86_64.stamp"),
+            File(context.filesDir, ".wnsteam-bridge-lib.stamp"),
+            File(context.filesDir, "wnsteam-planw-cache/.planw-valve-steam.stamp"),
         ).forEach { if (it.exists()) it.delete() }
     }
 

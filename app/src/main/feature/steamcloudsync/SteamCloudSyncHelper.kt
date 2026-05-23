@@ -17,12 +17,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import timber.log.Timber
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 object SteamCloudSyncHelper {
     // Sentinel labels for the conflict dialog. Rendered as-is in
@@ -100,6 +102,7 @@ object SteamCloudSyncHelper {
             // stays stale until the next launch path runs the full
             // enrichSteamSettings.
             if (ok) {
+                probeCache.remove(appId)
                 runCatching {
                     SteamService.pushCloudStateToLibSteamClient(appId)
                 }.onFailure { e ->
@@ -124,11 +127,17 @@ object SteamCloudSyncHelper {
         if (shortcut.getExtra("game_source") != "STEAM") return false
         val appId = shortcut.getExtra("app_id")
         if (appId.isEmpty()) return false
+        val appIdInt = appId.toIntOrNull() ?: return false
 
-        val prefs = context.getSharedPreferences("cloud_sync_state", Context.MODE_PRIVATE)
-        if (prefs.contains("synced_STEAM_$appId")) return true
-
-        return hasActualLocalSaves(context, appId.toIntOrNull() ?: return false)
+        // Always consult the filesystem rather than a "synced" pref. The pref
+        // shortcut previously trusted a fingerprint match per container, but
+        // it stayed valid across symlink-flips that physically moved cloud
+        // saves OUT of the container's Steam dir into the shared store (e.g.
+        // planW launches where the Android-side download wrote through the
+        // symlink, then installPlanWValveSteam replaced the symlink with an
+        // empty real dir — saves orphaned, pref still said "synced"). Disk
+        // is the only honest answer.
+        return hasActualLocalSaves(context, appIdInt)
     }
 
     fun hasActualLocalSaves(
@@ -234,6 +243,9 @@ object SteamCloudSyncHelper {
         val timestamps: SteamCloudConflictTimestamps,
     )
 
+    private const val PROBE_CACHE_TTL_MS = 60_000L
+    private val probeCache = ConcurrentHashMap<Int, Pair<Long, CloudConflictProbe>>()
+
     @JvmStatic
     fun probeCloudConflict(
         context: Context,
@@ -245,6 +257,16 @@ object SteamCloudSyncHelper {
                 differs = false,
                 timestamps = SteamCloudConflictTimestamps(LABEL_NO_LOCAL_SAVES, LABEL_NO_CLOUD_SAVES),
             )
+        }
+        // Re-launching the same game within PROBE_CACHE_TTL_MS reuses the
+        // last successful probe — the cloud and local state can't meaningfully
+        // diverge in this window, and skipping the Steam round-trip + SHA-1
+        // of every local save file is a noticeable launch-time win.
+        // Invalidated by forceDownloadById / uploadLocalSaves when local state
+        // actually changes; cloud-unreachable results are intentionally NOT
+        // cached so the next launch retries with a hopefully-live session.
+        probeCache[appId]?.let { (ts, cached) ->
+            if (System.currentTimeMillis() - ts < PROBE_CACHE_TTL_MS) return cached
         }
         // hasLocalCloudSaves can short-circuit on a `synced_STEAM_$appId` pref entry
         // without going through steamPrefixResolver, so the symlink may still be stale
@@ -273,7 +295,7 @@ object SteamCloudSyncHelper {
                         snapshot == null -> LABEL_CLOUD_UNREACHABLE
                         else -> formatTimestamp(snapshot.newestRemoteTimestamp, LABEL_NO_CLOUD_SAVES)
                     }
-                CloudConflictProbe(
+                val probe = CloudConflictProbe(
                     differs = snapshot?.differs ?: false,
                     timestamps =
                         SteamCloudConflictTimestamps(
@@ -281,6 +303,8 @@ object SteamCloudSyncHelper {
                             cloudTimestampLabel = cloudLabel,
                         ),
                 )
+                if (snapshot != null) probeCache[appId] = System.currentTimeMillis() to probe
+                probe
             } catch (e: Exception) {
                 Timber.e(e, "Steam cloud conflict probe failed for %s", shortcut.name)
                 CloudConflictProbe(
@@ -339,7 +363,7 @@ object SteamCloudSyncHelper {
             // forceDownloadById already refreshes the libsteamclient
             // mirror on success, so the inline push that used to live
             // here is redundant. Just mark the snapshot.
-            markCloudSaveSynced(context, shortcut.getExtra("app_id"))
+            markCloudSaveSynced(context, shortcut.getExtra("app_id"), shortcut.container)
         }
         Timber.i("Steam cloud save download for %s: %s", shortcut.name, result)
         return result
@@ -371,6 +395,7 @@ object SteamCloudSyncHelper {
                     ).await()
             val ok = syncInfo?.syncResult == SyncResult.Success || syncInfo?.syncResult == SyncResult.UpToDate
             if (ok) {
+                probeCache.remove(appId)
                 // Detached snapshot capture so the upload caller isn't held waiting on disk I/O.
                 CoroutineScope(Dispatchers.IO).launch {
                     runCatching {
@@ -405,7 +430,7 @@ object SteamCloudSyncHelper {
     ): Boolean {
         val appId = gameId.toIntOrNull() ?: return false
         val result = runBlocking { forceDownloadById(context, appId) }
-        if (result) markCloudSaveSynced(context, gameId)
+        if (result) markCloudSaveSynced(context, gameId, ContainerUtils.getUsableContainerOrNull(context, gameId))
         Timber.i("Steam cloud save download for %s: %s", gameId, result)
         return result
     }
@@ -413,10 +438,26 @@ object SteamCloudSyncHelper {
     private fun markCloudSaveSynced(
         context: Context,
         appId: String,
+        container: Container?,
     ) {
         if (appId.isEmpty()) return
         val prefs = context.getSharedPreferences("cloud_sync_state", Context.MODE_PRIVATE)
-        prefs.edit().putLong("synced_STEAM_$appId", System.currentTimeMillis()).apply()
+        prefs.edit().putString("synced_STEAM_$appId", containerFingerprint(container)).apply()
+    }
+
+    /**
+     * Identity of the container *incarnation* the cloud saves were synced into.
+     * Combines the container id (changes on a container switch) with the .wine
+     * prefix dir's last-modified time (changes when the container is
+     * reinstalled/recreated). When this no longer matches a stored "synced"
+     * flag, the flag is stale and the cloud download must run again.
+     */
+    private fun containerFingerprint(container: Container?): String {
+        if (container == null) return "none"
+        val root = container.rootDir ?: return "id-${container.id}"
+        val wineDir = File(root, ".wine")
+        val sig = if (wineDir.exists()) wineDir.lastModified() else 0L
+        return "${container.id}:$sig"
     }
 
     private fun steamPrefixResolver(
@@ -440,8 +481,17 @@ object SteamCloudSyncHelper {
         // container. The appId-based fallback only runs when no shortcut is available.
         activateContainerForCloudOp(context, appId, containerHint)
 
+        // Derive accountId from steamUserSteamId64 BEFORE the steamUserAccountId
+        // pref so the Android cloud manager and the in-Wine launcher always
+        // agree on which userdata/<accountId>/ subdir to use. The launcher
+        // computes accId = WN_STEAM_STEAMID & 0xFFFFFFFF (main.cpp:435), where
+        // WN_STEAM_STEAMID is steamUserSteamId64 (XServerDisplayActivity.java:5564).
+        // steamUserAccountId can be stale from a prior account login (or a
+        // restored Drive backup) and silently point the download at a
+        // different userdata folder than the running game reads from.
         val accountId =
             SteamService.userSteamId?.accountID?.toLong()
+                ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
                 ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
                 ?: 0L
         return { prefix -> PathType.from(prefix).toAbsPath(context, appId, accountId) }

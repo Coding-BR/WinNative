@@ -46,6 +46,31 @@
 #include <time.h>
 #include <tlhelp32.h>
 
+// LoadLibraryEx search-path flags — fallbacks in case the mingw-w64 headers
+// gate them behind a higher _WIN32_WINNT than we compile at.
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+#define LOAD_LIBRARY_SEARCH_DEFAULT_DIRS 0x00001000
+#endif
+#ifndef LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+#define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x00000100
+#endif
+#ifndef LOAD_IGNORE_CODE_AUTHZ_LEVEL
+#define LOAD_IGNORE_CODE_AUTHZ_LEVEL 0x00000010
+#endif
+
+// Calling convention for steamclient's C++ virtual (vtable) methods. On a
+// 32-bit build those are MSVC __thiscall (this in ECX); on x86-64 there is
+// one convention so it expands to nothing. The flat Steam_* / CreateInterface
+// exports stay __cdecl (the compiler default) on both.
+#ifdef __i386__
+#define WN_THISCALL __thiscall
+#else
+#define WN_THISCALL
+#endif
+
 // IClientUser / IClientEngine vtable offsets — CONFIRMED by binary RE of
 // Valve's steamclient64.dll (steam_client_0403) AND by decompiling GameHub
 // SteamAgent's SteamCore::LoginToSteam (FUN_140055690).
@@ -69,6 +94,14 @@ static const int kVtUser_GetSteamID         = 0x50;  // slot 10: CSteamID& GetSt
 static const int kVtUser_BHasCachedCreds    = 0x188; // slot 49: bool BHasCachedCredentials(const char*)
 static const int kVtUser_SetLoginToken      = 0x1C0; // slot 56: EResult SetLoginToken(const char* token, const char* account)
 
+// IClientUser install-script engine slots — CONFIRMED from GameHub SteamAgent
+// (FUN_14005a850 / FUN_1400504a0) against steamclient64.dll. The agent runs the
+// game's installscript.vdf (VC++ redist, prerequisites, registry setup) through
+// these before LaunchApp; a prerequisite-dependent game won't boot without it.
+static const int kVtUser_RunInstallScript       = 0x310; // slot 98: bool RunInstallScript(AppId_t, int flags)
+static const int kVtUser_IsInstallScriptRunning = 0x318; // slot 99: int  IsInstallScriptRunning()
+static const int kVtUser_GetInstallScriptState  = 0x320; // slot 100: bool GetInstallScriptState(char*, uint32, int*, int*)
+
 // IClientEngine slot 43 — GetIClientAppManager(hUser, hPipe). CONFIRMED by
 // disassembling GameHub SteamAgent (FUN_140055180). IClientAppManager slot 2
 // — LaunchApp — CONFIRMED two ways: GameHub's SteamCore::LaunchApplication
@@ -76,23 +109,42 @@ static const int kVtUser_SetLoginToken      = 0x1C0; // slot 56: EResult SetLogi
 // IClientAppManager proxy vtable (0 InstallApp, 1 UninstallApp, 2 LaunchApp,
 // 3 ShutdownApp).
 static const int kVtEngine_GetIClientAppManager = 0x158; // IClientEngine slot 43
-static const int kVtEngine_GetIClientApps       = 0x88;  // IClientEngine slot 17
 static const int kVtAppMgr_LaunchApp            = 0x10;  // IClientAppManager slot 2
-// IClientApps slot 7 — bool RequestAppInfoUpdate(AppId_t* pAppIDs, int32 n).
-// CONFIRMED from steamclient64.dll's IClientApps proxy thunk table.
-static const int kVtApps_RequestAppInfoUpdate   = 0x38;  // IClientApps slot 7
+// IClientAppManager slots — make steamclient see the game as FullyInstalled
+// before LaunchApp. RefreshAppInfo re-scans library folders; GetAppInstallState
+// returns EAppState bits (bit 2 = FullyInstalled). Verified working on-device.
+static const int kVtAppMgr_RefreshAppInfo       = 0x298; // void RefreshAppInfo()
+static const int kVtAppMgr_GetAppInstallState   = 0x20;  // int  GetAppInstallState(AppId_t)
 
-// IClientEngine slot 24 — GetIClientRemoteStorage(hUser, hPipe), and the
-// IClientRemoteStorage cloud-sync slots. CONFIRMED against steamclient64.dll
-// build steam_client_0403 by RE of GameHub SteamAgent's cloud worker
-// (FUN_14005bbd0): it acquires IClientRemoteStorage, calls BeginAppSync,
-// busy-waits on IsAppSyncInProgress, then confirms via GetSyncState.
-static const int kVtEngine_GetIClientRemoteStorage = 0xC0;  // IClientEngine slot 24
-static const int kVtRS_GetSyncState         = 0x240; // int  GetSyncState(AppId_t) -> EGetFileSyncState
-static const int kVtRS_BeginAppSync         = 0x270; // bool BeginAppSync(AppId_t, EAppSyncCommand, flags)
-static const int kVtRS_IsAppSyncInProgress  = 0x278; // bool IsAppSyncInProgress(AppId_t)
-static const int kVtRS_GetConflictInfo      = 0x258; // bool GetConflictInfo(AppId_t, int* outLocal, int* outRemote)
-static const int kVtRS_ResolveConflict      = 0x268; // bool ResolveConflict(AppId_t, bool acceptLocal)
+// IClientApps — request the PICS appinfo for the game before LaunchApp so
+// steamclient has the launch config loaded. Without this, LaunchApp's job
+// fails with EAppUpdateError=9 (MissingConfig) and silently doesn't spawn.
+// Slot offsets verified against steamclient64.dll's IClientApps proxy
+// thunk table (CONFIRMED in HEAD's launcher; GameHub's SteamCore::RefreshApps
+// uses the same call shape).
+static const int kVtEngine_GetIClientApps       = 0x88;  // slot 17: IClientApps*(hUser, hPipe)
+static const int kVtApps_RequestAppInfoUpdate   = 0x38;  // slot 7:  bool(AppId_t* ids, int n)
+
+// IClientUtils — used to poll LaunchApp's HSteamAPICall result so we can read
+// the EAppUpdateError that explains why the spawn silently didn't happen.
+// Slots verified by RE of GameHub SteamAgent's poll loop (FUN_14005d5c0 +
+// FUN_14005518... at VA 0x140055580, IClientUtils stored at this+0x78) +
+// cross-check with the IClientUtilsMap proxy vtable in steamclient64.dll @
+// 0x1392e6718.
+static const int kVtEngine_GetIClientUtils       = 0x70;  // slot 14: IClientUtils*(HSteamPipe)
+static const int kVtUtils_IsAPICallCompleted     = 0xB0;  // slot 22: bool(apiCall, *pbFailed)
+static const int kVtUtils_GetAPICallFailureReason = 0xB8; // slot 23: int(apiCall)  ESteamAPICallFailure
+static const int kVtUtils_GetAPICallResult       = 0xC0;  // slot 24: bool(apiCall, pCb, cubCb, iCbExpected, *pbFailed)
+
+// LaunchAppResult_t — k_iClientAppManagerCallbacks + 0xB = 0x1361 << 8 | 0x0b.
+// Size + error-offset extracted from FUN_140058f20 disassembly:
+//   mov $0x13610b, [%rsp+0x20]     iCallbackExpected
+//   mov $0x20c,   %r9d              cubCallback (524 bytes)
+//   lea -0x10(%rbp), %r8            buffer base
+//   cmp %esi, -0x8(%rbp)            error read at buffer+0x8
+static const int kLaunchAppResultCallbackId    = 0x13610B;
+static const int kLaunchAppResultSize          = 0x20C;
+static const int kLaunchResultErrorOffset      = 0x8;     // int32 EAppUpdateError
 
 typedef void* (*CreateInterfaceFn)(const char* version, int* returnCode);
 typedef int   (*Steam_CreateGlobalUser_fn)(int* pipe_out);
@@ -369,6 +421,107 @@ static int count_process_by_name(const char* exeName) {
 // __try/__except, so this VirtualQuery probe is our guard against an offset
 // shift in a future steamclient build (a wrong slot reads a data/null pointer;
 // calling it would crash the launcher and abort the game launch).
+// Install (idempotent) and start the "Steam Client Service" backed by
+// steamservice.exe so steamclient64.dll's IPC queue gets a consumer.
+// Without this, IClientAppManager::LaunchApp marshals the call into a
+// CSerializingBuffer + IPCClient::DispatchAndReturnAPICall, returns a
+// non-zero HSteamAPICall, and the work is silently dropped because there
+// is no peer process draining the named-event-backed pipe — verified by
+// Ghidra: the CAPIJobLaunchApp factory (steamclient64.dll @0x1384c1610)
+// and CUser::SpawnProcess (@0x1389d5dd0) are only reachable from a
+// server-side dispatcher that lives in steamservice.exe.
+//
+// GameHub's SteamAgent does the same (decompiled FUN_140052b40 /
+// FUN_1400531b0): OpenServiceW(L"Steam Client Service"), install if
+// missing via CreateService, StartService, poll status.
+//
+// Returns true iff the service is in SERVICE_RUNNING state when we
+// return. A false return is non-fatal — LaunchApp will still queue the
+// job and the launcher will fall through to the CreateProcess path that
+// already works for non-DRM games.
+static bool start_steam_client_service(void) {
+    const char* kSvcName       = "Steam Client Service";
+    const char* kSvcExe        = "C:\\Program Files (x86)\\Steam\\bin\\steamservice.exe";
+    const char* kSvcBinPath    = "\"C:\\Program Files (x86)\\Steam\\bin\\steamservice.exe\" /RunAsService";
+
+    DWORD attr = GetFileAttributesA(kSvcExe);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        log_line("[wn-launcher] steamservice: binary not present at %s — "
+                 "LaunchApp's IPC queue will have no peer; will use "
+                 "CreateProcess fallback", kSvcExe);
+        return false;
+    }
+    log_line("[wn-launcher] steamservice: found %s", kSvcExe);
+
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) {
+        log_line("[wn-launcher] steamservice: OpenSCManager failed GLE=%lu",
+                 GetLastError());
+        return false;
+    }
+
+    SC_HANDLE svc = OpenServiceA(scm, kSvcName, SERVICE_ALL_ACCESS);
+    if (!svc) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+            log_line("[wn-launcher] steamservice: service missing — "
+                     "installing as \"%s\"", kSvcName);
+            svc = CreateServiceA(
+                scm, kSvcName, kSvcName,
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_DEMAND_START,
+                SERVICE_ERROR_NORMAL,
+                kSvcBinPath,
+                NULL, NULL, NULL, NULL, NULL);
+            if (!svc) {
+                log_line("[wn-launcher] steamservice: CreateService failed GLE=%lu",
+                         GetLastError());
+                CloseServiceHandle(scm);
+                return false;
+            }
+            log_line("[wn-launcher] steamservice: service installed");
+        } else {
+            log_line("[wn-launcher] steamservice: OpenService failed GLE=%lu", err);
+            CloseServiceHandle(scm);
+            return false;
+        }
+    }
+
+    SERVICE_STATUS status;
+    memset(&status, 0, sizeof(status));
+    QueryServiceStatus(svc, &status);
+    log_line("[wn-launcher] steamservice: pre-start state=%lu", status.dwCurrentState);
+
+    if (status.dwCurrentState != SERVICE_RUNNING) {
+        if (!StartServiceA(svc, 0, NULL)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+                log_line("[wn-launcher] steamservice: StartService failed GLE=%lu",
+                         err);
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                return false;
+            }
+        }
+        int waited = 0;
+        while (waited < 30000) {
+            if (!QueryServiceStatus(svc, &status)) break;
+            if (status.dwCurrentState == SERVICE_RUNNING ||
+                status.dwCurrentState == SERVICE_STOPPED) break;
+            Sleep(200);
+            waited += 200;
+        }
+        log_line("[wn-launcher] steamservice: post-start state=%lu after %dms",
+                 status.dwCurrentState, waited);
+    }
+
+    bool running = (status.dwCurrentState == SERVICE_RUNNING);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return running;
+}
+
 static bool is_exec_ptr(void* p) {
     if (!p) return false;
     MEMORY_BASIC_INFORMATION mbi;
@@ -379,187 +532,12 @@ static bool is_exec_ptr(void* p) {
            x == PAGE_EXECUTE_READWRITE || x == PAGE_EXECUTE_WRITECOPY;
 }
 
-// Drive a Steam Cloud sync for `appId` through Valve's real steamclient64.dll
-// and block until it completes. isDownload=true pulls cloud saves DOWN before
-// launch; isDownload=false pushes local saves UP after the game exits.
-//
-// Mirrors GameHub SteamAgent's cloud worker (FUN_14005bbd0): acquire
-// IClientRemoteStorage, BeginAppSync, busy-wait IsAppSyncInProgress draining
-// callbacks, then confirm GetSyncState. We deliberately do NOT call
-// ResolveConflict on an unresolved conflict — it discards one side and a wrong
-// guess loses the user's saves; logging and proceeding is the safe default.
-//
-// Every runtime-built vtable slot is is_exec_ptr()-checked before use: a slot
-// shift would otherwise crash the launcher before the game ever starts, so on a
-// failed check we log and return and the game still launches (without sync).
-static void cloud_sync(void* engine, int hUser, int pipe, uint32_t appId,
-                       bool isDownload,
-                       Steam_BGetCallback_fn bGetCallback,
-                       Steam_FreeLastCallback_fn freeLastCallback) {
-    const char* dir = isDownload ? "download" : "upload";
-    if (!engine || appId == 0) return;
-
-    // The app's Cloud Saves toggle gates launcher-side sync.
-    const char* noCloud = getenv("WN_STEAM_NO_CLOUD");
-    if (noCloud && *noCloud) {
-        log_line("[wn-launcher] cloud %s: skipped — cloud saves disabled", dir);
-        return;
-    }
-
-    void** engine_vt = *(void***) engine;
-    void* getRSp = engine_vt[kVtEngine_GetIClientRemoteStorage / 8];
-    if (!is_exec_ptr(getRSp)) {
-        log_line("[wn-launcher] cloud %s: GetIClientRemoteStorage slot "
-                 "(+0x%x) not executable (%p) — skipping sync",
-                 dir, kVtEngine_GetIClientRemoteStorage, getRSp);
-        return;
-    }
-    typedef void* (*GetIClientRemoteStorageFn)(void* self, int u, int p);
-    void* rs = ((GetIClientRemoteStorageFn) getRSp)(engine, hUser, pipe);
-    log_line("[wn-launcher] cloud %s: GetIClientRemoteStorage -> %p", dir, rs);
-    if (!rs) return;
-
-    void** rs_vt = *(void***) rs;
-    void* stateP = rs_vt[kVtRS_GetSyncState / 8];
-    void* beginP = rs_vt[kVtRS_BeginAppSync / 8];
-    void* progP  = rs_vt[kVtRS_IsAppSyncInProgress / 8];
-    log_line("[wn-launcher] cloud %s: RS vt GetSyncState=%p BeginAppSync=%p "
-             "IsAppSyncInProgress=%p", dir, stateP, beginP, progP);
-    if (!is_exec_ptr(stateP) || !is_exec_ptr(beginP) || !is_exec_ptr(progP)) {
-        log_line("[wn-launcher] cloud %s: an IClientRemoteStorage slot is not "
-                 "executable — offsets may not match this steamclient build; "
-                 "skipping sync", dir);
-        return;
-    }
-    typedef bool (*BeginAppSyncFn)(void* self, uint32_t app, int d, int f);
-    typedef bool (*IsAppSyncInProgressFn)(void* self, uint32_t app);
-    typedef int  (*GetSyncStateFn)(void* self, uint32_t app);
-    BeginAppSyncFn        beginSync  = (BeginAppSyncFn) beginP;
-    IsAppSyncInProgressFn inProgress = (IsAppSyncInProgressFn) progP;
-    GetSyncStateFn        getState   = (GetSyncStateFn) stateP;
-
-    // BeginAppSync(appId, EAppSyncCommand, flags) — CONFIRMED from GameHub
-    // SteamAgent's cloud worker FUN_14005bbd0:
-    //   launch DOWNLOAD = BeginAppSync(appId, 1, 0)  cmd bit0 "AutoCloud Launch"
-    //   exit   UPLOAD   = BeginAppSync(appId, 2, 4)  cmd bit1 + flag bit2 "AC Exit"
-    // The exit/upload path MUST carry a non-zero command mask + the AC-Exit
-    // flag: with a zero command mask steamclient runs no sync job at all and
-    // returns "synced" instantly (~90ms) without transferring anything — that
-    // was the upload no-op bug.
-    const int kCmd  = isDownload ? 1 : 2;
-    const int kFlag = isDownload ? 0 : 4;
-
-    // EGetFileSyncState — CONFIRMED from SteamAgent's GetSyncState name table:
-    //   0 Disabled  1 Synchronized  2 InProgress  3 PendingDownload
-    //   4 PendingUpload  5 PendingBoth  6 ConflictingChanges
-    int state0 = getState(rs, appId);
-    log_line("[wn-launcher] cloud %s: pre-sync state=%d", dir, state0);
-
-    // SteamAgent re-runs the sync while it stays in a pending state. Do the
-    // same: up to 3 attempts, stopping on Synchronized(1) or Conflict(6).
-    const int kMaxWaitMs = 60000;
-    int finalState = state0;
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        bool started = beginSync(rs, appId, kCmd, kFlag);
-        log_line("[wn-launcher] cloud %s: BeginAppSync(appId=%u, cmd=%d, "
-                 "flag=%d) attempt %d -> %d",
-                 dir, appId, kCmd, kFlag, attempt, started ? 1 : 0);
-        if (!started) {
-            log_line("[wn-launcher] cloud %s: BeginAppSync declined", dir);
-            break;
-        }
-        int waited = 0;
-        while (inProgress(rs, appId) && waited < kMaxWaitMs) {
-            if (bGetCallback && freeLastCallback) {
-                char cb[64];
-                while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
-            }
-            Sleep(10);
-            waited += 10;
-        }
-        finalState = getState(rs, appId);
-        log_line("[wn-launcher] cloud %s: attempt %d finished in %dms, state=%d "
-                 "(1=Synced 3=pendDL 4=pendUL 5=pendBoth 6=CONFLICT)",
-                 dir, attempt, waited, finalState);
-        if (finalState == 1 || finalState == 6) break;
-        bool retry = isDownload ? (finalState == 3)
-                                : (finalState == 4 || finalState == 5);
-        if (!retry) break;
-        Sleep(300);
-    }
-
-    if (finalState == 6) {
-        // Conflict — ask the app which copy to keep via a request/response file.
-        void* infoP    = rs_vt[kVtRS_GetConflictInfo / 8];
-        void* resolveP = rs_vt[kVtRS_ResolveConflict / 8];
-        if (!is_exec_ptr(infoP) || !is_exec_ptr(resolveP)) {
-            log_line("[wn-launcher] cloud %s: conflict — resolve slots not "
-                     "executable; leaving both copies intact", dir);
-        } else {
-            typedef bool (*GetConflictInfoFn)(void*, uint32_t, int*, int*);
-            typedef bool (*ResolveConflictFn)(void*, uint32_t, bool);
-            int localT = 0, remoteT = 0;
-            ((GetConflictInfoFn) infoP)(rs, appId, &localT, &remoteT);
-            log_line("[wn-launcher] cloud %s: CONFLICT — localTime=%d "
-                     "remoteTime=%d; asking app", dir, localT, remoteT);
-            remove("C:\\wn-cloud-conflict.resp");
-            FILE* rq = fopen("C:\\wn-cloud-conflict.req", "w");
-            if (rq) {
-                fprintf(rq, "%u %d %d\n", appId, localT, remoteT);
-                fclose(rq);
-            }
-            char choice[16] = {0};
-            int cw = 0;
-            while (cw < 600000) {
-                if (bGetCallback && freeLastCallback) {
-                    char cb[64];
-                    while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
-                }
-                FILE* rp = fopen("C:\\wn-cloud-conflict.resp", "r");
-                if (rp) {
-                    if (!fgets(choice, sizeof(choice), rp)) choice[0] = '\0';
-                    fclose(rp);
-                    break;
-                }
-                Sleep(200);
-                cw += 200;
-            }
-            remove("C:\\wn-cloud-conflict.req");
-            remove("C:\\wn-cloud-conflict.resp");
-            if (choice[0] != 'l' && choice[0] != 'c') {
-                log_line("[wn-launcher] cloud %s: no conflict choice from app; "
-                         "leaving both copies intact", dir);
-            } else {
-                bool acceptLocal = (choice[0] == 'l');
-                bool rr = ((ResolveConflictFn) resolveP)(rs, appId, acceptLocal);
-                log_line("[wn-launcher] cloud %s: ResolveConflict(acceptLocal="
-                         "%d) -> %d", dir, acceptLocal ? 1 : 0, rr ? 1 : 0);
-                if (beginSync(rs, appId, kCmd, kFlag)) {
-                    int w = 0;
-                    while (inProgress(rs, appId) && w < kMaxWaitMs) {
-                        if (bGetCallback && freeLastCallback) {
-                            char cb[64];
-                            while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
-                        }
-                        Sleep(10);
-                        w += 10;
-                    }
-                }
-                finalState = getState(rs, appId);
-            }
-        }
-    }
-
-    if (finalState == 1) {
-        log_line("[wn-launcher] cloud %s: COMPLETE (Synchronized)", dir);
-    } else if (finalState == 6) {
-        log_line("[wn-launcher] cloud %s: CONFLICT unresolved — both copies "
-                 "left intact", dir);
-    } else {
-        log_line("[wn-launcher] cloud %s: did NOT fully sync (state=%d)",
-                 dir, finalState);
-    }
-}
+// Steam Cloud sync is driven entirely on the Android side by wn-steam-client
+// (SteamLaunchCloudSync.syncBeforeLaunch / SteamExitCloudSync.syncOnExit).
+// The in-Wine IClientRemoteStorage::BeginAppSync path that used to live
+// here has been removed: steamclient's own auto-sync runs out-of-band on
+// logon, our explicit call was always declined (state=2 stable) and never
+// landed any bytes, so it was a no-op that just added latency + log noise.
 
 int main(int argc, char** argv) {
     setbuf(stderr, NULL);
@@ -613,51 +591,124 @@ int main(int argc, char** argv) {
 
     // ------------------------------------------------------------------
     // STEP 1: LoadLibrary Valve's real steamclient64.dll from the Steam
-    // dir. WE USE THE FULL ABSOLUTE PATH so Wine's DllOverrides
-    // (which redirect bare "steamclient64.dll" to the bionic bridge's
-    // lsteamclient.dll in system32) don't kick in. The bridge's
-    // Steam_CreateGlobalUser is an unimplemented stub; we need Valve's
-    // real implementation.
+    // dir, by FULL ABSOLUTE PATH so Wine's DllOverrides (which redirect a
+    // bare "steamclient64.dll" to the bionic bridge's lsteamclient.dll)
+    // don't kick in — the bridge's Steam_CreateGlobalUser is a stub.
     //
-    // Pre-load tier0_s64.dll then vstdlib_s64.dll by full path FIRST.
-    // steamclient64.dll imports ~50 V_*/Plat_*/CThread*/Spew* functions
-    // from those two DLLs. Proton 9's Wine resolves the transitive
-    // imports against steamclient64.dll's own directory; Proton 10's
-    // loader does not, so they fall back to ntdll unimplemented stubs
-    // (0x00A1xxxx) and the first call into one during process_attach
-    // page-faults on execute access (LoadLibraryEx fails, GLE=998).
-    // Loading the real modules up front puts them in the module list so
-    // steamclient64.dll's imports bind by basename. tier0 must come
-    // first: vstdlib_s64.dll itself imports tier0_s64.dll.
+    // We host the 64-bit steamclient64.dll — the same binary GameHub's
+    // agent uses — so IClientAppManager::LaunchApp drives the game through
+    // steamclient's own app-launch path. We preload the dependency chain —
+    // Wine CRT thunks then Steam's own tier0_s64/vstdlib_s64 — and try a
+    // cascade of LoadLibrary strategies with cold-start backoff.
     // ------------------------------------------------------------------
-    SetDllDirectoryA("C:\\Program Files (x86)\\Steam");
+    const char* kSteamDir = "C:\\Program Files (x86)\\Steam";
+    SetDllDirectoryA(kSteamDir);
     {
-        const char* deps[] = {
-            "C:\\Program Files (x86)\\Steam\\tier0_s64.dll",
-            "C:\\Program Files (x86)\\Steam\\vstdlib_s64.dll",
+        // Wine CRT thunks by short name (found in system32); Steam's
+        // siblings by absolute path. Every preload is best-effort — a
+        // missing optional DLL just logs and continues.
+        struct Preload { const char* name; bool fullPath; };
+        const Preload preloads[] = {
+            { "msvcr120.dll", false }, { "msvcp120.dll", false },
+            { "vcruntime140.dll", false }, { "msvcp140.dll", false },
+            { "tier0_s64.dll", true }, { "vstdlib_s64.dll", true },
+            { "video64.dll", true }, { "SteamUI.dll", true },
         };
-        for (const char* dep : deps) {
-            HMODULE dm = LoadLibraryExA(
-                dep, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-            if (dm) {
-                log_line("[wn-launcher] preloaded %s at %p", dep, dm);
+        for (const Preload& p : preloads) {
+            HMODULE dm;
+            if (p.fullPath) {
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s\\%s", kSteamDir, p.name);
+                dm = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
             } else {
-                log_line("[wn-launcher] WARN preload %s FAILED, GLE=%lu",
-                         dep, GetLastError());
+                dm = LoadLibraryA(p.name);
+            }
+            if (dm) {
+                log_line("[wn-launcher] preload %s: ok (%p)", p.name, dm);
+            } else {
+                log_line("[wn-launcher] preload %s: failed GLE=%lu (continuing)",
+                         p.name, GetLastError());
             }
         }
     }
-    const char* steamclientPath =
-        "C:\\Program Files (x86)\\Steam\\steamclient64.dll";
-    HMODULE lsc = LoadLibraryExA(
-        steamclientPath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+
+    char steamclientPath[MAX_PATH];
+    snprintf(steamclientPath, sizeof(steamclientPath),
+             "%s\\steamclient64.dll", kSteamDir);
+
+    // Cascade of load strategies. Different flag combinations exercise
+    // different paths in Wine's PE loader; under FEX/arm64ec one often
+    // works where another faults. We never use DONT_RESOLVE_DLL_REFERENCES
+    // — it skips DllMain, leaving steamclient uninitialised.
+    struct LoadAttempt { DWORD flags; const char* desc; };
+    const LoadAttempt attempts[] = {
+        { LOAD_WITH_ALTERED_SEARCH_PATH, "LOAD_WITH_ALTERED_SEARCH_PATH" },
+        { 0, "no flags" },
+        { LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, "SEARCH_DEFAULT_DIRS" },
+        { LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_IGNORE_CODE_AUTHZ_LEVEL,
+          "SEARCH_DEFAULT_DIRS + IGNORE_CFG" },
+        { LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+          "DLL_LOAD_DIR + SYSTEM32" },
+    };
+    const int kAttempts = (int)(sizeof(attempts) / sizeof(attempts[0]));
+    HMODULE lsc = NULL;
+    DWORD lastErr = 0;
+    for (int i = 0; i < kAttempts && !lsc; i++) {
+        lsc = LoadLibraryExA(steamclientPath, NULL, attempts[i].flags);
+        if (lsc) {
+            log_line("[wn-launcher] steamclient64.dll loaded at %p "
+                     "(strategy %d/%d: %s)",
+                     lsc, i + 1, kAttempts, attempts[i].desc);
+            break;
+        }
+        lastErr = GetLastError();
+        log_line("[wn-launcher] load strategy %d/%d (%s) FAILED, GLE=%lu",
+                 i + 1, kAttempts, attempts[i].desc, lastErr);
+        Sleep(50);
+    }
+    // Cold-start backoff: a freshly-booted prefix (wineserver warming,
+    // siblings still unpacking) can fail every strategy transiently.
+    for (int round = 0; round < 3 && !lsc; round++) {
+        log_line("[wn-launcher] steamclient64.dll cold-start retry "
+                 "round %d/3 after 500ms", round + 1);
+        Sleep(500);
+        for (int i = 0; i < kAttempts && !lsc; i++) {
+            lsc = LoadLibraryExA(steamclientPath, NULL, attempts[i].flags);
+            if (!lsc) lastErr = GetLastError();
+        }
+        if (lsc) {
+            log_line("[wn-launcher] steamclient64.dll loaded at %p "
+                     "(retry round %d)", lsc, round + 1);
+        }
+    }
+    // Last resort: plain LoadLibraryA routes through a different loader
+    // path than LoadLibraryExA on some Wine builds.
     if (!lsc) {
-        log_line("[wn-launcher] LoadLibraryEx(%s) FAILED, GLE=%lu",
-                 steamclientPath, GetLastError());
+        lsc = LoadLibraryA(steamclientPath);
+        if (lsc) {
+            log_line("[wn-launcher] steamclient64.dll loaded at %p "
+                     "(plain LoadLibraryA)", lsc);
+        } else {
+            lastErr = GetLastError();
+        }
+    }
+    if (!lsc) {
+        // Distinguish "file bad" from "DllMain init faulted": a DATAFILE
+        // load maps the image without running its code.
+        HMODULE probe = LoadLibraryExA(steamclientPath, NULL,
+                                       LOAD_LIBRARY_AS_DATAFILE);
+        if (probe) {
+            log_line("[wn-launcher] diag: DATAFILE load OK — file is "
+                     "well-formed; failure is in DllMain/runtime init");
+            FreeLibrary(probe);
+        } else {
+            log_line("[wn-launcher] diag: DATAFILE load also FAILED, GLE=%lu",
+                     GetLastError());
+        }
+        log_line("[wn-launcher] LoadLibrary(%s) FAILED after all strategies, "
+                 "last GLE=%lu", steamclientPath, lastErr);
         return 2;
     }
-    log_line("[wn-launcher] steamclient64.dll loaded at %p (from %s)",
-             lsc, steamclientPath);
 
     CreateInterfaceFn createInterface =
         (CreateInterfaceFn) GetProcAddress(lsc, "CreateInterface");
@@ -736,7 +787,7 @@ int main(int argc, char** argv) {
                          i, i * 8, engine_vt[i]);
             }
 
-            typedef void* (*GetIClientUserFn)(void* self, int hUser, int hPipe);
+            typedef void* (WN_THISCALL *GetIClientUserFn)(void* self, int hUser, int hPipe);
             GetIClientUserFn getIClientUser = (GetIClientUserFn)
                 engine_vt[kVtEngine_GetIClientUser / 8];
             void* iuser = getIClientUser(engine, hUser, pipe);
@@ -767,7 +818,7 @@ int main(int argc, char** argv) {
                 // the connection callbacks drained in STEP 4.
 
                 // Diagnostic only — BHasCachedCredentials (slot 49).
-                typedef bool (*BHasCachedCredsFn)(void* self, const char* user);
+                typedef bool (WN_THISCALL *BHasCachedCredsFn)(void* self, const char* user);
                 BHasCachedCredsFn hasCached = (BHasCachedCredsFn)
                     iuser_vt[kVtUser_BHasCachedCreds / 8];
                 log_line("[wn-launcher] BHasCachedCredentials(%s) = %d",
@@ -776,7 +827,7 @@ int main(int argc, char** argv) {
                 // STEP 3.1 — SetLoginToken(refreshToken, accountName).
                 // Both args are C-strings (confirmed: SteamAgent passes
                 // RDX=token, R8=accountName).
-                typedef int (*SetLoginTokenFn)(void* self, const char* token,
+                typedef int (WN_THISCALL *SetLoginTokenFn)(void* self, const char* token,
                                                const char* account);
                 SetLoginTokenFn setLoginToken = (SetLoginTokenFn)
                     iuser_vt[kVtUser_SetLoginToken / 8];
@@ -789,7 +840,7 @@ int main(int argc, char** argv) {
                 // LogOn (not a caller-supplied SteamID). Valve's
                 // CSteamID& GetSteamID(CSteamID&) fills the out-arg and
                 // returns a pointer to it.
-                typedef void* (*GetSteamIDFn)(void* self, void* outBuf);
+                typedef void* (WN_THISCALL *GetSteamIDFn)(void* self, void* outBuf);
                 GetSteamIDFn getSteamID = (GetSteamIDFn)
                     iuser_vt[kVtUser_GetSteamID / 8];
                 uint64_t outSid = 0;
@@ -810,7 +861,7 @@ int main(int argc, char** argv) {
                 // (immediate reject visible here); the final result still
                 // arrives via the SteamServersConnected/ConnectFailure
                 // callbacks drained in STEP 4.
-                typedef int (*LogOnFn)(void* self, uint64_t steamID);
+                typedef int (WN_THISCALL *LogOnFn)(void* self, uint64_t steamID);
                 LogOnFn logOn = (LogOnFn) iuser_vt[kVtUser_LogOn / 8];
                 int logonRc = logOn(iuser, logonSid);
                 log_line("[wn-launcher] LogOn(%llu) -> EResult=%d "
@@ -843,7 +894,11 @@ int main(int argc, char** argv) {
     int  connFailEResult = 0;
     int  polls = 0;
     if (bLoggedOn) {
-        const int kMaxPolls = 200;  // 200 * 100ms = 20s
+        // 60s. The i386 steamclient under FEX often fails its WebSocket CM
+        // attempts first and only connects after falling back to a UDP CM
+        // ~25s in, so a 20s window timed out just before logon completed.
+        // Hard auth failures (EResult 5/15/84) still bail early below.
+        const int kMaxPolls = 600;  // 600 * 100ms = 60s
         char cbBuf[64] = {0};
         for (; polls < kMaxPolls; ++polls) {
             if (bGetCallback && freeLastCallback) {
@@ -898,59 +953,183 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // STEP 4.5: Refresh the game's app-info so steamclient has its launch
-    // config (which exe to run) before LaunchApp. Mirrors GameHub's
-    // SteamCore::RefreshApps. Without this, LaunchApp is accepted (returns
-    // a valid HSteamAPICall) but steamclient has no launch config for the
-    // app and never spawns the game.
+    // STEP 4.4: Request fresh PICS appinfo for the game so steamclient has
+    // the launch config loaded before LaunchApp. Without this, LaunchApp
+    // accepts the job (returns a valid HSteamAPICall) but the CGameLauncher
+    // job aborts with EAppUpdateError=9 (MissingConfig) and silently never
+    // spawns the game — empirically observed on MHST (appId 2356560)
+    // via the LaunchAppResult_t poll added in STEP 5. Mirrors GameHub
+    // SteamCore::RefreshApps.
     // ------------------------------------------------------------------
     if (loggedOn && engine && appId != 0) {
         void** engine_vt = *(void***) engine;
-        typedef void* (*GetIClientAppsFn)(void* self, int hUser, int hPipe);
+        typedef void* (WN_THISCALL *GetIClientAppsFn)(void* self, int hUser, int hPipe);
         GetIClientAppsFn getApps = (GetIClientAppsFn)
             engine_vt[kVtEngine_GetIClientApps / 8];
         void* iApps = getApps(engine, hUser, pipe);
         log_line("[wn-launcher] IClientEngine.GetIClientApps -> %p", iApps);
         if (iApps) {
             void** apps_vt = *(void***) iApps;
-            typedef bool (*RequestAppInfoUpdateFn)(void* self,
-                                                   uint32_t* appIds, int count);
-            RequestAppInfoUpdateFn reqInfo = (RequestAppInfoUpdateFn)
-                apps_vt[kVtApps_RequestAppInfoUpdate / 8];
-            uint32_t appIds[1] = { appId };
-            bool reqRc = reqInfo(iApps, appIds, 1);
-            log_line("[wn-launcher] RequestAppInfoUpdate(appId=%u) -> %d",
-                     appId, reqRc ? 1 : 0);
-            // Wait for AppInfoUpdateComplete_t (callback 1003), up to 10s,
-            // draining the pipe meanwhile.
-            bool appInfoDone = false;
-            for (int i = 0; i < 100 && !appInfoDone; ++i) {
-                if (bGetCallback && freeLastCallback) {
-                    char cb[64];
-                    while (bGetCallback(pipe, cb)) {
-                        if (*(int*)(cb + 4) == 1003) appInfoDone = true;
-                        freeLastCallback(pipe);
+            void* reqP = apps_vt[kVtApps_RequestAppInfoUpdate / 8];
+            if (!is_exec_ptr(reqP)) {
+                log_line("[wn-launcher] RequestAppInfoUpdate slot not executable — "
+                         "skipping appinfo refresh");
+            } else {
+                typedef bool (WN_THISCALL *RequestAppInfoUpdateFn)(void* self,
+                                                       uint32_t* appIds, int count);
+                RequestAppInfoUpdateFn reqInfo = (RequestAppInfoUpdateFn) reqP;
+                uint32_t appIds[1] = { appId };
+                bool reqRc = reqInfo(iApps, appIds, 1);
+                log_line("[wn-launcher] RequestAppInfoUpdate(appId=%u) -> %d",
+                         appId, reqRc ? 1 : 0);
+                // Wait for AppInfoUpdateComplete_t (callback id 1003) up
+                // to 10s, draining other callbacks meanwhile.
+                bool appInfoDone = false;
+                int  waited = 0;
+                for (int i = 0; i < 100 && !appInfoDone; ++i) {
+                    if (bGetCallback && freeLastCallback) {
+                        char cb[64];
+                        while (bGetCallback(pipe, cb)) {
+                            if (*(int*)(cb + 4) == 1003) appInfoDone = true;
+                            freeLastCallback(pipe);
+                        }
                     }
+                    if (!appInfoDone) { Sleep(100); waited += 100; }
                 }
-                if (!appInfoDone) Sleep(100);
+                log_line("[wn-launcher] AppInfoUpdateComplete_t %s after %dms",
+                         appInfoDone ? "received" : "NOT received", waited);
             }
-            log_line("[wn-launcher] AppInfoUpdateComplete_t %s",
-                     appInfoDone ? "received" : "NOT received within 10s");
         }
     }
 
     // ------------------------------------------------------------------
-    // STEP 4.6: Steam Cloud — pull saves DOWN before launch. Drives a
-    // sync through Valve's real steamclient64.dll and blocks until it
-    // finishes, exactly as GameHub's SteamAgent waits for the Steam Cloud
-    // download before starting the game. Without this the game can start
-    // before its cloud saves land locally and clobber them with a fresh
-    // profile. Skipped when not logged on (no cloud session).
+    // STEP 4.5: Make steamclient treat the game as FullyInstalled before
+    // LaunchApp — without it LaunchApp's async job aborts and the game is
+    // never spawned. Mirrors GameHub SteamAgent's install-state gate
+    // (FUN_14005a850).
     // ------------------------------------------------------------------
     if (loggedOn && engine && appId != 0) {
-        cloud_sync(engine, hUser, pipe, appId, /*isDownload=*/true,
-                   bGetCallback, freeLastCallback);
+        void** engine_vt = *(void***) engine;
+        typedef void* (WN_THISCALL *GetIfaceFn)(void* self, int hUser, int hPipe);
+        void* appMgr = ((GetIfaceFn) engine_vt[kVtEngine_GetIClientAppManager / 8])
+                           (engine, hUser, pipe);
+        log_line("[wn-launcher] readiness: IClientAppManager=%p", appMgr);
+
+        // Refresh library/appinfo so the staged appmanifest_<id>.acf is
+        // parsed into steamclient's in-memory app-state table, then poll
+        // GetAppInstallState until k_EAppStateFullyInstalled (bit 2) is set.
+        if (appMgr) {
+            void** am_vt = *(void***) appMgr;
+            void* refreshP = am_vt[kVtAppMgr_RefreshAppInfo / 8];
+            void* stateP   = am_vt[kVtAppMgr_GetAppInstallState / 8];
+            if (is_exec_ptr(refreshP)) {
+                typedef void (WN_THISCALL *RefreshAppInfoFn)(void* self);
+                ((RefreshAppInfoFn) refreshP)(appMgr);
+                log_line("[wn-launcher] RefreshAppInfo() called");
+            }
+            if (is_exec_ptr(stateP)) {
+                typedef int (WN_THISCALL *GetAppInstallStateFn)(void* self, uint32_t app);
+                GetAppInstallStateFn getInstallState = (GetAppInstallStateFn) stateP;
+                int st = 0;
+                for (int i = 0; i < 100; ++i) {
+                    st = getInstallState(appMgr, appId);
+                    if (st & 4) break;
+                    if (bGetCallback && freeLastCallback) {
+                        char cb[64];
+                        while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
+                    }
+                    Sleep(100);
+                }
+                log_line("[wn-launcher] GetAppInstallState(appId=%u) = 0x%x (%s)",
+                         appId, st,
+                         (st & 4) ? "FullyInstalled"
+                                  : "NOT installed — LaunchApp may no-op");
+            }
+        }
     }
+
+    // ------------------------------------------------------------------
+    // STEP 4.6: Run the game's Steam install script (installscript.vdf)
+    // before launch — installs VC++ redistributables / other prerequisites
+    // and applies registry setup, mirroring GameHub's SteamAgent
+    // (FUN_14005a850). RunInstallScript starts steamclient's install-script
+    // engine; poll IsInstallScriptRunning until it returns 0. Without this a
+    // prerequisite-dependent game starts and dies on a missing runtime.
+    // ------------------------------------------------------------------
+    if (loggedOn && engine && appId != 0) {
+        void** engine_vt = *(void***) engine;
+        typedef void* (WN_THISCALL *GetIClientUserFn)(void* self, int hUser, int hPipe);
+        GetIClientUserFn getUser = (GetIClientUserFn)
+            engine_vt[kVtEngine_GetIClientUser / 8];
+        void* iUser = getUser(engine, hUser, pipe);
+        log_line("[wn-launcher] install script: IClientUser -> %p", iUser);
+        if (iUser) {
+            void** user_vt = *(void***) iUser;
+            void* runP   = user_vt[kVtUser_RunInstallScript / 8];
+            void* progP  = user_vt[kVtUser_IsInstallScriptRunning / 8];
+            void* stateP = user_vt[kVtUser_GetInstallScriptState / 8];
+            if (!is_exec_ptr(runP) || !is_exec_ptr(progP) || !is_exec_ptr(stateP)) {
+                log_line("[wn-launcher] install script: a vtable slot is not "
+                         "executable — skipping (offsets may not match this "
+                         "steamclient build)");
+            } else {
+                typedef bool (WN_THISCALL *RunInstallScriptFn)(void* self,
+                                               uint32_t app, int flags);
+                typedef int  (WN_THISCALL *IsInstallScriptRunningFn)(void* self);
+                typedef bool (WN_THISCALL *GetInstallScriptStateFn)(void* self,
+                                               char* buf, uint32_t cb,
+                                               int* outA, int* outB);
+                bool started = ((RunInstallScriptFn) runP)(iUser, appId, 0);
+                log_line("[wn-launcher] RunInstallScript(appId=%u) -> %d",
+                         appId, started ? 1 : 0);
+                if (started) {
+                    IsInstallScriptRunningFn isRunning =
+                        (IsInstallScriptRunningFn) progP;
+                    GetInstallScriptStateFn getState =
+                        (GetInstallScriptStateFn) stateP;
+                    const int kMaxWaitMs = 180000;
+                    int waited = 0, lastStep = -1;
+                    while (waited < kMaxWaitMs) {
+                        if (isRunning(iUser) == 0) break;
+                        char buf[1024];
+                        int stepNo = 0, stepCount = 0;
+                        if (getState(iUser, buf, sizeof(buf), &stepNo, &stepCount)
+                                && stepNo != lastStep) {
+                            lastStep = stepNo;
+                            log_line("[wn-launcher] install script: step %d/%d",
+                                     stepNo, stepCount);
+                        }
+                        if (bGetCallback && freeLastCallback) {
+                            char cb[64];
+                            while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
+                        }
+                        Sleep(200);
+                        waited += 200;
+                    }
+                    log_line("[wn-launcher] install script finished in %dms (%s)",
+                             waited, waited >= kMaxWaitMs ? "TIMEOUT" : "complete");
+                }
+            }
+        }
+    }
+
+    // Cloud sync: driven entirely Android-side by wn-steam-client; no
+    // in-Wine step here.
+
+    // ------------------------------------------------------------------
+    // STEP 4.8: Bring up steamservice.exe as the IPC backend so
+    // IClientAppManager::LaunchApp's marshaled job has someone to drain
+    // the named-event queue. Without this, LaunchApp returns a valid
+    // HSteamAPICall but never spawns the game; the launcher falls through
+    // to the CreateProcess fallback below (which is fine for non-DRM
+    // games, but bypasses steamclient's CGameLauncher path that SteamStub
+    // DRM games need for in-process self-decryption).
+    //
+    // No-op if steamservice.exe is not staged in <Steam>/bin/. The
+    // CreateProcess fallback then carries the launch as before.
+    // ------------------------------------------------------------------
+    bool svcRunning = start_steam_client_service();
+    log_line("[wn-launcher] steamservice running: %d", svcRunning ? 1 : 0);
 
     // ------------------------------------------------------------------
     // STEP 5: Launch the game. Preferred path is Valve's own
@@ -985,7 +1164,7 @@ int main(int argc, char** argv) {
     bool launchedViaApp = false;
     if (engine && appId != 0) {
         void** engine_vt = *(void***) engine;
-        typedef void* (*GetIClientAppManagerFn)(void* self, int hUser, int hPipe);
+        typedef void* (WN_THISCALL *GetIClientAppManagerFn)(void* self, int hUser, int hPipe);
         GetIClientAppManagerFn getAppMgr = (GetIClientAppManagerFn)
             engine_vt[kVtEngine_GetIClientAppManager / 8];
         void* appMgr = getAppMgr(engine, hUser, pipe);
@@ -1000,7 +1179,7 @@ int main(int argc, char** argv) {
             //   arg3 uLaunchOption — 0 for a normal launch
             //   arg4 ELaunchSource — 300 (dash_applaunch)
             //   arg5 pszUserArgs   — "" when there are no launch options
-            typedef uint64_t (*LaunchAppFn)(void* self, void* pGameId,
+            typedef uint64_t (WN_THISCALL *LaunchAppFn)(void* self, void* pGameId,
                                             uint32_t uLaunchOption,
                                             uint32_t eLaunchSource,
                                             const char* pszUserArgs);
@@ -1011,26 +1190,120 @@ int main(int argc, char** argv) {
             log_line("[wn-launcher] IClientAppManager.LaunchApp(appId=%u) "
                      "-> HSteamAPICall=0x%llx", appId,
                      (unsigned long long) apiCall);
+
+            // Poll the LaunchAppResult_t to surface the EAppUpdateError
+            // that explains why the spawn silently doesn't happen. This is
+            // a diagnostic gate, not a control-flow one — we still
+            // continue to the process-watch loop below, then fall back to
+            // CreateProcess if no game process appears, but the logged
+            // error code tells us exactly which precondition LaunchApp
+            // bailed on. Mirrors GameHub SteamAgent's FUN_14005d5c0.
             if (apiCall != 0) {
-                // LaunchApp is async — steamclient spawns the game. Wait
-                // for the process to appear (up to 25s), pumping callbacks.
-                for (int i = 0; i < 50 && !launchedViaApp; ++i) {
+                typedef void* (WN_THISCALL *GetIClientUtilsFn)(void* self, int hPipe);
+                GetIClientUtilsFn getUtils = (GetIClientUtilsFn)
+                    engine_vt[kVtEngine_GetIClientUtils / 8];
+                void* utils = getUtils(engine, pipe);
+                log_line("[wn-launcher] IClientEngine.GetIClientUtils -> %p", utils);
+                if (utils) {
+                    void** utils_vt = *(void***) utils;
+                    void* isCompletedP = utils_vt[kVtUtils_IsAPICallCompleted / 8];
+                    void* getResultP   = utils_vt[kVtUtils_GetAPICallResult / 8];
+                    void* getReasonP   = utils_vt[kVtUtils_GetAPICallFailureReason / 8];
+                    log_line("[wn-launcher] utils vt IsAPICallCompleted=%p "
+                             "GetAPICallFailureReason=%p GetAPICallResult=%p",
+                             isCompletedP, getReasonP, getResultP);
+                    if (is_exec_ptr(isCompletedP) && is_exec_ptr(getResultP)) {
+                        typedef bool (WN_THISCALL *IsAPICallCompletedFn)(void* self,
+                                                       uint64_t apiCall, bool* pbFailed);
+                        typedef int  (WN_THISCALL *GetFailureReasonFn)(void* self,
+                                                       uint64_t apiCall);
+                        typedef bool (WN_THISCALL *GetAPICallResultFn)(void* self,
+                                                       uint64_t apiCall, void* pCb,
+                                                       int cubCb, int iCbExpected,
+                                                       bool* pbFailed);
+                        IsAPICallCompletedFn isCompleted = (IsAPICallCompletedFn) isCompletedP;
+                        GetFailureReasonFn   getReason   = (GetFailureReasonFn) getReasonP;
+                        GetAPICallResultFn   getResult   = (GetAPICallResultFn) getResultP;
+
+                        const int kPollMaxMs = 10000;
+                        int  waited = 0;
+                        bool failed = false;
+                        bool completed = false;
+                        while (waited < kPollMaxMs) {
+                            failed = false;
+                            completed = isCompleted(utils, apiCall, &failed);
+                            if (completed) break;
+                            if (bGetCallback && freeLastCallback) {
+                                char cb[64];
+                                while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
+                            }
+                            Sleep(100);
+                            waited += 100;
+                        }
+                        if (!completed) {
+                            log_line("[wn-launcher] LaunchApp poll: TIMED OUT "
+                                     "after %dms — job still pending", waited);
+                        } else if (failed) {
+                            int reason = is_exec_ptr(getReasonP) ? getReason(utils, apiCall) : -99;
+                            log_line("[wn-launcher] LaunchApp poll: API CALL FAILED "
+                                     "after %dms, reason=%d "
+                                     "(-1=NoFailure 0=SteamGone 1=NetworkFailure "
+                                     "2=InvalidHandle 3=MismatchedCallback)",
+                                     waited, reason);
+                        } else {
+                            unsigned char buf[kLaunchAppResultSize];
+                            memset(buf, 0, sizeof(buf));
+                            bool resFailed = false;
+                            bool got = getResult(utils, apiCall, buf,
+                                                  kLaunchAppResultSize,
+                                                  kLaunchAppResultCallbackId,
+                                                  &resFailed);
+                            int eAppError = *(int*)(buf + kLaunchResultErrorOffset);
+                            log_line("[wn-launcher] LaunchApp poll: COMPLETED in %dms "
+                                     "got=%d resFailed=%d EAppUpdateError=%d "
+                                     "(0=NoError 1=Unspecified 2=Paused 3=Cancelled "
+                                     "4=Suspended 5=NoSubscription 6=NoConnection "
+                                     "7=Timeout 8=MissingKey 9=MissingConfig "
+                                     "0xE=AppLocked 0xF=OtherSessionPlaying "
+                                     "0x10=AlreadyRunning 0x21=33 0x23=35 0x2D=45)",
+                                     waited, got ? 1 : 0, resFailed ? 1 : 0, eAppError);
+                            // Hex dump first 32 bytes of the result struct so a
+                            // future RE pass can verify the field layout.
+                            char hex[3 * 32 + 1];
+                            int hp = 0;
+                            for (int i = 0; i < 32; ++i) {
+                                hp += snprintf(hex + hp, sizeof(hex) - hp, "%02x ", buf[i]);
+                            }
+                            log_line("[wn-launcher] LaunchApp result hex+0..32: %s", hex);
+                        }
+                    } else {
+                        log_line("[wn-launcher] LaunchApp poll: IClientUtils vtable "
+                                 "slots not executable — skipping poll");
+                    }
+                }
+            }
+
+            if (apiCall != 0) {
+                // LaunchApp queued the launch asynchronously. Wait up to 60s
+                // for the game process to appear, draining callbacks so
+                // steamclient's launch job advances; if it never shows, fall
+                // back to CreateProcess.
+                for (int i = 0; i < 120 && !launchedViaApp; ++i) {
                     if (count_process_by_name(exeName) > 0) {
                         launchedViaApp = true;
-                    } else {
-                        if (bGetCallback && freeLastCallback) {
-                            char cb[64];
-                            while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
-                        }
-                        Sleep(500);
+                        break;
                     }
+                    if (bGetCallback && freeLastCallback) {
+                        char cb[64];
+                        while (bGetCallback(pipe, cb)) freeLastCallback(pipe);
+                    }
+                    Sleep(500);
                 }
                 if (launchedViaApp)
                     log_line("[wn-launcher] LaunchApp: \"%s\" is running", exeName);
                 else
                     log_line("[wn-launcher] LaunchApp dispatched but \"%s\" never "
-                             "appeared in 25s — falling back to CreateProcess",
-                             exeName);
+                             "appeared — falling back to CreateProcess", exeName);
             } else {
                 log_line("[wn-launcher] LaunchApp returned a null call handle "
                          "— falling back to CreateProcess");
@@ -1053,11 +1326,7 @@ int main(int argc, char** argv) {
             absent = (count_process_by_name(exeName) != 0) ? 0 : absent + 1;
         }
         log_line("[wn-launcher] game \"%s\" exited (LaunchApp path)", exeName);
-        // STEP 6: Steam Cloud — push saves UP now the game has exited.
-        if (loggedOn && engine && appId != 0) {
-            cloud_sync(engine, hUser, pipe, appId, /*isDownload=*/false,
-                       bGetCallback, freeLastCallback);
-        }
+        // Cloud upload at exit is driven Android-side by SteamExitCloudSync.
         log_line("[wn-launcher] Steam Launcher shutdown");
         return 0;
     }
@@ -1089,11 +1358,7 @@ int main(int argc, char** argv) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    // STEP 6: Steam Cloud — push saves UP now the game has exited.
-    if (loggedOn && engine && appId != 0) {
-        cloud_sync(engine, hUser, pipe, appId, /*isDownload=*/false,
-                   bGetCallback, freeLastCallback);
-    }
+    // Cloud upload at exit is driven Android-side by SteamExitCloudSync.
 
     log_line("[wn-launcher] Steam Launcher shutdown");
     return 0;

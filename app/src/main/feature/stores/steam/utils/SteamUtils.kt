@@ -1141,8 +1141,13 @@ object SteamUtils {
                 SteamService.userSteamId?.convertToUInt64()?.toString()
                     ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.toString()
                     ?: "0"
+            // Same fallback order as SteamCloudSyncHelper.steamPrefixResolver:
+            // derive from steamUserSteamId64 ahead of a possibly-stale
+            // steamUserAccountId so gbe_fork's userdata/<accountId>/ matches
+            // the path the Android cloud manager writes to.
             val accountId =
                 SteamService.userSteamId?.accountID?.toLong()
+                    ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
                     ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
                     ?: 0L
 

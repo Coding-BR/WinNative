@@ -6443,8 +6443,10 @@ class SteamService : Service() {
                     "beginLaunchAppBlocking must not be called on the main thread"
                 }
                 var completionSent = false
+                // Consistent accountId chain — see SteamCloudSyncHelper.steamPrefixResolver.
                 val accountId =
                     userSteamId?.accountID?.toLong()
+                        ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
                         ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
                         ?: 0L
                 val prefixToPath: (String) -> String = { prefix ->
@@ -6486,8 +6488,10 @@ class SteamService : Service() {
         ): Boolean {
             return withContext(Dispatchers.IO) {
                 try {
+                    // Consistent accountId chain — see SteamCloudSyncHelper.steamPrefixResolver.
                     val accountId =
                         userSteamId?.accountID?.toLong()
+                            ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
                             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
                             ?: 0L
                     val prefixToPath: (String) -> String = { prefix ->
@@ -6527,8 +6531,31 @@ class SteamService : Service() {
             appId: Int,
             callback: CloudSyncCallback,
         ) {
+            // Defensive container activation. PathType.toAbsPath resolves
+            // through the per-session home/xuser symlink (flipped by
+            // ContainerManager.activateContainer to the active container's
+            // xuser-N), and exit-time is the one cloud-op codepath that
+            // didn't enforce activation — SteamCloudSyncHelper
+            // .activateContainerForCloudOp does the same on the download
+            // side. If anything between the game exit and this upload
+            // swaps the symlink target, we'd otherwise upload from the
+            // wrong container's wineprefix. Cheap & idempotent.
+            runCatching {
+                com.winlator.cmod.feature.stores.steam.utils.ContainerUtils
+                    .getUsableContainerOrNull(context, appId.toString())
+                    ?.let { com.winlator.cmod.runtime.container.ContainerManager(context).activateContainer(it) }
+            }.onFailure { Timber.w(it, "syncCloudOnExit: container activation failed for app=%d", appId) }
+
+            // Same fallback order as SteamCloudSyncHelper.steamPrefixResolver /
+            // SteamUtils.writeCompleteSettingsDir — derive from steamUserSteamId64
+            // BEFORE steamUserAccountId so the exit upload reads from the SAME
+            // userdata/<accountId>/<appId>/ subdir the launch-time download
+            // wrote into and the in-Wine real Steam used at play time. A stale
+            // steamUserAccountId would otherwise point the upload at a
+            // different folder than the game just wrote to.
             val accountId =
                 userSteamId?.accountID?.toLong()
+                    ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
                     ?: PrefManager.steamUserAccountId.takeIf { it != 0 }?.toLong()
                     ?: 0L
             val prefixToPath: (String) -> String = { prefix ->
