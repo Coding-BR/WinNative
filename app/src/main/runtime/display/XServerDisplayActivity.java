@@ -5500,6 +5500,27 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                             "Steam Launcher: WINEDLLOVERRIDES set to '"
                             + envVars.get("WINEDLLOVERRIDES")
                             + "' to disable lsteamclient export-hijack");
+                    // Bypass Proton's ntdll lsteamclient hooks. This env var is
+                    // read inside ntdll's PE loader (Wine source
+                    // dlls/ntdll/loader.c: use_lsteamclient @1151,
+                    // build_module @2376, import_dll @1201) and turns OFF two
+                    // things that otherwise corrupt Valve's real DllMain on
+                    // Proton 10+ (Wine 10+ loader):
+                    //   (1) force-loading lsteamclient.dll + installing
+                    //       export trampolines (sets LDR_DONT_CALL_DLLMAIN
+                    //       so Valve's DllMain never runs);
+                    //   (2) silently rewriting steamclient64.dll's
+                    //       tier0_s64 / vstdlib_s64 IAT imports to ntdll.dll.
+                    // Our WINEDLLOVERRIDES=lsteamclient= above blocks the
+                    // file-load half of (1) but leaves (2) wired up, so on
+                    // Proton 10/11 Valve's DllMain AVs the moment it calls
+                    // a tier0 function -> GLE=998 ERROR_NOACCESS, DATAFILE
+                    // smoke-test OK. GameHub sets this unconditionally
+                    // (bg5.smali:1667).
+                    envVars.put("PROTON_DISABLE_LSTEAMCLIENT", "1");
+                    Log.i("XServerDisplayActivity",
+                            "Steam Launcher: PROTON_DISABLE_LSTEAMCLIENT=1 "
+                            + "(bypass ntdll lsteamclient hooks for Proton 10+)");
                     String planWUser = com.winlator.cmod.feature.stores.steam.utils
                             .PrefManager.INSTANCE.getUsername();
                     String planWSid  = String.valueOf(com.winlator.cmod.feature.stores.steam.utils

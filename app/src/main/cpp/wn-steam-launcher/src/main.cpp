@@ -421,6 +421,116 @@ static int count_process_by_name(const char* exeName) {
 // __try/__except, so this VirtualQuery probe is our guard against an offset
 // shift in a future steamclient build (a wrong slot reads a data/null pointer;
 // calling it would crash the launcher and abort the game launch).
+// Top-level unhandled-exception filter — logs the AV that Wine's ntdll
+// catches and turns into the opaque GLE=998. Note: VEH (AddVectored
+// ExceptionHandler) was tried first but its install call hung the launcher
+// on Proton 10 — Wine 10's ntdll appears to have a VEH bug. SEH /
+// UnhandledExceptionFilter doesn't go through that code path.
+// Dump every currently-loaded module's base + size + path. Called before
+// LoadLibrary so the UEF can map the fault IP to a module address range.
+static void dump_loaded_modules(const char* when) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                                           GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        log_line("[wn-launcher] modules(%s): CreateToolhelp32Snapshot failed GLE=%lu",
+                 when, GetLastError());
+        return;
+    }
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
+    int n = 0;
+    if (Module32First(snap, &me)) {
+        do {
+            log_line("[wn-launcher] modules(%s): base=%p size=0x%lx name=%s path=%s",
+                     when, me.modBaseAddr, (unsigned long) me.modBaseSize,
+                     me.szModule, me.szExePath);
+            n++;
+        } while (Module32Next(snap, &me));
+    }
+    log_line("[wn-launcher] modules(%s): total=%d", when, n);
+    CloseHandle(snap);
+}
+
+static LONG WINAPI launcher_unhandled_filter(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord) return EXCEPTION_EXECUTE_HANDLER;
+    const EXCEPTION_RECORD* er = info->ExceptionRecord;
+    void* ip = er->ExceptionAddress;
+
+    char modName[MAX_PATH] = {0};
+    HMODULE faultMod = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)ip, &faultMod)) {
+        GetModuleFileNameA(faultMod, modName, sizeof(modName));
+    }
+
+    char bytes[3 * 16 + 1] = {0};
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(ip, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+            const unsigned char* p = (const unsigned char*)ip;
+            int hp = 0;
+            for (int i = 0; i < 16 && hp + 3 < (int)sizeof(bytes); ++i) {
+                hp += snprintf(bytes + hp, sizeof(bytes) - hp, "%02x ", p[i]);
+            }
+        }
+    }
+
+    log_line("[wn-launcher] UEF: tid=%lu pid=%lu exc=0x%lx at %p mod='%s' bytes=%s",
+             (unsigned long) GetCurrentThreadId(),
+             (unsigned long) GetCurrentProcessId(),
+             er->ExceptionCode, ip, modName[0] ? modName : "(unknown)", bytes);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const char* op = (er->ExceptionInformation[0] == 0) ? "read"
+                       : (er->ExceptionInformation[0] == 1) ? "write"
+                       : (er->ExceptionInformation[0] == 8) ? "DEP" : "?";
+        log_line("[wn-launcher] UEF: AV %s fault_addr=0x%llx",
+                 op, (unsigned long long) er->ExceptionInformation[1]);
+    }
+
+    // Dump page info around the fault IP — explains why DEP fired.
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(ip, &mbi, sizeof(mbi))) {
+            log_line("[wn-launcher] UEF: page base=%p size=0x%llx state=0x%lx "
+                     "protect=0x%lx alloc_protect=0x%lx type=0x%lx",
+                     mbi.BaseAddress, (unsigned long long) mbi.RegionSize,
+                     mbi.State, mbi.Protect, mbi.AllocationProtect, mbi.Type);
+        }
+    }
+
+    // Context register dump (Rax-R15 + Rip + Rsp) — useful to spot
+    // which register held the bad function pointer just before the call.
+    if (info->ContextRecord) {
+        const CONTEXT* c = info->ContextRecord;
+        log_line("[wn-launcher] UEF: ctx Rip=%llx Rsp=%llx Rbp=%llx",
+                 (unsigned long long) c->Rip,
+                 (unsigned long long) c->Rsp,
+                 (unsigned long long) c->Rbp);
+        log_line("[wn-launcher] UEF: ctx Rax=%llx Rcx=%llx Rdx=%llx Rbx=%llx",
+                 (unsigned long long) c->Rax, (unsigned long long) c->Rcx,
+                 (unsigned long long) c->Rdx, (unsigned long long) c->Rbx);
+        log_line("[wn-launcher] UEF: ctx Rsi=%llx Rdi=%llx R8=%llx R9=%llx",
+                 (unsigned long long) c->Rsi, (unsigned long long) c->Rdi,
+                 (unsigned long long) c->R8,  (unsigned long long) c->R9);
+        // First 8 stack qwords — return-address chain hints.
+        const uint64_t* sp = (const uint64_t*) c->Rsp;
+        MEMORY_BASIC_INFORMATION smbi;
+        if (sp && VirtualQuery((LPCVOID) sp, &smbi, sizeof(smbi))
+            && smbi.State == MEM_COMMIT) {
+            char chain[256]; int p = 0;
+            for (int i = 0; i < 8; ++i) {
+                p += snprintf(chain + p, sizeof(chain) - p, "%llx ",
+                              (unsigned long long) sp[i]);
+            }
+            log_line("[wn-launcher] UEF: stack[0..7]=%s", chain);
+        }
+    }
+
+    dump_loaded_modules("UEF");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // Install (idempotent) and start the "Steam Client Service" backed by
 // steamservice.exe so steamclient64.dll's IPC queue gets a consumer.
 // Without this, IClientAppManager::LaunchApp marshals the call into a
@@ -545,8 +655,9 @@ int main(int argc, char** argv) {
     // Truncate the log file at process start so each launch's trace is
     // self-contained.
     { FILE* lf = fopen("C:\\wn-launcher.log", "w"); if (lf) fclose(lf); }
-    log_line("[wn-launcher] Steam Launcher in-process Steam launcher starting (pid=%lu)",
-             (unsigned long) GetCurrentProcessId());
+    log_line("[wn-launcher] Steam Launcher in-process Steam launcher starting (pid=%lu tid=%lu)",
+             (unsigned long) GetCurrentProcessId(),
+             (unsigned long) GetCurrentThreadId());
 
     if (argc < 2) {
         log_line("[wn-launcher] FATAL: missing game exe argv[1]");
@@ -589,6 +700,32 @@ int main(int argc, char** argv) {
                  (sslCert && *sslCert) ? sslCert : "(unset)");
     }
 
+    // Env-propagation probe: log a handful of Proton/Wine env vars that
+    // we expect to inherit from the spawner so we can tell whether the
+    // env layer made it through wine -> winhandler -> steam.exe. If
+    // PROTON_DISABLE_LSTEAMCLIENT is "1" here but ntdll still prints no
+    // "lsteamclient disabled.", the gate is reading from a different
+    // source than libc getenv.
+    {
+        const char* probes[] = {
+            "PROTON_DISABLE_LSTEAMCLIENT",
+            "WINEDLLOVERRIDES",
+            "WINEDEBUG",
+            "WINEESYNC",
+            "WINENTSYNC",
+            "PROTON_USE_WOW64",
+        };
+        for (size_t i = 0; i < sizeof(probes)/sizeof(probes[0]); ++i) {
+            const char* libc = getenv(probes[i]);
+            char winv[256] = {0};
+            DWORD wlen = GetEnvironmentVariableA(probes[i], winv, sizeof(winv));
+            log_line("[wn-launcher] env probe: %-30s libc=%-10s win32=%s",
+                     probes[i],
+                     (libc && *libc) ? libc : "(unset)",
+                     (wlen > 0 && wlen < sizeof(winv)) ? winv : "(unset)");
+        }
+    }
+
     // ------------------------------------------------------------------
     // STEP 1: LoadLibrary Valve's real steamclient64.dll from the Steam
     // dir, by FULL ABSOLUTE PATH so Wine's DllOverrides (which redirect a
@@ -608,10 +745,17 @@ int main(int argc, char** argv) {
         // siblings by absolute path. Every preload is best-effort — a
         // missing optional DLL just logs and continues.
         struct Preload { const char* name; bool fullPath; };
+        // tier0_s64.dll and vstdlib_s64.dll INTENTIONALLY DROPPED from
+        // preload on Proton 10+. Their DllMain spawns a worker thread that
+        // later exits and trips Wine 10's stricter RtlProcessFlsData over
+        // a stale FLS callback (some other DLL's bad pointer; we saw a DEP
+        // AV at 0x7ffc90ae08 = unmapped). steamclient64.dll will pull both
+        // in via its import table when we LoadLibrary it; SetDllDirectory
+        // (steamDir) above gives the search path. CRT preloads stay — they
+        // never spawn a worker.
         const Preload preloads[] = {
             { "msvcr120.dll", false }, { "msvcp120.dll", false },
             { "vcruntime140.dll", false }, { "msvcp140.dll", false },
-            { "tier0_s64.dll", true }, { "vstdlib_s64.dll", true },
             { "video64.dll", true }, { "SteamUI.dll", true },
         };
         for (const Preload& p : preloads) {
@@ -631,6 +775,12 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    log_line("[wn-launcher] preloads done; installing unhandled-exception filter");
+    LPTOP_LEVEL_EXCEPTION_FILTER prevFilter =
+        SetUnhandledExceptionFilter(launcher_unhandled_filter);
+    log_line("[wn-launcher] UEF installed (prev=%p)", prevFilter);
+    dump_loaded_modules("pre-LoadLibrary");
 
     char steamclientPath[MAX_PATH];
     snprintf(steamclientPath, sizeof(steamclientPath),
