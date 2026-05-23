@@ -70,13 +70,13 @@ public class Container {
     private String execArgs = "";
     private boolean launchRealSteam;
     private boolean launchBionicSteam;
-    private boolean useColdClient = true;
+    private boolean useColdClient = false;
     private String steamType = "normal";
     private boolean allowSteamUpdates;
     private boolean needsUnpacking = true;
     private boolean forceDlc = false;
     private boolean steamOfflineMode = false;
-    private boolean unpackFiles = true;
+    private boolean unpackFiles = false;
     private boolean runtimePatcher = false;
 
     public static final String STEAM_TYPE_NORMAL = "normal";

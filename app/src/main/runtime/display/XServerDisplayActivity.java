@@ -2943,8 +2943,13 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             return;
         }
 
-        // Goldberg path only — Steam Launcher exit sync runs in
-        // syncStoreCloudOnExit, ahead of the Android-side cloud gate.
+        // Single Steam upload path — covers every Steam launch mode
+        // (Steam Launcher, ColdClient, Bionic, Goldberg, Real Steam).
+        // The in-Wine launcher (steam.exe / wn-steam-launcher.exe) does
+        // NOT do its own cloud sync — see wn-steam-launcher/src/main.cpp
+        // lines 645-648 + 1479 + 1511; everything lives here.
+        // SteamAutoCloud.syncUserFiles diffs local against the cloud
+        // baseline, so a no-op exit (nothing changed) does not upload.
         runExitUploadWithRetries(
                 "Steam cloud sync for appId=" + appId,
                 "Cloud Sync Uploading...",
