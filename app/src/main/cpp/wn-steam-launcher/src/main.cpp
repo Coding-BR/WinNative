@@ -652,8 +652,14 @@ static bool is_exec_ptr(void* p) {
 int main(int argc, char** argv) {
     setbuf(stderr, NULL);
     setbuf(stdout, NULL);
-    // Truncate the log file at process start so each launch's trace is
-    // self-contained.
+    // No console-hide step: this binary is linked --subsystem,windows
+    // (see build.sh), so Wine never attaches a console and never maps
+    // a visible console window. Earlier attempts to hide a console
+    // attached by --subsystem,console raced the X server and let the
+    // window briefly map before SW_HIDE took effect — which then
+    // satisfied isApplicationWindow() and prematurely closed the
+    // Android-side preloader. Truncate the log file at process start
+    // so each launch's trace is self-contained.
     { FILE* lf = fopen("C:\\wn-launcher.log", "w"); if (lf) fclose(lf); }
     log_line("[wn-launcher] Steam Launcher in-process Steam launcher starting (pid=%lu tid=%lu)",
              (unsigned long) GetCurrentProcessId(),

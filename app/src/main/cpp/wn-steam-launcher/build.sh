@@ -28,11 +28,19 @@ OUT_DIR_REL="../../assets/wnsteam/bionic"
 OUT_FILE="$OUT_DIR_REL/steam.exe"
 
 # Static link the runtime so we don't drag MinGW DLLs into the wine prefix.
-# -Wl,--subsystem,console : keep it a console subsystem so stderr/stdout reach
-# Wine's GuestProgramLauncher pipe → host logcat.
+# -Wl,--subsystem,windows : no console attached, so Wine doesn't pre-map a
+# visible console X11 window during process startup. A prior `console`
+# subsystem build with `ShowWindow(GetConsoleWindow(), SW_HIDE)` raced
+# the X server — the console window briefly mapped, satisfied
+# Window.isApplicationWindow() in XServerDisplayActivity, and closed the
+# preloader prematurely (cutting off mid-launch phase updates). With
+# `windows` subsystem there's no console to hide. stderr/stdout go
+# nowhere, which we don't need: log_line() writes directly to
+# C:\wn-launcher.log via fopen("a"), which is what
+# WnLauncherStatusTailer reads.
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
     -static -static-libgcc -static-libstdc++ \
-    -Wl,--subsystem,console \
+    -Wl,--subsystem,windows \
     -o "$OUT_FILE" \
     src/main.cpp \
     -ladvapi32 -lkernel32 -luser32

@@ -320,6 +320,18 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private String midiSoundFont = "";
     private String lc_all = "";
     PreloaderDialog preloaderDialog = null;
+    // Watches wn-launcher.log during Steam Launcher startup and feeds
+    // user-readable phase updates ("Signing in to Steam…", "Launching
+    // <game>…") into preloaderDialog. Replaces the static "Initializing"
+    // text. See WnLauncherStatusTailer.
+    private com.winlator.cmod.feature.stores.steam.wnsteam.WnLauncherStatusTailer wnLauncherStatusTailer = null;
+    // When true, the X-server's "first application window mapped" event
+    // does NOT dismiss the preloader. Used in Steam Launcher mode where
+    // intermediate wine_explorer / launcher windows would otherwise close
+    // the splash before the actual game launches. The tailer's
+    // onLaunchComplete callback dismisses instead.
+    private final java.util.concurrent.atomic.AtomicBoolean wnLauncherDrivesDismiss =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private Runnable configChangedCallback = null;
     private boolean isPaused = false;
     private boolean reusingSession = false;
@@ -1413,7 +1425,19 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                     } else {
                         xServerView.getRenderer().setCursorVisible(false);
                     }
-                    preloaderDialog.closeOnUiThread();
+                    // In Steam Launcher mode, intermediate launcher / wine
+                    // windows can satisfy isApplicationWindow() before the
+                    // actual game. Let the launcher-log tailer dismiss the
+                    // splash via its launch-complete callback so phase
+                    // updates keep flowing to the user until the game proc
+                    // actually starts.
+                    if (!wnLauncherDrivesDismiss.get()) {
+                        preloaderDialog.closeOnUiThread();
+                        if (wnLauncherStatusTailer != null) {
+                            wnLauncherStatusTailer.stop();
+                            wnLauncherStatusTailer = null;
+                        }
+                    }
                     winStarted[0] = true;
                     firstAppWindowAppeared.set(true);
                     cancelRealSteamWatchdog();
@@ -3135,6 +3159,10 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         activityDestroyed.set(true);
         if (preloaderDialog != null) {
             preloaderDialog.close();
+        }
+        if (wnLauncherStatusTailer != null) {
+            wnLauncherStatusTailer.stop();
+            wnLauncherStatusTailer = null;
         }
         if (multicastLock != null && multicastLock.isHeld()) {
             try {
@@ -5664,10 +5692,80 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
 
+        // Steam Launcher splash phase updates: tail wn-launcher.log and
+        // route key milestones into preloaderDialog. Starts before the
+        // launcher is spawned so we don't miss its first line. Stops
+        // when the game's first window maps (line ~1416) or on activity
+        // teardown. Only attached for Steam Launcher launches; other
+        // launch modes keep the existing preloader behavior.
+        if (com.winlator.cmod.feature.stores.steam.utils.PrefManager.INSTANCE.getWnPlanW()
+                && shortcut != null && "STEAM".equals(shortcut.getExtra("game_source"))) {
+            try {
+                java.io.File launcherLog = new java.io.File(
+                        container.getRootDir(), ".wine/drive_c/wn-launcher.log");
+                String gameName = shortcut != null && !shortcut.name.isEmpty()
+                        ? shortcut.name : "game";
+                if (wnLauncherStatusTailer != null) wnLauncherStatusTailer.stop();
+                wnLauncherStatusTailer = new com.winlator.cmod.feature.stores.steam.wnsteam
+                        .WnLauncherStatusTailer(
+                            launcherLog,
+                            gameName,
+                            200L,
+                            // Phase update: use setStepOnUiThread (not
+                            // showOnUiThread / showLaunchPreloader) so we
+                            // update ONLY the text on the existing splash —
+                            // no re-creation, no metadata clear. The original
+                            // launch splash created at line 1398 via
+                            // showLaunchPreloader populates the Steam badge
+                            // and game/container labels; we must not reset
+                            // them, or the user sees a flicker that looks
+                            // like "opens the container" followed by a
+                            // second, blank-metadata splash.
+                            (phaseText) -> {
+                                if (preloaderDialog != null) {
+                                    preloaderDialog.setStepOnUiThread(phaseText);
+                                }
+                                return kotlin.Unit.INSTANCE;
+                            },
+                            // Launch-complete: launcher confirmed the game exe
+                            // is running. Hold the "Launching <Game>…" phase
+                            // text on screen for 3 seconds so the user sees a
+                            // clear "we're handing off to the game" beat, then
+                            // dismiss. The game's first frame typically arrives
+                            // within that window, but the brief overlap is
+                            // intentional UX — better than a flash to wine
+                            // desktop / black screen before the game draws.
+                            () -> {
+                                if (preloaderDialog != null) {
+                                    preloaderDialog.closeWithDelay(3000L);
+                                }
+                                return kotlin.Unit.INSTANCE;
+                            });
+                wnLauncherStatusTailer.start();
+                // In Steam Launcher mode, suppress the X-server-side early
+                // preloader dismiss — the launcher's own intermediate windows
+                // would close the splash before phase updates finish. The
+                // tailer's onLaunchComplete (above) takes over the dismiss.
+                wnLauncherDrivesDismiss.set(true);
+                Log.i("XServerDisplayActivity",
+                        "Steam Launcher: status tailer attached to " + launcherLog.getPath());
+            } catch (Exception e) {
+                Log.w("XServerDisplayActivity",
+                        "Steam Launcher: failed to start status tailer: " + e.getMessage());
+            }
+        }
+
         // Pass final envVars to the launcher
         guestProgramLauncherComponent.setEnvVars(envVars);
         guestProgramLauncherComponent.setTerminationCallback((status) -> {
             Log.d("XServerDisplayActivity", "Guest process terminated with status: " + status);
+            // Steam Launcher status tailer: stop on guest termination (covers
+            // both the normal post-game-window stop and the abort-on-crash
+            // path where the game never gets to map a window).
+            if (wnLauncherStatusTailer != null) {
+                wnLauncherStatusTailer.stop();
+                wnLauncherStatusTailer = null;
+            }
 
             // Keep A:\Steam persistence for Android 16 testing
             // User expressly requested: "don't remove the A:\Steam\ Folder unless the next game has the toggle off to not move it."
