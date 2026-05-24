@@ -10,7 +10,10 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.MarqueeSpacing
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -508,6 +511,7 @@ private fun SectionLabel(
 // Component item card
 // ============================================================================
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ComponentItemCard(
     item: ComponentItem,
@@ -546,6 +550,9 @@ private fun ComponentItemCard(
             }
             Spacer(Modifier.width(13.dp))
             Column(modifier = Modifier.weight(1f)) {
+                // Marquee: TextOverflow.Ellipsis renders "..." until the text
+                // overflows, then basicMarquee scrolls it left to reveal the
+                // remainder, pauses 5 s, repeats. No-op for short labels.
                 Text(
                     text = item.verName,
                     color = TextPrimary,
@@ -553,6 +560,13 @@ private fun ComponentItemCard(
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.basicMarquee(
+                        iterations = Int.MAX_VALUE,
+                        initialDelayMillis = 5000,
+                        repeatDelayMillis = 5000,
+                        velocity = 25.dp,
+                        spacing = MarqueeSpacing(40.dp),
+                    ),
                 )
                 val sizeLabel = formatSizeLabel(item)
                 if (sizeLabel != null) {
@@ -566,6 +580,10 @@ private fun ComponentItemCard(
                 }
             }
             Spacer(Modifier.width(8.dp))
+            if (isSteamCompatible(item)) {
+                SteamCompatBadge()
+                Spacer(Modifier.width(8.dp))
+            }
             if (item.isInstalled) {
                 IconTapButton(
                     icon = Icons.Outlined.Delete,
@@ -615,6 +633,29 @@ private fun IconTapButton(
             contentDescription = null,
             tint = tint,
             modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
+private fun isSteamCompatible(item: ComponentItem): Boolean =
+    item.verName.contains("steam", ignoreCase = true) ||
+        item.key.contains("steam", ignoreCase = true)
+
+@Composable
+private fun SteamCompatBadge() {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(SuccessGreen.copy(alpha = 0.14f))
+            .border(1.dp, SuccessGreen.copy(alpha = 0.30f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Steam",
+            color = SuccessGreen,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
         )
     }
 }

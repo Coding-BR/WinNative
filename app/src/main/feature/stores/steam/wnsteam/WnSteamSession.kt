@@ -533,6 +533,31 @@ class WnSteamSession : AutoCloseable {
         val beginJson = nativeCloudBeginFileUpload(
             h, appId, filename, fileBytes.size, fileBytes.size, fileShaHex, timestamp, batchId,
         ) ?: return false
+        // Short-circuit: if Steam responds with blocks=[] it means our SHA
+        // already matches what's in the cloud (typically because Valve's
+        // real steamclient64.dll auto-uploaded this file mid-game while we
+        // were playing). There's nothing to PUT, and CommitFileUpload would
+        // return file_committed=false (server has nothing to commit FROM
+        // THIS request, even though the file IS in the cloud). Treating
+        // that as failure made the exit-sync DAO update get skipped, which
+        // surfaced as a phantom conflict on every relaunch. Returning true
+        // here is correct: the cloud already holds an identical copy.
+        try {
+            val blocks0 = org.json.JSONObject(beginJson).optJSONArray("blocks")
+            if (blocks0 == null || blocks0.length() == 0) {
+                android.util.Log.i(
+                    "WnSteamSession",
+                    "cloud upload short-circuit: blocks=0 for $filename — file already in cloud, treating as success"
+                )
+                // Still call Commit for protocol cleanliness (Steam expects
+                // every Begin to be paired with a Commit), but ignore its
+                // return value — the success signal is the empty blocks list.
+                nativeCloudCommitFileUpload(h, true, appId, fileShaHex, filename)
+                return true
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("WnSteamSession", "uploadCloudFile early-parse failed: $filename", e)
+        }
         var allOk = true
         try {
             val blocks = org.json.JSONObject(beginJson).optJSONArray("blocks")

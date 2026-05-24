@@ -6400,12 +6400,24 @@ class SteamService : Service() {
 
                                 if (steamInstance != null && appInfo != null) {
                                     progressWrapper("Checking Local Saves...", 0f)
+                                    // Exit semantics: always upload local. Without
+                                    // preferredSave=Local, syncUserFiles defaults to
+                                    // None — which converts the common "Valve's
+                                    // real steamclient64.dll auto-uploaded mid-game
+                                    // → cloud changeNumber bumped > our DAO" case
+                                    // into SyncResult.Conflict and skips the exit
+                                    // upload. User just played, their local IS the
+                                    // truth, so resolve in favor of local. Trade-off:
+                                    // same as Cold Client — second device's exit
+                                    // overwrites the first's progress if you play
+                                    // the same game on two devices simultaneously.
                                     val postSyncInfo =
                                         SteamAutoCloud
                                             .syncUserFiles(
                                                 appInfo = appInfo,
                                                 clientId = clientId,
                                                 steamInstance = steamInstance,
+                                                preferredSave = SaveLocation.Local,
                                                 parentScope = this@async,
                                                 prefixToPath = prefixToPath,
                                                 onProgress = progressWrapper,

@@ -792,20 +792,37 @@ object SteamAutoCloud {
                             } catch (_: Exception) {
                                 Files.move(tmpPath, actualFilePath, StandardCopyOption.REPLACE_EXISTING)
                             }
-                            // Preserve the cloud-side mtime — without this,
-                            // the next exit-sync's pathToUserFile baseline
-                            // captures "now" as the mtime, and a no-op
-                            // re-upload batch fires every time the game
-                            // exits even though nothing actually changed.
-                            // Cloud timestamps are unix seconds; convert
-                            // to FileTime in millis.
+                            // Preserve the cloud-side mtime UNCONDITIONALLY.
+                            // CloudFileInfo.timestamp is already in millis
+                            // (parseCloudFileChangeList scales the native
+                            // unix-seconds value at line 244).
+                            //
+                            // Why no `if (file.timestamp > 0)` guard: when
+                            // Steam's cloud returns time_stamp=0 for a file
+                            // (placeholder entries, certain delete-style
+                            // records, very old uploads that never had a
+                            // timestamp set), skipping the restore leaves
+                            // mtime at the atomic-write time (= "now"). On
+                            // the next launch, `localTimestamp` is `max()`
+                            // across all local mtimes, so even ONE such
+                            // drifty file makes the conflict UI report
+                            // "Local = current time" vs the cloud's real
+                            // time → false conflict on every re-launch
+                            // because the local timestamp keeps shifting
+                            // forward on each download.
+                            //
+                            // Setting mtime to epoch (1970-01-01) for
+                            // zero-timestamp files gives a stable sentinel
+                            // that doesn't drift and is visually
+                            // recognizable as "cloud-side timestamp was
+                            // unset". A prior bug here also multiplied
+                            // file.timestamp by 1000 and set mtimes to
+                            // year 58364 — fixed by this same hunk.
                             try {
-                                if (file.timestamp > 0) {
-                                    java.nio.file.Files.setLastModifiedTime(
-                                        actualFilePath,
-                                        java.nio.file.attribute.FileTime.fromMillis(
-                                            file.timestamp * 1000L))
-                                }
+                                val mtimeMs = if (file.timestamp > 0) file.timestamp else 0L
+                                java.nio.file.Files.setLastModifiedTime(
+                                    actualFilePath,
+                                    java.nio.file.attribute.FileTime.fromMillis(mtimeMs))
                             } catch (e: Exception) {
                                 Timber.d(e, "cloud download: failed to set mtime for ${file.filename}")
                             }
