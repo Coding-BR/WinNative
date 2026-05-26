@@ -710,9 +710,20 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         super.onCreate(savedInstanceState);
         AppUtils.hideSystemUI(this);
         AppUtils.keepScreenOn(this);
-        // Draw above the keyguard so the X server / Wine renderer keeps a usable
-        // Surface during boot (otherwise the lockscreen hides it and the
-        // WinHandler watcher tears down before the game draws its first frame).
+        // Allow the X server / Wine renderer to attach a Surface while the
+        // device is on the secure keyguard. Without this, the lockscreen
+        // hides our Surface, the renderer reports "no windows remain", and
+        // the WinHandler watcher exits the session before the game can
+        // even draw its first frame — observed booting Among Us at 17:07
+        // where Among Us.exe loaded all Wine DLLs + lsteamclient.dll, then
+        // the session torn-down at "Hiding hud as no renderer windows
+        // remain" because the lockscreen was on top. Per Android SDK:
+        // setShowWhenLocked(true) draws the Activity above the keyguard;
+        // setTurnScreenOn(true) wakes the display when the Activity comes
+        // to front. The keyguard still gates user input (taps reach the
+        // keyguard not the game) but the renderer keeps a viewport so the
+        // game proceeds with its boot — which is what we need for adb-
+        // driven test runs where the developer's screen is locked.
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true);
             setTurnScreenOn(true);
@@ -722,8 +733,16 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 | android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
                 | android.view.WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
         }
-        // Some OEM skins (observed on OPLUS) leave mKeyguardOccluded=false even
-        // with setShowWhenLocked; ask the KeyguardManager to actually remove it.
+        // setShowWhenLocked alone leaves mKeyguardOccluded=false on some
+        // OEM skins (observed on OPLUS — keyguard rendered above our
+        // SurfaceView, X server gets no usable buffer, Wine renderer
+        // tears down within ~16s). requestDismissKeyguard asks the
+        // KeyguardManager to actually remove the keyguard for this
+        // activity's lifetime; on a non-secure lock it dismisses, on a
+        // secure lock it lights up the PIN/biometric prompt with the
+        // activity behind it (still better than the activity behind
+        // the full lockscreen). Best-effort: silently ignored on
+        // pre-26 + when no keyguard service.
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             try {
                 android.app.KeyguardManager km = (android.app.KeyguardManager)
@@ -736,6 +755,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                     "requestDismissKeyguard failed: " + t.getMessage());
             }
         }
+        // Clean up any shared debug logs and prepare for fresh session logging
         DebugFragment.Companion.cleanupSharedLogs();
         com.winlator.cmod.runtime.system.LogManager.prepareForNewSession(this);
 
@@ -5263,8 +5283,11 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         }
 
         // Bionic Steam: publish the IPC + identity env vars the Wine-side
-        // libsteamclient.so reads at module init. Steam3Master / SteamClientService
-        // point at the loopback listeners WnSteamBootstrap stood up earlier.
+        // libsteamclient.so reads at module init. Steam3Master /
+        // SteamClientService point at the 127.0.0.1:57343/57344 listeners
+        // the WnSteamBootstrap master (started in setupSteamEnvironment)
+        // already stood up — so the game's Steamworks calls, bridged
+        // through lsteamclient, reach the authenticated session.
         if (isBionicSteamEnabledForShortcut()) {
             try {
                 long bsSteamId = com.winlator.cmod.feature.stores.steam.utils
@@ -5554,6 +5577,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
 
+        // Pass final envVars to the launcher
         guestProgramLauncherComponent.setEnvVars(envVars);
         guestProgramLauncherComponent.setTerminationCallback((status) -> {
             Log.d("XServerDisplayActivity", "Guest process terminated with status: " + status);

@@ -50,8 +50,10 @@ object SteamCloudHistoryProvider {
     }
 
     /**
-     * Fetches Steam Cloud files for [appId] and groups them by timestamp clusters.
-     * Returns [HistoryResult.Unreachable] so the UI can distinguish that from empty.
+     * Fetch the Steam Cloud file list for [appId] and group the files into
+     * "save events" by timestamp clusters. Detailed variant returns
+     * [HistoryResult.Unreachable] when wn-session can't be reached so the
+     * UI can distinguish that from a genuinely empty save list.
      */
     suspend fun listCloudSaveGroupsDetailed(
         context: Context,

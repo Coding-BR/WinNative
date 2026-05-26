@@ -144,24 +144,45 @@ public:
 
     void notify_games_played(const pb::CMsgClientGamesPlayed& msg);
 
+    // Player.SetRichPresence#1 — broadcast the local user's rich-presence
+    // map for `app_id`. Fire-and-forget service method (no callback);
+    // Steam pushes a CMsgClientPersonaState for self echoing the new
+    // RP set, which CMClient's route_inbound_ + persona_observer
+    // mirror back into pushed_state. No-op unless LoggedOn.
     void set_rich_presence(uint32_t app_id,
                             const std::vector<pb::CPlayer_SetRichPresence_KV>& kv);
 
+    // CMsgClientKickPlayingSession — release this account's other active
+    // playing session. Fire-and-forget; no-op unless LoggedOn.
     void kick_playing_session(bool only_stop_game);
 
     void set_persona_state(uint32_t persona_state);
 
-    // Rename path: server echoes the new name in a self CMsgClientPersonaState.
+    // CMsgClientChangeStatus carrying both persona_state AND a new
+    // player_name — Steam's "rename" path. The CM doesn't ack
+    // explicitly, but the server-pushed CMsgClientPersonaState for
+    // self that follows will echo the new name (cached by
+    // route_inbound_); self_persona() picks it up. Fire-and-forget;
+    // no-op unless LoggedOn.
     void set_persona_name(const std::string& name,
                           uint32_t persona_state_keep_current = 1 /*Online*/);
 
-    // Persona reply is server-pushed and cached.
+    // CMsgClientRequestFriendData — request persona data for the local user.
+    // The reply arrives async as a server-pushed CMsgClientPersonaState,
+    // which route_inbound_ caches; read it back via self_persona().
     void request_user_persona();
 
-    // persona_state_requested is an EClientPersonaStateFlag bitmask.
+    // CMsgClientRequestFriendData — request persona data for an arbitrary
+    // set of SteamID64s. `persona_state_requested` is an
+    // EClientPersonaStateFlag bitmask (1=PlayerName, ~0 / 0xFFFF for the
+    // standard set). Replies arrive async as CMsgClientPersonaState
+    // pushes; read them back via friend_personas(). No-op when not
+    // logged on. Empty list returns immediately.
     void request_friend_personas(const std::vector<uint64_t>& sids,
                                  uint32_t persona_state_requested = 1);
 
+    // The local user's most recently received persona (name/avatar/game),
+    // or nullopt if no CMsgClientPersonaState for our SteamID has arrived.
     [[nodiscard]] std::optional<pb::PersonaStateFriend> self_persona() const;
 
     [[nodiscard]] bool is_playing_blocked() const noexcept {
@@ -174,19 +195,36 @@ public:
     // Cached post-logon licenses; empty until the push arrives.
     [[nodiscard]] std::vector<pb::License> license_list() const;
 
-    // Full snapshot; incremental updates are merged in.
+    // The most recent CMsgClientFriendsList — list of friend SteamID64s
+    // (full snapshot; incremental updates are merged in). Empty until the
+    // post-logon push has arrived. Powers WnLibSteamClient.setFriendsList
+    // so ISteamFriends.GetFriendCount/ByIndex/Relationship returns real
+    // data to in-game queries.
     [[nodiscard]] std::vector<uint64_t> friends_list() const;
 
+    // Snapshot of friend personas observed from CMsgClientPersonaState
+    // pushes. One entry per non-self SteamID64 for which we've received
+    // a name (other fields can be empty). Used to push friend display
+    // names into libsteamclient.so so ISteamFriends.GetFriendPersonaName
+    // resolves real names instead of an empty string.
     struct FriendPersonaSnapshot {
         uint64_t             sid                 = 0;
         std::string          player_name;
         uint32_t             persona_state       = 0;
         uint32_t             game_played_app_id  = 0;
-        // Raw SHA-1 (20 bytes) of the CDN avatar JPG; empty until pushed.
+        // Raw SHA-1 (20 bytes) of the CDN avatar JPG. Empty when the
+        // server hasn't included it in a CMsgClientPersonaState push.
+        // The hex form goes out in nativeGetFriendPersonas's JSON so
+        // Kotlin can route it to nativeSetFriendAvatarHash without a
+        // separate CM round-trip.
         std::vector<uint8_t> avatar_hash;
     };
     [[nodiscard]] std::vector<FriendPersonaSnapshot> friend_personas() const;
 
+    // FamilyGroups.GetFamilyGroup#1 — enumerate the members of the local
+    // user's Steam Family. family_group_id comes from the logon response;
+    // the callback gets the group name + member SteamIDs, or nullopt on
+    // failure / not logged on.
     using FamilyGroupCallback = std::function<void(
         std::optional<pb::CFamilyGroups_GetFamilyGroup_Response>)>;
     void get_family_group(uint64_t family_group_id, FamilyGroupCallback cb,
@@ -242,6 +280,13 @@ public:
                           uint32_t crc_stats,
                           const std::vector<std::pair<uint32_t, uint32_t>>& stats);
 
+    // ISteamMatchmaking lobby browser — single-shot request/response.
+    // Sends CMsgClientMMSGetLobbyList (EMsg 6607); response carries an
+    // array of lobby SteamIDs the game then probes via RequestLobbyData
+    // for full metadata. Filters (key+value+comparison+filter_type) are
+    // SDK-shape — caller builds them from
+    // ISteamMatchmaking.AddRequestLobbyList*Filter slot calls. nullopt
+    // on timeout / disconnect / parse failure.
     using LobbyListCallback = std::function<void(
         std::optional<pb::CMsgClientMMSGetLobbyListResponse>)>;
     void lobby_get_list(uint32_t app_id,
@@ -250,10 +295,21 @@ public:
                         LobbyListCallback cb,
                         std::chrono::seconds timeout = std::chrono::seconds{30});
 
+    // Observer fired from route_inbound_ when an unsolicited
+    // CMsgClientMMSLobbyData (EMsg 6612) arrives — Steam pushes these
+    // whenever a lobby the client is subscribed to changes (metadata
+    // edit, member join/leave, owner change). The observer copies
+    // payload into pushed().active_lobbies in libsteamclient.so and
+    // emits the SDK's LobbyDataUpdate_t callback. Registration is one-
+    // shot at session init via cm_bridge.
     using LobbyDataObserver =
         std::function<void(const pb::CMsgClientMMSLobbyData&)>;
     void set_lobby_data_observer(LobbyDataObserver obs);
 
+    // Host-control trio (Phase B). Each emits its corresponding
+    // CMsgClientMMS* through the encrypted channel with a JobManager-
+    // tracked continuation; on response the lambda deserializes the
+    // proto + delivers std::optional<Response> to the caller.
     using LobbyCreateCallback = std::function<void(
         std::optional<pb::CMsgClientMMSCreateLobbyResponse>)>;
     void lobby_create(uint32_t app_id, int32_t lobby_type,
@@ -266,10 +322,16 @@ public:
                     LobbyJoinCallback cb,
                     std::chrono::seconds timeout = std::chrono::seconds{30});
 
-    // Fire-and-forget; SDK doesn't gate any callback on the LeaveLobbyResponse.
+    // Fire-and-forget — Steam acknowledges via 6606 LeaveLobbyResponse
+    // but the SDK contract doesn't gate any callback on it.
     void lobby_leave(uint32_t app_id, uint64_t lobby_sid);
 
-    // steam_id_member=0 = lobby-level data; non-zero = per-member data.
+    // SetLobbyData (lobby-level OR per-member). steam_id_member=0 means
+    // the data applies to the lobby itself; non-zero is a member-data
+    // update. Steam server-echoes via 6610 SetLobbyDataResponse +
+    // pushes 6612 ClientMMSLobbyData to every member with the new
+    // metadata; the existing LobbyData observer mirrors it into
+    // pushed().active_lobbies so all clients converge.
     using LobbySetDataCallback = std::function<void(
         std::optional<pb::CMsgClientMMSSetLobbyDataResponse>)>;
     void lobby_set_data(uint32_t app_id, uint64_t lobby_sid,
@@ -280,9 +342,16 @@ public:
                         LobbySetDataCallback cb,
                         std::chrono::seconds timeout = std::chrono::seconds{30});
 
+    // SendLobbyChatMsg (fire-and-forget). Steam relays to all members
+    // as 6614 ClientMMSLobbyChatMsg pushes; the observer below mirrors
+    // each one into pushed().lobby_chat_buffer and emits LobbyChatMsg_t.
     void lobby_send_chat(uint32_t app_id, uint64_t lobby_sid,
                          std::vector<uint8_t> chat_bytes);
 
+    // SetLobbyOwner — host-only ownership transfer. EMsg 6615
+    // CMsgClientMMSSetLobbyOwner → 6616 Response. Steam also pushes
+    // 6612 LobbyData on success so every member's GetLobbyOwner
+    // re-reads the new value; we don't need to mirror separately.
     using LobbySetOwnerCallback = std::function<void(
         std::optional<pb::CMsgClientMMSSetLobbyOwnerResponse>)>;
     void lobby_set_owner(uint32_t app_id, uint64_t lobby_sid,
@@ -290,9 +359,15 @@ public:
                          LobbySetOwnerCallback cb,
                          std::chrono::seconds timeout = std::chrono::seconds{30});
 
+    // InviteToLobby (fire-and-forget). EMsg 6621
+    // CMsgClientMMSInviteToLobby. Steam pushes a notification to the
+    // invitee's Steam client — overlay popup OR Friends chat (if
+    // they're offline / not in-game). No response message; we just
+    // confirm the CM channel accepted the bytes.
     void lobby_invite_user(uint32_t app_id, uint64_t lobby_sid,
                            uint64_t invitee_sid);
 
+    // Server-push observers for the in-lobby state-sync surface.
     using LobbyChatMsgObserver =
         std::function<void(const pb::CMsgClientMMSLobbyChatMsg&)>;
     using LobbyMembershipObserver =
@@ -301,7 +376,11 @@ public:
     void set_lobby_chat_msg_observer(LobbyChatMsgObserver obs);
     void set_lobby_membership_observer(LobbyMembershipObserver obs);
 
-    // Non-OK results still reach the caller for entitlement diagnostics.
+    // Single-shot depot decryption key request (Phase 5 foundation).
+    // Response carries the AES-256 key used to decrypt the depot's content
+    // manifest and every CDN chunk. nullopt on timeout / disconnect /
+    // parse failure; a non-OK eresult is still delivered so the caller
+    // can distinguish "not owned" from "transport error".
     using DepotDecryptionKeyCallback =
         std::function<void(std::optional<pb::CMsgClientGetDepotDecryptionKeyResponse>)>;
     void get_depot_decryption_key(uint32_t depot_id, uint32_t app_id,
@@ -322,12 +401,23 @@ public:
     void get_cdn_servers(uint32_t cell_id, CdnServersCallback cb,
                          std::chrono::seconds timeout = std::chrono::seconds{30});
 
+    // Phase 6 — Steam Cloud save sync.
+    //
+    // Cloud user quota: Cloud.GetUserQuota#1. Returns total + used
+    // bytes for the signed-in account. Async — callback receives
+    // nullopt on transport failure / not logged on. Default timeout
+    // 30s. The result drives the libsteamclient.so pushed
+    // cloud_quota_{total,available} state via the SteamService bridge
+    // that calls pushQuotaToLibSteamClient on success.
     using CloudUserQuotaCallback = std::function<void(
         std::optional<pb::CCloud_GetUserQuota_Response>)>;
     void cloud_get_user_quota(CloudUserQuotaCallback cb,
                               std::chrono::seconds timeout = std::chrono::seconds{30});
 
-    // Pass synced_change_number=0 for a full cloud restore listing.
+    // Cloud file changelist: Cloud.GetAppFileChangelist#1. Lists the app's
+    // remote cloud files relative to synced_change_number; pass 0 for the
+    // full list (the restore path). The response's path_prefixes index lets
+    // the caller resolve each file to its local OS path. nullopt on failure.
     using CloudFileChangelistCallback = std::function<void(
         std::optional<pb::CCloud_GetAppFileChangelist_Response>)>;
     void cloud_get_app_file_changelist(uint32_t app_id,
@@ -429,11 +519,17 @@ private:
     StateCallback                     on_state_;
     ClientMessageCallback             on_client_message_;
 
+    // ISteamMatchmaking server-push observer. Set once at session init
+    // (cm_bridge wires libsteamclient.so's mirror); fired from
+    // route_inbound_'s ClientMMSLobbyData arm.
     LobbyDataObserver                 lobby_data_observer_;
     LobbyChatMsgObserver              lobby_chat_msg_observer_;
     LobbyMembershipObserver           lobby_membership_observer_;
 
-    // Holds merged PICS product-info responses until the final part arrives.
+    // PICS product-info accumulator. Keyed by jobid_source/_target. When a
+    // response carries response_pending=true, the partial result is merged
+    // into the entry and the callback is NOT yet fired. The final part (with
+    // the flag absent or false) merges and fires.
     struct PicsAggregate {
         pb::CMsgClientPICSProductInfoResponse acc;
         PicsProductInfoCallback               cb;

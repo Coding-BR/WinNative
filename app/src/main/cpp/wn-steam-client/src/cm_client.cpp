@@ -1518,6 +1518,7 @@ void CMClient::route_inbound_(EMsg emsg,
         case EMsg::ClientMMSSetLobbyDataResponse:
         case EMsg::ClientMMSSetLobbyOwnerResponse:
         case EMsg::ClientMMSGetLobbyStatusResponse:
+            // Single-shot response — JobManager handles routing + parse.
             jobs_.deliver(header.jobid_target,
                           header.eresult,
                           header.error_message,
@@ -1700,6 +1701,10 @@ void CMClient::route_inbound_(EMsg emsg,
         }
 
         case EMsg::ClientPersonaState: {
+            // Server-pushed persona updates; cache the entry for our own
+            // SteamID so self_persona() can surface name/avatar/game,
+            // AND cache friend personas separately so the ISteamFriends
+            // queries (via libsteamclient.so) can return real names.
             auto resp = pb::CMsgClientPersonaState::deserialize(body);
             if (resp) {
                 const uint64_t self = steam_id_.load();

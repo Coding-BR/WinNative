@@ -42,18 +42,39 @@ class WnSteamSession : AutoCloseable {
         nativeDisconnect(h)
     }
 
-    // Send CMsgClientLogOff + flush before disconnect. Bare disconnect leaves
-    // the session "alive" on Steam's side for ~5 min, which makes the next
-    // LogonWithRefreshToken hit EResult=15.
+    /**
+     * Send `CMsgClientLogOff` then disconnect. Use this from the
+     * hybrid hand-off path so Steam clears the session immediately
+     * — a bare [disconnect] just closes the socket, leaving the
+     * session "alive" on Steam's side for ~5 min until heartbeat
+     * timeout, which makes the bootstrap's subsequent
+     * LogonWithRefreshToken hit EResult=15 (AccessDenied).
+     *
+     * Best-effort: sends + sleeps [flushMs] to let the channel
+     * flush before tearing down, then disconnects regardless of
+     * response (CMsgClientLoggedOff is acknowledged async; we don't
+     * gate the rest of the hand-off on it).
+     */
     fun logOffAndDisconnect(flushMs: Int = 500) {
         val h = nativeHandle.get(); if (h == 0L) return
         nativeLogOffAndDisconnect(h, flushMs)
     }
 
-    // Mint a FRESH refresh token via Authentication.GenerateAccessTokenForApp#1
-    // so a follow-up logon bypasses Steam's concurrent-login anti-abuse.
-    // Blocking — MUST run on Dispatchers.IO. The OLD token is invalidated on
-    // success; the caller MUST persist the new one before disconnect.
+    /**
+     * Mint a FRESH refresh token from the current [currentToken] via
+     * Authentication.GenerateAccessTokenForApp#1 (renewal_type=Allow).
+     * The hybrid hand-off uses this so the bootstrap can log on with a
+     * never-used token, bypassing Steam's concurrent-login anti-abuse
+     * (the EResult=15 wall observed in commit 90361f6).
+     *
+     * Blocks the calling thread up to [timeoutMs] while waiting for the
+     * server response — MUST run on Dispatchers.IO. Returns the new
+     * refresh token, or null on any failure (not logged on, timeout,
+     * service error, missing field). On success the OLD [currentToken]
+     * is invalidated server-side; the caller MUST persist the new one
+     * (PrefManager.refreshToken) BEFORE the wn-session disconnects, or
+     * the next reconnect will use the stale token and fail.
+     */
     fun renewRefreshToken(
         currentToken: String,
         steamId64: Long,
@@ -64,7 +85,15 @@ class WnSteamSession : AutoCloseable {
         return nativeRenewRefreshToken(h, currentToken, steamId64, timeoutMs)
     }
 
-    // Start credentials login; [callback] runs on a native worker thread.
+    /**
+     * Begins the credentials login flow:
+     *   GetPasswordRSAPublicKey → encrypt password → BeginAuthSession →
+     *   prompt the [authenticator] for Steam Guard codes as needed →
+     *   PollAuthSessionStatus until a refresh token is issued.
+     *
+     * Calls [callback] with the final [WnAuthResult] on a native worker
+     * thread. Marshal to your own dispatcher before touching UI state.
+     */
     fun startLoginWithCredentials(
         username: String,
         password: String,
@@ -218,13 +247,24 @@ class WnSteamSession : AutoCloseable {
         return nativeGetCloudFileList(h, appId)
     }
 
-    // Returns [totalBytes, usedBytes] or null. BLOCKING — off main thread.
+    /**
+     * Cloud.GetUserQuota#1 — returns the signed-in account's Steam
+     * Cloud quota: [totalBytes, usedBytes]. null on failure / not
+     * logged on. BLOCKING (CM round-trip, ~up to 30s) — call off the
+     * main thread.
+     */
     fun getCloudUserQuota(): LongArray? {
         val h = nativeHandle.get(); if (h == 0L) return null
         return try { nativeGetCloudUserQuota(h) } catch (_: UnsatisfiedLinkError) { null }
     }
 
-    // Blocking resolver for a remote cloud-save download URL and headers.
+    /**
+     * Resolve the HTTP(S) download location of a remote cloud-save file
+     * (Cloud.ClientFileDownload). Returns a JSON object string:
+     * `{"fileSize","rawFileSize","sha","timestamp","urlHost","urlPath",
+     *   "useHttps","encrypted","headers":[{"name","value"}, ...]}`.
+     * BLOCKING (CM round-trip) — call off the main thread. null on failure.
+     */
     fun getCloudDownloadInfo(appId: Int, filename: String): String? {
         val h = nativeHandle.get(); if (h == 0L) return null
         return nativeGetCloudDownloadInfo(h, appId, filename)
@@ -478,21 +518,35 @@ class WnSteamSession : AutoCloseable {
         nativeSetPersonaState(h, personaState)
     }
 
-    // Rename — server echoes the new name back via getSelfPersona().
+    /**
+     * Publish a new persona name (CMsgClientChangeStatus with player_name).
+     * Fire-and-forget — the server-pushed CMsgClientPersonaState that
+     * follows echoes the new name back via getSelfPersona(). [personaState]
+     * is included alongside per the proto contract (1 = Online); empty
+     * [name] is a no-op (Steam rejects).
+     */
     fun setPersonaName(name: String, personaState: Int = 1) {
         if (name.isEmpty()) return
         val h = nativeHandle.get(); if (h == 0L) return
         nativeSetPersonaName(h, name, personaState)
     }
 
-    // Request persona data; poll [getSelfPersona] for the cached reply.
+    /**
+     * Request the local user's persona data (CMsgClientRequestFriendData).
+     * The reply is server-pushed and cached — poll [getSelfPersona] after.
+     */
     fun requestUserPersona() {
         val h = nativeHandle.get(); if (h == 0L) return
         nativeRequestUserPersona(h)
     }
 
-    // personaStateRequested is an EClientPersonaStateFlag bitmask (1=PlayerName).
-    // Replies arrive async; read them back via [getFriendPersonas].
+    /**
+     * Request persona data for an arbitrary set of friends
+     * (CMsgClientRequestFriendData). [personaStateRequested] is an
+     * EClientPersonaStateFlag bitmask — 1=PlayerName covers the basic
+     * name-resolution case. Replies arrive async as
+     * CMsgClientPersonaState pushes; read them back via [getFriendPersonas].
+     */
     fun requestFriendPersonas(
         steamIds: LongArray,
         personaStateRequested: Int = 1,
@@ -503,7 +557,11 @@ class WnSteamSession : AutoCloseable {
         catch (_: UnsatisfiedLinkError) {}
     }
 
-    // Local user's cached persona JSON, or null until the first push.
+    /**
+     * The local user's cached persona as JSON
+     * `{"personaState","gameAppId","playerName","avatarHash","gameName","gameId"}`,
+     * or null if no CMsgClientPersonaState has arrived yet.
+     */
     fun getSelfPersona(): String? {
         val h = nativeHandle.get(); if (h == 0L) return null
         return nativeGetSelfPersona(h)
@@ -521,20 +579,35 @@ class WnSteamSession : AutoCloseable {
         return nativeGetLicenseList(h)
     }
 
-    // Mutual friends only (EFriendRelationship=3); empty until post-logon push.
+    /**
+     * The cached friends list (mutual friends only, EFriendRelationship=3)
+     * as an array of SteamID64s. Empty array until the post-logon
+     * CMsgClientFriendsList push has arrived. Non-blocking.
+     */
     fun getFriendsList(): LongArray {
         val h = nativeHandle.get(); if (h == 0L) return LongArray(0)
         return try { nativeGetFriendsList(h) } catch (_: UnsatisfiedLinkError) { LongArray(0) }
     }
 
-    // Cached friend personas as `[{sid,name,state,app},...]`; "[]" until push.
+    /**
+     * Cached friend personas as JSON `[{sid,name,state,app},...]`.
+     * Populated from server-pushed CMsgClientPersonaState updates;
+     * names-only snapshot. Returns `"[]"` until any non-self persona
+     * has arrived.
+     */
     fun getFriendPersonas(): String {
         val h = nativeHandle.get(); if (h == 0L) return "[]"
         return try { nativeGetFriendPersonas(h) ?: "[]" }
                catch (_: UnsatisfiedLinkError) { "[]" }
     }
 
-    // Blocking owned-games lookup; private libraries return "[]".
+    /**
+     * List the games a user owns (Player.GetOwnedGames#1). Blocks until the
+     * reply arrives (30s native timeout). Returns a JSON array
+     * `[{appId,name,playtimeTwoWeeks,playtimeForever,imgIconUrl,sortAs,
+     * rtimeLastPlayed},...]` (`[]` for a private library), or null on
+     * failure / not logged on.
+     */
     fun getOwnedGames(steamId: Long): String? {
         val h = nativeHandle.get(); if (h == 0L) return null
         return nativeGetOwnedGames(h, steamId)

@@ -32,9 +32,18 @@ object WnSteamAssetsInstaller {
     fun isSupportedFor(container: Container): Boolean =
         lsteamclientArchive(container) != null
 
-    // Container-independent half of [install]: extracts the bionic Steam
-    // runtime + stages the bridge libsteamclient.so. Safe to pre-warm at
-    // login before a container is chosen. Idempotent via stamp file.
+    /**
+     * Run the install pass for [container]. Safe to call on every launch;
+     * idempotent via the sentinel files written under [stamp].
+     */
+    /**
+     * Container-independent half of [install]: extract the bionic Steam
+     * runtime (libsteamclient.so + libsteamnetworkingsockets / steamservice /
+     * tier0 / vstdlib) into `usr/lib/`, and stage the bridge copy of
+     * libsteamclient.so in filesDir. Safe to call early — e.g. at Steam
+     * login, before any container is chosen — to pre-warm WnSteamBootstrap.
+     * Idempotent via the stamp file.
+     */
     fun installBionicRuntime(context: Context): Boolean {
         val imageFs = ImageFs.find(context)
         val apkId = apkStamp(context)
@@ -281,10 +290,21 @@ object WnSteamAssetsInstaller {
     fun bridgeLibPath(context: Context): File =
         File(context.filesDir, "libsteamclient.so")
 
-    // Stage steamservice.exe (the Steam Client Service) at <Steam>/bin/ so
-    // the in-Wine launcher can register + start it — required for
-    // IClientAppManager::LaunchApp to actually spawn the game (otherwise the
-    // IPC queue has no consumer and we fall through to CreateProcess).
+    /**
+     * Stage Valve's `steamservice.exe` (the Steam Client Service binary) at
+     * `<Steam>/bin/steamservice.exe` inside the container. The in-Wine
+     * launcher (steam.exe / main.cpp:start_steam_client_service) installs +
+     * starts this as a Win32 service so steamclient64.dll's IPC queue gets
+     * a consumer — that's the prerequisite for
+     * IClientAppManager::LaunchApp to actually spawn the game (otherwise
+     * the call is silently dropped and we fall through to CreateProcess).
+     * GameHub does the same; the binary lives at exactly the same relative
+     * path in their install.
+     *
+     * No-op (returns false) if the asset is not bundled in this APK. The
+     * launcher's bootstrap then logs "steamservice: binary not present"
+     * and falls through to CreateProcess.
+     */
     fun installPlanWSteamService(context: Context, container: Container): Boolean {
         // <Steam>/bin/ payload for the Steam Client Service:
         //   steamservice.exe          — the service binary
@@ -779,7 +799,11 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    // Wipe stamps so the next [install] re-extracts assets.
+    /**
+     * Wipe stamps + installed files so the next [install] re-extracts.
+     * Useful when the container's wine version changes (caller is expected
+     * to detect this).
+     */
     fun reset(context: Context) {
         val imageFs = ImageFs.find(context)
         listOf(

@@ -92,9 +92,15 @@ object SteamCloudSyncHelper {
                     ).await()
 
             val ok = syncInfo?.syncResult == SyncResult.Success || syncInfo?.syncResult == SyncResult.UpToDate
-            // Refresh libsteamclient.so's cloud_files mirror so an immediate
-            // launch sees the freshly-downloaded file list via FileExists /
-            // GetFileCount instead of last launch's stale state.
+            // Refresh libsteamclient.so's cloud_files mirror after the
+            // download so a game launched immediately after the
+            // \"Restore\" (or any other forceDownloadById caller — the
+            // user-facing \"Sync from Steam Cloud\" button + the
+            // Cloud Saves history Restore button both land here) sees
+            // the freshly-downloaded file list via ISteamRemoteStorage
+            // .FileExists / GetFileCount. Without this, the mirror
+            // stays stale until the next launch path runs the full
+            // enrichSteamSettings.
             if (ok) {
                 probeCache.remove(appId)
                 runCatching {
@@ -103,6 +109,10 @@ object SteamCloudSyncHelper {
                     Timber.w(e, "forceDownloadById: libsteamclient mirror refresh failed for app=%d", appId)
                 }
             }
+            // Intentionally no snapshot capture here. The user-facing "Sync from Steam Cloud"
+            // button and launch-time auto-downloads should just place files locally; an
+            // automatic rollback snapshot on every download bloats local storage and isn't
+            // what the user asked for. Exit-sync still snapshots via SteamExitCloudSync.
             ok
         } catch (e: Exception) {
             Timber.e(e, "Failed to force Steam cloud download for appId=%d", appId)
@@ -246,21 +256,33 @@ object SteamCloudSyncHelper {
                 timestamps = SteamCloudConflictTimestamps(LABEL_NO_LOCAL_SAVES, LABEL_NO_CLOUD_SAVES),
             )
         }
-        // Reuse a recent probe — cloud + local can't meaningfully diverge in this
-        // window, and skipping the Steam round-trip + SHA-1 of every local save
-        // is a noticeable launch-time win. Cloud-unreachable is NOT cached so
-        // the next launch retries; forceDownloadById / uploadLocalSaves invalidate.
+        // Re-launching the same game within PROBE_CACHE_TTL_MS reuses the
+        // last successful probe — the cloud and local state can't meaningfully
+        // diverge in this window, and skipping the Steam round-trip + SHA-1
+        // of every local save file is a noticeable launch-time win.
+        // Invalidated by forceDownloadById / uploadLocalSaves when local state
+        // actually changes; cloud-unreachable results are intentionally NOT
+        // cached so the next launch retries with a hopefully-live session.
         probeCache[appId]?.let { (ts, cached) ->
             if (System.currentTimeMillis() - ts < PROBE_CACHE_TTL_MS) return cached
         }
-        // hasLocalCloudSaves can return from prefs before resolving the Steam prefix.
-        // Activate the shortcut's container so local SHA checks read the right wineprefix.
+        // hasLocalCloudSaves can short-circuit on a `synced_STEAM_$appId` pref entry
+        // without going through steamPrefixResolver, so the symlink may still be stale
+        // when fetchCloudConflictSnapshot reads local files for the SHA comparison.
+        // Activate this shortcut's container explicitly so the SHA check sees the
+        // correct per-game wineprefix.
         activateContainer(context, shortcut.container)
         return runBlocking {
             try {
-                // Context enables SHA-aware local checks, avoiding false conflicts after pulls.
-                // Snapshot is null when wn-session can't reach the CM; in that case we
-                // let the game launch with local files rather than show an "Unknown" dialog.
+                // Pass context so the snapshot can do a SHA-aware content check (not CN-only)
+                // and avoid spurious conflict dialogs when local matches cloud after a pull.
+                // Snapshot is null when wn-session can't reach the CM (cold start race,
+                // network drop, EResult 84/15). In that case we do NOT claim a
+                // conflict — popping a dialog with "Unknown" on the cloud side
+                // (the historical bug) tells the user nothing actionable and
+                // would force them to pick blind. Instead we let the game launch
+                // with local files; the user can use "Sync from Steam Cloud"
+                // manually once the connection comes back.
                 val snapshot = SteamService.fetchCloudConflictSnapshot(appId, context)
                 val localActual = getNewestActualLocalCloudSaveTimestamp(context, appId, shortcut.container)
                 val localTracked =

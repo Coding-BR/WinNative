@@ -1170,14 +1170,30 @@ class SteamService : Service() {
         suspend fun setPersonaState(state: EPersonaState) =
             withContext(Dispatchers.IO) {
                 PrefManager.personaState = state.code()
-                // Hybrid mode suspends wn-session; ISteamFriends.SetPersonaState is
-                // un-RE'd, so we accept that hybrid won't broadcast to Steam friends
-                // and just keep local UI in sync.
+                // HYBRID STAGE-2 — in hybrid mode the wn-session is
+                // permanently suspended so its CMsgClientChangeStatus path
+                // is a guaranteed no-op (withWnSession would return null
+                // and silently drop). Public ISteamFriends has no
+                // SetPersonaState (it's IClientFriends, internal and
+                // un-RE'd); for now we accept that hybrid mode doesn't
+                // broadcast the new state to Steam friends and just keep
+                // the LOCAL UI in sync (status drawer reflects the user's
+                // pick). Future: either RE IClientFriends SetPersonaState
+                // slot OR send CMsgClientChangeStatus from steam_bootstrap
+                // through libsteamclient.so's open CM channel.
                 if (!PrefManager.wnHybridMode) {
                     withWnSession { session -> session.setPersonaState(state.code()) }
+                } else {
+                    Timber.d("Hybrid: setPersonaState($state) local-only; " +
+                        "Steam-side broadcast deferred until IClientFriends RE")
                 }
-                // Sync libsteamclient.so's pushed state so in-process games
-                // observing ISteamFriends.GetPersonaState see the new value.
+                // Sync our open-source libsteamclient.so's pushed state +
+                // emit PersonaStateChange_t for any in-process game that
+                // observes ISteamFriends.GetPersonaState. Routes through
+                // the same JNI setter the seedFromPrefManager path uses,
+                // so the receiver state row's pstate cell flips with
+                // every change — independent of the wn-session CM
+                // round-trip (which is suspended in hybrid mode).
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setPersonaState(state.code())
                 // Reflect the change locally — Steam does not echo our own
@@ -3951,11 +3967,20 @@ class SteamService : Service() {
                                         // downloader. downloadApp() runs on a native worker
                                         // thread; suspendCancellableCoroutine bridges its
                                         // WnDownloadListener.onComplete back to this coroutine.
-                                        // Progress maps per-depot cumulative bytes into
-                                        // di.updateBytesDownloaded(delta).
+                                        // Progress sets di's absolute byte count from the sum
+                                        // of every depot's cumulative bytes.
                                         Timber.i("Downloading game to $appDirPath (attempt $attempt)")
                                         val wnDepotBytes = java.util.concurrent.ConcurrentHashMap<Int, Long>()
-                                        val wnGlobalPrev = java.util.concurrent.atomic.AtomicLong(0L)
+                                        for ((depotId, bytes) in di.depotCumulativeUncompressedBytes) {
+                                            if (depotId in selectedDepots) {
+                                                val initialBytes = bytes.get().coerceAtLeast(0L)
+                                                if (initialBytes > 0L) {
+                                                    wnDepotBytes[depotId] = initialBytes
+                                                }
+                                            }
+                                        }
+                                        val wnGlobalPrev =
+                                            java.util.concurrent.atomic.AtomicLong(wnDepotBytes.values.sum())
                                         // Throttle for DownloadRecord progress persistence — a DB
                                         val wnLastPersistMs = java.util.concurrent.atomic.AtomicLong(0L)
                                         for (batch in wnBatches) {
@@ -3987,19 +4012,55 @@ class SteamService : Service() {
                                                             // worker unwinding). Ignore them — otherwise this
                                                             // would overwrite the PAUSED phase back to DOWNLOADING.
                                                             if (!di.isActive()) return
-                                                            wnDepotBytes[depotId] = depotDone
-                                                            // Persist per-depot cumulative bytes so resume
-                                                            // restores the real % instead of starting at 0.
-                                                            di.depotCumulativeUncompressedBytes
+                                                            // Record per-depot cumulative bytes so the
+                                                            // throttled progress snapshot (depot_bytes.json)
+                                                            // stays accurate — on the next resume this lets
+                                                            // the UI restore the real % instead of starting
+                                                            // the bar at 0 while write_depot re-verifies.
+                                                            // Native verification reports bytes in scan order
+                                                            // from 0 on every resume. Do not let that lower a
+                                                            // previously persisted depot count; otherwise quick
+                                                            // pause/resume cycles during VERIFYING rewrite the
+                                                            // snapshot to the partially re-scanned byte count.
+                                                            val depotBytes =
+                                                                di.depotCumulativeUncompressedBytes
                                                                 .getOrPut(depotId) {
                                                                     java.util.concurrent.atomic.AtomicLong(0L)
-                                                                }.set(depotDone)
+                                                                }
+                                                            val observedDepotDone = depotDone.coerceAtLeast(0L)
+                                                            var monotonicDepotDone: Long
+                                                            while (true) {
+                                                                val currentDepotDone = depotBytes.get()
+                                                                monotonicDepotDone = maxOf(currentDepotDone, observedDepotDone)
+                                                                if (monotonicDepotDone == currentDepotDone ||
+                                                                    depotBytes.compareAndSet(currentDepotDone, monotonicDepotDone)
+                                                                ) {
+                                                                    break
+                                                                }
+                                                            }
+                                                            wnDepotBytes[depotId] = monotonicDepotDone
                                                             di.markProgressSnapshotDirty()
                                                             val g = wnDepotBytes.values.sum()
                                                             val delta = g - wnGlobalPrev.getAndSet(g)
                                                             if (delta > 0L) di.updateBytesDownloaded(delta)
-                                                            // Suffix `(g)` makes each tick unique so the
-                                                            // StateFlow dedup doesn't freeze byte/speed UI.
+                                                            val statusTick =
+                                                                if (verifying && observedDepotDone < monotonicDepotDone) {
+                                                                    "$g/$observedDepotDone"
+                                                                } else {
+                                                                    g.toString()
+                                                                }
+                                                            // Drive the phase from the native `verifying`
+                                                            // flag — VERIFYING while validating on-disk
+                                                            // content, DOWNLOADING while actually fetching
+                                                            // from the CDN — so a verify pass reads
+                                                            // "Verifying" and only flips to "Downloading"
+                                                            // once it starts pulling missing files. The
+                                                            // status message carries a unique suffix (g)
+                                                            // every tick: the Downloads row collects it via
+                                                            // collectAsState() and a StateFlow dedups equal
+                                                            // values, so a constant message would freeze
+                                                            // the live byte count / speed; a changing value
+                                                            // forces the recomposition that re-reads them.
                                                             di.updateStatus(
                                                                 if (verifying) {
                                                                     DownloadPhase.VERIFYING
@@ -4007,9 +4068,9 @@ class SteamService : Service() {
                                                                     DownloadPhase.DOWNLOADING
                                                                 },
                                                                 if (verifying) {
-                                                                    "Verifying depot $depotId ($g)"
+                                                                    "Verifying depot $depotId ($statusTick)"
                                                                 } else {
-                                                                    "Downloading depot $depotId ($g)"
+                                                                    "Downloading depot $depotId ($statusTick)"
                                                                 },
                                                             )
                                                             // Also notify the progress-bar listeners.
@@ -4983,8 +5044,16 @@ class SteamService : Service() {
             appId: Int,
             configDirectory: String,
         ) = runCatching {
-            // libsteamclient.so primary path — use its ISteamUserStats schema
-            // directly when ready, else fall through to the wn-session CM fetch.
+            // libsteamclient.so primary path: source the achievement schema
+            // directly from its ISteamUserStats via
+            // WnSteamBootstrap.listAchievementsFull(). Goldberg's
+            // achievement_name_to_block.json + binary VDF aren't produced
+            // here — cold-client-only artifacts that Bionic games don't
+            // consume — but the launcher's in-app achievement display
+            // (cachedAchievements) still wants the list, so we populate
+            // that. Falls through to wn-session if the .so isn't bound
+            // to this appId yet (prewarm uses appId=0 so library/sign-in
+            // time can't drive this).
             run {
                 val bs = com.winlator.cmod.feature.stores.steam.wnsteam
                     .WnSteamBootstrap
@@ -5009,14 +5078,25 @@ class SteamService : Service() {
                 Timber.d("libsteamclient.so achievements not ready for app $appId — falling through to wn-session CM fetch")
             }
 
-            // Cold-warm from per-app schema cache so achievement HUDs gating on
-            // UserStatsReceived_t light up immediately; the CM push later
-            // overwrites with current data.
+            // Cold-warm libsteamclient.so from the per-app schema cache
+            // BEFORE the CM fetch. Game-side achievement HUDs gating on
+            // ISteamUserStats.RequestCurrentStats → UserStatsReceived_t
+            // light up immediately. The fresh CM push that lands later
+            // overwrites with current data; the setter-level dedup
+            // avoids redundant callbacks when nothing changed.
+            //
+            // No-op when no cache exists (first launch of this app, or
+            // cache was deleted). When wn-session is rate-limited /
+            // signed-out, this is the ONLY data the game sees until
+            // logon recovers — strict improvement over the prior
+            // empty-schema state.
             @Suppress("UNUSED_VARIABLE")
             val warmedFromCache = warmAchievementSchemaFromCache(appId)
 
-            // CMsgClientGetUserStats returns the binary-VDF schema consumed by
-            // StatsAchievementsGenerator for Goldberg achievements/stats JSON.
+            // Primary path: the C++ WN-Steam-Client (Phase 9 — JavaSteam is
+            // being dropped). CMsgClientGetUserStats returns the binary-VDF
+            // UserGameStatsSchema — exactly what StatsAchievementsGenerator
+            // consumes to emit Goldberg's achievements.json + stats.json.
             val schemaArray: ByteArray = run {
                 val wn = withWnSession { session ->
                     withContext(Dispatchers.IO) { session.getUserStatsSchema(appId) }
@@ -9191,9 +9271,19 @@ class SteamService : Service() {
                 return cachedTicket.encryptedTicket
             }
 
-            // Goldberg's configs.user.ini `ticket=` consumes this protobuf.
-            // Wait up to 15s for cold-start logon — Capcom DRM titles refuse
-            // to boot if configs.user.ini is written with no ticket.
+            // Primary path: the C++ WN-Steam-Client (Phase 9 — JavaSteam is
+            // being dropped). RequestEncryptedAppTicket returns the serialized
+            // EncryptedAppTicket protobuf — exactly what Goldberg's
+            // configs.user.ini `ticket=` consumes.
+            //
+            // CRITICAL: if wn-session isn't logged on yet at launch time
+            // (cold-start + game-launch-too-fast), withWnSession will
+            // immediately return null and we'll write configs.user.ini
+            // with NO ticket. Capcom-DRM titles (MHR / MHS) reject and
+            // refuse to boot. Wait up to 15s for logon to complete
+            // before giving up — the same launch path already absorbs
+            // multi-second waits for PICS and DLC fetch, so the user
+            // doesn't notice.
             var wnTicket: ByteArray? = null
             val ticketWaitDeadlineMs = System.currentTimeMillis() + 15_000L
             while (wnTicket == null && System.currentTimeMillis() < ticketWaitDeadlineMs) {
@@ -9201,10 +9291,14 @@ class SteamService : Service() {
                     withContext(Dispatchers.IO) { session.requestEncryptedAppTicket(appId) }
                 }
                 if (wnTicket != null) break
+                // No session or session returned null. Both can transient
+                // — wait briefly then retry. Don't busy-loop.
                 kotlinx.coroutines.delay(500L)
             }
             if (wnTicket == null) {
-                Timber.w("encrypted app ticket: 15s wait elapsed without success for app $appId")
+                Timber.w("encrypted app ticket: 15s wait elapsed without success for app $appId — " +
+                    "game launches that need this ticket (Capcom DRM titles, online auth) will fail. " +
+                    "Verify wn-session is logged on (state-dump op).")
             }
             if (wnTicket != null && wnTicket.isNotEmpty()) {
                 runCatching {
