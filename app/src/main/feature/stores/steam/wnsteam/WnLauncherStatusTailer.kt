@@ -139,9 +139,19 @@ class WnLauncherStatusTailer(
         // `[wn-launcher]`. Anything else is something writing to the same
         // file by accident, ignore.
         if (!line.contains("[wn-launcher]")) return
-        // Terminal phase: launcher logged that the game's exe is now
-        // running. Signal the dismiss-the-splash callback (one-shot).
-        val isTerminal = line.contains("is running") && line.contains("LaunchApp")
+        // Terminal phase: launcher confirmed the game process is now
+        // running. Two paths to "running":
+        //   1. `LaunchApp: "<exe>" is running` — IClientAppManager
+        //      successfully spawned the game via its DRM/launch path
+        //   2. `game process started pid=N` — IClientAppManager succeeded
+        //      but the launcher's process scan didn't find the named exe
+        //      (common for games where steamclient renames or wraps the
+        //      exe), and the launcher fell back to direct CreateProcess
+        //      which succeeded
+        // Both are "the game is now alive" and both should fire the
+        // dismiss-the-splash callback (one-shot).
+        val isTerminal = (line.contains("is running") && line.contains("LaunchApp"))
+                || line.contains("game process started pid=")
         val phase = phaseFor(line)
         if (phase != null && phase != lastEmitted) {
             lastEmitted = phase
@@ -170,6 +180,19 @@ class WnLauncherStatusTailer(
         line.contains("Steam_BLoggedOn=true") -> "Steam ready"
         line.contains("RequestAppInfoUpdate(appId=") -> "Updating game info…"
         line.contains("GetAppInstallState(appId=") -> "Verifying install…"
+        // Per-container redistributable scan/install (replaces Steam's
+        // RunInstallScript path). The launcher emits one line per state
+        // change; we map the most user-visible ones.
+        line.contains("redist scan: scanning") -> "Scanning redistributables…"
+        line.contains("installing redistributable:") -> phaseForInstallingRedist(line)
+        // Summary line now has fields: installed N, skipped M, failed-marked K,
+        // timed-out-unmarked T. We treat any of those endings as terminal.
+        line.contains("redist scan: installed") -> "Redistributables ready"
+        line.contains("redist scan: ") && line.contains(" of ") -> "Redistributables ready"
+        line.contains("redist scan: 0 *.exe installers") -> "No redistributables to install"
+        line.contains("redist scan: no _CommonRedist") -> "No redistributables to install"
+        // Legacy Steam RunInstallScript path — kept as a fallback if
+        // someone toggles kRunSteamInstallScript=true in main.cpp.
         line.contains("RunInstallScript(appId=") -> "Installing redistributables…"
         line.contains("install script finished") -> "Redistributables installed"
         line.contains("steamservice: post-start state=4") -> "Steam service running"
@@ -180,6 +203,26 @@ class WnLauncherStatusTailer(
         // closing the splash. The terminal signal still fires via the
         // isTerminal branch in consumeLine; only the text stays stable.
         else -> null
+    }
+
+    // Pretty-print "installing redistributable: <name> (<n>/<total>, …)" as
+    // "Installing <name>… (n/total)" for the splash. Falls back to a generic
+    // string when the pattern doesn't match the expected shape.
+    private fun phaseForInstallingRedist(line: String): String {
+        val marker = "installing redistributable:"
+        val start = line.indexOf(marker)
+        if (start < 0) return "Installing redistributable…"
+        val rest = line.substring(start + marker.length).trim()
+        // Format: "<name> (<n>/<total>, <bytes> bytes)"
+        val name = rest.substringBefore(" (").trim()
+        val ratio = rest.substringAfter("(", "").substringBefore(",", "").trim()
+        return if (name.isNotEmpty() && ratio.contains("/")) {
+            "Installing $name… ($ratio)"
+        } else if (name.isNotEmpty()) {
+            "Installing $name…"
+        } else {
+            "Installing redistributable…"
+        }
     }
 
     companion object {

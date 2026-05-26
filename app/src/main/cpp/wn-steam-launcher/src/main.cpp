@@ -45,6 +45,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <tlhelp32.h>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 // LoadLibraryEx search-path flags — fallbacks in case the mingw-w64 headers
 // gate them behind a higher _WIN32_WINNT than we compile at.
@@ -649,6 +652,339 @@ static bool is_exec_ptr(void* p) {
 // logon, our explicit call was always declined (state=2 stable) and never
 // landed any bytes, so it was a no-op that just added latency + log noise.
 
+// -------------------------------------------------------------------------
+// Per-container redistributable installer with marker-file tracking.
+//
+// Replaces steamclient's RunInstallScript path for redistributables
+// (VC++, DirectX, etc.) shipped under the game's `_CommonRedist/` folder.
+// Steam's path silently fails on Wine for these installers — its
+// CreateProcess on `_CommonRedist/vcredist/2022/VC_redist.x64.exe` returns
+// ERROR_PATH_NOT_FOUND when the game install dir is a symlink (which it
+// always is under our /storage/emulated mount). We do the install
+// ourselves with CreateProcess + WaitForSingleObject and persist a marker
+// file inside the Wine prefix so the next launch in the same container
+// can skip already-installed redists.
+//
+// Tracking storage: `C:\wn-installed-redists.txt`. This lives inside the
+// per-container Wine prefix:
+//   <container.rootDir>/.wine/drive_c/wn-installed-redists.txt
+// Container deletion removes the prefix → marker goes with it. Recreating
+// a same-named container produces a new container ID and a new prefix
+// directory, so the marker is absent on first launch and redists install
+// fresh. No global state, no cross-container leakage.
+//
+// Format: one entry per line, tab-separated
+//   <filename>\t<size>\t<unix-timestamp>
+// Header comment line at top: `# wn-installed-redists v1`.
+// Match is by (filename, size) so a game update that replaces the
+// bundled installer's bytes triggers a clean reinstall.
+// -------------------------------------------------------------------------
+
+static const char* kRedistsMarkerPath = "C:\\wn-installed-redists.txt";
+
+// Derive the game's install directory from its full exe path.
+// Returns std::string for simplicity. Strips the trailing filename.
+static std::string game_dir_of(const char* gameExePath) {
+    if (!gameExePath || !*gameExePath) return {};
+    std::string p(gameExePath);
+    // Trim trailing backslash if any.
+    while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
+    auto pos = p.find_last_of("\\/");
+    if (pos == std::string::npos) return {};
+    return p.substr(0, pos);
+}
+
+// True if the marker file already records this (filename, size) pair.
+// Tolerant of a missing marker file (returns false).
+static bool redist_already_installed(const std::string& name, uint64_t size) {
+    FILE* f = fopen(kRedistsMarkerPath, "r");
+    if (!f) return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+        // Parse `<name>\t<size>\t<ts>` — name may contain spaces, never a tab.
+        char* tab1 = strchr(line, '\t');
+        if (!tab1) continue;
+        *tab1 = '\0';
+        char* tab2 = strchr(tab1 + 1, '\t');
+        if (!tab2) continue;
+        uint64_t lineSize = _strtoui64(tab1 + 1, nullptr, 10);
+        if (name == line && lineSize == size) { found = true; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+// Append a new entry to the marker file. Creates the file with a header
+// on first use. The fourth column (exitCode) records the actual installer
+// exit so the user can see at a glance which installs succeeded vs which
+// refused (e.g. DXSETUP returning a Wine-specific code because the prefix
+// already has builtin d3dx9 DLLs). Both states result in a "marked, skip
+// on next launch" decision — only true timeouts (which never invoke this
+// function) leave the entry off the file so the user can retry.
+static void mark_redist_installed(const std::string& name, uint64_t size,
+                                  uint32_t exitCode) {
+    bool needHeader = false;
+    {
+        FILE* probe = fopen(kRedistsMarkerPath, "r");
+        if (!probe) needHeader = true; else fclose(probe);
+    }
+    FILE* f = fopen(kRedistsMarkerPath, "a");
+    if (!f) {
+        log_line("[wn-launcher] redist mark: cannot open %s for append (GLE=%lu)",
+                 kRedistsMarkerPath, GetLastError());
+        return;
+    }
+    if (needHeader) fprintf(f, "# wn-installed-redists v1\n");
+    fprintf(f, "%s\t%llu\t%llu\t%lu\n", name.c_str(),
+            (unsigned long long) size, (unsigned long long) time(nullptr),
+            (unsigned long) exitCode);
+    fclose(f);
+}
+
+// Lowercase a copy of the input (ASCII only — installer names are
+// always plain ASCII).
+static std::string to_lower(const std::string& s) {
+    std::string r = s;
+    for (auto& c : r) c = (char) tolower((unsigned char) c);
+    return r;
+}
+
+// Pick silent-install command-line args based on the installer's filename.
+// Different installer families use incompatible silent-flag conventions —
+// `/quiet` works for modern MSI bootstrappers (VC++ 2015-2022), but
+// DXSETUP.exe needs `/silent`, InnoSetup wants `/VERYSILENT`, NSIS uses
+// `/S`. Picking the wrong flag = installer pops a GUI dialog and waits
+// forever for user input (which is exactly the hang the user reported
+// with DXSETUP.exe under our prior `/quiet /norestart` default).
+//
+// Matrix sourced from each installer family's published silent-install
+// reference (Microsoft DirectX SDK docs, Visual C++ redistributable
+// command-line reference, InnoSetup setup command-line guide, NSIS
+// silent-install convention).
+//
+// Returns the args string to pass after the executable name. Does not
+// include the executable itself.
+static std::string silent_args_for(const std::string& filename) {
+    std::string lower = to_lower(filename);
+    // DirectX 9.0c June 2010 redistributable (and older DXSetup builds).
+    if (lower == "dxsetup.exe") return "/silent";
+    // Modern Visual C++ 2015-2022 redistributable bootstrapper.
+    if (lower.rfind("vc_redist", 0) == 0) return "/quiet /norestart";
+    // Legacy Visual C++ 2005-2013 redistributable.
+    if (lower.rfind("vcredist_", 0) == 0) return "/q /norestart";
+    // OpenAL Soft.
+    if (lower == "oalinst.exe") return "/silent";
+    // PhysX system software installers (NVIDIA).
+    if (lower.find("physx") != std::string::npos) return "/quiet";
+    // .NET Framework / .NET Runtime installers.
+    if (lower.rfind("dotnetfx", 0) == 0
+            || lower.rfind("dotnet", 0) == 0
+            || lower.rfind("ndp", 0) == 0) {
+        return "/q /norestart";
+    }
+    // UE4/UE5 prerequisites bootstrapper.
+    if (lower.find("prereqsetup") != std::string::npos
+            || lower.find("ue4prereq") != std::string::npos
+            || lower.find("ue5prereq") != std::string::npos) {
+        return "/quiet /norestart";
+    }
+    // InnoSetup (Unity prereqs, many Steam middleware installers).
+    // Heuristic: filename literally `setup.exe` — far from perfect but
+    // catches the InnoSetup convention.
+    if (lower == "setup.exe") return "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
+    // Generic MSI-bootstrapper fallback. Works for ~80% of redist
+    // installers in the wild. If a specific installer hangs here add
+    // it to the dispatch above.
+    return "/quiet /norestart";
+}
+
+// Three-way result from running a single redist installer:
+//   OK       — installer exited cleanly with 0 or 3010 (= success +
+//              reboot pending; we never reboot, harmless).
+//   FAILED   — installer ran and exited with a non-zero, non-3010 code.
+//              Mark anyway (don't retry) since the installer almost
+//              certainly knew what it was doing — common case is
+//              DXSETUP returning a Wine-specific code because the
+//              prefix already has builtin d3dx9 DLLs and it refuses
+//              to overwrite. Retrying every launch helps nobody and
+//              just adds 1-3 s of pointless work per launch.
+//   TIMEOUT  — silent install hung past 90 s. Almost always the wrong
+//              silent flag for this installer family (Inno/NSIS/etc.).
+//              Do NOT mark, so user can fix the dispatch and retry.
+enum class RedistInstallResult { OK, FAILED, TIMEOUT };
+
+// Run a single redist installer with the appropriate silent flags for
+// its installer family (see silent_args_for). Per-installer wait
+// capped at 90s — silent installs complete in <30s in practice; if
+// we hit 90s the installer is almost certainly hung on a GUI dialog
+// despite the silent flag (incorrect flag for this installer family).
+// Returns the exit code in *outExitCode (0xFFFFFFFF on CreateProcess
+// failure, 0xFFFFFFFE on timeout).
+static RedistInstallResult run_redist_installer(
+        const std::filesystem::path& installer, uint32_t* outExitCode) {
+    std::string fn = installer.filename().string();
+    std::string args = silent_args_for(fn);
+    std::string cmd;
+    cmd.reserve(installer.string().size() + args.size() + 4);
+    cmd += '"';
+    cmd += installer.string();
+    cmd += "\" ";
+    cmd += args;
+
+    log_line("[wn-launcher] redist install: spawning %s with args: %s",
+             fn.c_str(), args.c_str());
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    std::string cwdStr = installer.parent_path().string();
+    if (!CreateProcessA(
+            installer.string().c_str(),
+            cmd.data(),
+            nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            cwdStr.empty() ? nullptr : cwdStr.c_str(),
+            &si, &pi)) {
+        log_line("[wn-launcher] redist install: CreateProcess failed for %s "
+                 "(GLE=%lu)",
+                 installer.string().c_str(), GetLastError());
+        if (outExitCode) *outExitCode = 0xFFFFFFFFu;
+        return RedistInstallResult::FAILED;
+    }
+    constexpr DWORD kPerInstallerTimeoutMs = 90 * 1000;
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, kPerInstallerTimeoutMs);
+    DWORD exitCode = ~0u;
+    bool timedOut = false;
+    if (waitResult == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+    } else {
+        log_line("[wn-launcher] redist install: %s — 90s timeout (silent "
+                 "flag '%s' likely incorrect for this installer family); "
+                 "killing process. Not marking as installed so the user "
+                 "can retry once the right flag is added.",
+                 fn.c_str(), args.c_str());
+        TerminateProcess(pi.hProcess, 1);
+        // Wait briefly for kill to propagate, then collect.
+        WaitForSingleObject(pi.hProcess, 5000);
+        timedOut = true;
+        exitCode = 0xFFFFFFFEu;  // sentinel for "killed by our timeout"
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (outExitCode) *outExitCode = exitCode;
+    if (timedOut) {
+        return RedistInstallResult::TIMEOUT;
+    }
+    // 0 = success, 3010 = success + reboot pending (we never reboot).
+    bool ok = (exitCode == 0 || exitCode == 3010);
+    log_line("[wn-launcher] redist install: %s exit=%lu (%s)",
+             fn.c_str(), exitCode,
+             ok ? "ok" : "fail (marking anyway — installer reported a "
+                         "definitive non-zero status; treating as "
+                         "\"tried, don't retry\" so the splash isn't "
+                         "stuck re-running it every launch)");
+    return ok ? RedistInstallResult::OK : RedistInstallResult::FAILED;
+}
+
+// Main entry: scan <gameDir>/_CommonRedist/ for *.exe and install each
+// one not already recorded in the per-container marker file. No-op if
+// the folder doesn't exist or the game has no .exe redistributables.
+static void scan_and_install_redists(const char* gameExePath) {
+    std::string gameDir = game_dir_of(gameExePath);
+    if (gameDir.empty()) {
+        log_line("[wn-launcher] redist scan: cannot derive game dir from \"%s\"",
+                 gameExePath ? gameExePath : "(null)");
+        return;
+    }
+    std::filesystem::path redistRoot = std::filesystem::path(gameDir) / "_CommonRedist";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(redistRoot, ec)) {
+        log_line("[wn-launcher] redist scan: no _CommonRedist at %s — skipping",
+                 redistRoot.string().c_str());
+        return;
+    }
+    log_line("[wn-launcher] redist scan: scanning %s", redistRoot.string().c_str());
+
+    // Collect every *.exe under _CommonRedist/.
+    std::vector<std::filesystem::path> installers;
+    for (auto it = std::filesystem::recursive_directory_iterator(
+                redistRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+         it != std::filesystem::recursive_directory_iterator(); ++it) {
+        if (ec) {
+            log_line("[wn-launcher] redist scan: iteration error: %s",
+                     ec.message().c_str());
+            ec.clear();
+            continue;
+        }
+        const auto& p = it->path();
+        if (!it->is_regular_file(ec)) continue;
+        std::string ext = p.extension().string();
+        for (auto& c : ext) c = (char) tolower((unsigned char) c);
+        if (ext != ".exe") continue;
+        installers.push_back(p);
+    }
+
+    if (installers.empty()) {
+        log_line("[wn-launcher] redist scan: 0 *.exe installers under %s",
+                 redistRoot.string().c_str());
+        return;
+    }
+    log_line("[wn-launcher] redist scan: found %zu installer(s)", installers.size());
+
+    int installed = 0, skipped = 0, failedMarked = 0, timedOut = 0;
+    int idx = 0;
+    for (const auto& installer : installers) {
+        ++idx;
+        std::string name = installer.filename().string();
+        uintmax_t sizeUm = std::filesystem::file_size(installer, ec);
+        uint64_t size = ec ? 0 : (uint64_t) sizeUm;
+        ec.clear();
+        if (redist_already_installed(name, size)) {
+            log_line("[wn-launcher] redistributable %s already installed in this "
+                     "container, skipping (%d/%zu)",
+                     name.c_str(), idx, installers.size());
+            ++skipped;
+            continue;
+        }
+        log_line("[wn-launcher] installing redistributable: %s (%d/%zu, %llu bytes)",
+                 name.c_str(), idx, installers.size(),
+                 (unsigned long long) size);
+        uint32_t exitCode = 0;
+        RedistInstallResult r = run_redist_installer(installer, &exitCode);
+        switch (r) {
+            case RedistInstallResult::OK:
+                mark_redist_installed(name, size, exitCode);
+                ++installed;
+                break;
+            case RedistInstallResult::FAILED:
+                // Mark with the failure exit code so we don't re-run on
+                // every launch. Common case: DXSETUP refusing to install
+                // over Wine builtin DirectX 9 DLLs (returns a Wine-specific
+                // non-zero code). The launcher's job is to do its best; we
+                // don't keep banging on an installer that's told us it
+                // won't proceed.
+                mark_redist_installed(name, size, exitCode);
+                ++failedMarked;
+                break;
+            case RedistInstallResult::TIMEOUT:
+                // Timeout almost always means the silent flag is wrong
+                // (Inno/NSIS/etc.) and the installer is hung on a GUI
+                // dialog. NOT marked, so the next launch retries after
+                // the user (or a code change) fixes silent_args_for.
+                ++timedOut;
+                break;
+        }
+    }
+    log_line("[wn-launcher] redist scan: installed %d, skipped %d, "
+             "failed-marked %d, timed-out-unmarked %d (of %zu total)",
+             installed, skipped, failedMarked, timedOut, installers.size());
+}
+
 int main(int argc, char** argv) {
     setbuf(stderr, NULL);
     setbuf(stdout, NULL);
@@ -1205,14 +1541,32 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // STEP 4.6: Run the game's Steam install script (installscript.vdf)
-    // before launch — installs VC++ redistributables / other prerequisites
-    // and applies registry setup, mirroring GameHub's SteamAgent
-    // (FUN_14005a850). RunInstallScript starts steamclient's install-script
-    // engine; poll IsInstallScriptRunning until it returns 0. Without this a
-    // prerequisite-dependent game starts and dies on a missing runtime.
+    // STEP 4.5: Scan the game's _CommonRedist/ folder and run each
+    // *.exe redistributable installer that hasn't already been installed
+    // in THIS container. Replaces steamclient's RunInstallScript path
+    // (which silently fails on Wine because Steam's CreateProcess on
+    // the redist installers returns ERROR_PATH_NOT_FOUND when the game
+    // install dir is a /storage/emulated symlink — `step 1/0` then
+    // never advances, locking the launcher).
+    //
+    // Tracking is per-container: the marker file lives at
+    //   C:\wn-installed-redists.txt
+    // which is inside the Wine prefix (deleted when the container is
+    // deleted, fresh when a same-named container is recreated with a
+    // new ID). Each entry is `<filename>\t<size>\t<unix-ts>`. Re-check
+    // is by (filename, size) — a game update that changes the bundled
+    // installer's bytes triggers reinstall.
+    //
+    // Skipped if no _CommonRedist/ folder exists.
     // ------------------------------------------------------------------
-    if (loggedOn && engine && appId != 0) {
+    scan_and_install_redists(gameExe);
+
+    // STEP 4.6 is intentionally skipped when scan_and_install_redists
+    // ran — the scan handles redistributables directly and Steam's
+    // RunInstallScript is the same broken path. The original block is
+    // kept below behind a compile-time flag for emergency revert.
+    constexpr bool kRunSteamInstallScript = false;
+    if (kRunSteamInstallScript && loggedOn && engine && appId != 0) {
         void** engine_vt = *(void***) engine;
         typedef void* (WN_THISCALL *GetIClientUserFn)(void* self, int hUser, int hPipe);
         GetIClientUserFn getUser = (GetIClientUserFn)
@@ -1243,17 +1597,60 @@ int main(int argc, char** argv) {
                         (IsInstallScriptRunningFn) progP;
                     GetInstallScriptStateFn getState =
                         (GetInstallScriptStateFn) stateP;
+                    // kMaxWaitMs: hard ceiling — the original 180s safety
+                    //   net for a script that's actually doing real work.
+                    // kEmptyScriptGraceMs: short grace for total_steps to
+                    //   populate after RunInstallScript returns. Many
+                    //   modern Steam games ship an installscript.vdf that
+                    //   declares no actual steps (UE4/Unity games whose
+                    //   redistributables are bundled under _CommonRedist
+                    //   and were already run at install time). Steam
+                    //   returns RunInstallScript=true but the script's
+                    //   total_steps stays at 0. Without breaking out we
+                    //   loop the full 180s waiting for steps that will
+                    //   never appear — locking up the launcher and the
+                    //   splash screen for any such game.
+                    //   Symptom we're fixing: log shows `step 1/0` and
+                    //   then no progress for the full 180s before
+                    //   proceeding to steamservice → LaunchApp.
+                    // kNoProgressMs: catch a script that DOES report a
+                    //   real total but stalls on one step (network
+                    //   redistributable download blocked, etc.).
                     const int kMaxWaitMs = 180000;
-                    int waited = 0, lastStep = -1;
+                    const int kEmptyScriptGraceMs = 3000;
+                    const int kNoProgressMs = 30000;
+                    int waited = 0, lastStep = -1, lastTotal = -1;
+                    int lastProgressAtMs = 0;
+                    const char* breakReason = "complete";
                     while (waited < kMaxWaitMs) {
-                        if (isRunning(iUser) == 0) break;
+                        if (isRunning(iUser) == 0) {
+                            breakReason = "complete";
+                            break;
+                        }
                         char buf[1024];
                         int stepNo = 0, stepCount = 0;
-                        if (getState(iUser, buf, sizeof(buf), &stepNo, &stepCount)
-                                && stepNo != lastStep) {
-                            lastStep = stepNo;
-                            log_line("[wn-launcher] install script: step %d/%d",
-                                     stepNo, stepCount);
+                        if (getState(iUser, buf, sizeof(buf),
+                                     &stepNo, &stepCount)) {
+                            if (stepNo != lastStep || stepCount != lastTotal) {
+                                lastStep = stepNo;
+                                lastTotal = stepCount;
+                                lastProgressAtMs = waited;
+                                log_line("[wn-launcher] install script: step %d/%d",
+                                         stepNo, stepCount);
+                            }
+                            // Empty / no-op script: total never published.
+                            // After the grace period, assume nothing real
+                            // is going to run and proceed.
+                            if (stepCount == 0
+                                    && waited >= kEmptyScriptGraceMs) {
+                                breakReason = "empty (total_steps=0)";
+                                break;
+                            }
+                            // Real script but stuck on one step.
+                            if (waited - lastProgressAtMs >= kNoProgressMs) {
+                                breakReason = "no-progress timeout";
+                                break;
+                            }
                         }
                         if (bGetCallback && freeLastCallback) {
                             char cb[64];
@@ -1263,7 +1660,9 @@ int main(int argc, char** argv) {
                         waited += 200;
                     }
                     log_line("[wn-launcher] install script finished in %dms (%s)",
-                             waited, waited >= kMaxWaitMs ? "TIMEOUT" : "complete");
+                             waited,
+                             waited >= kMaxWaitMs ? "hard-timeout"
+                                                  : breakReason);
                 }
             }
         }
