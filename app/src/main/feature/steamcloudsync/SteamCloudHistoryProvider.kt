@@ -14,38 +14,32 @@ import timber.log.Timber
 import java.security.MessageDigest
 
 /**
- * Provider for the Steam game "Save History" UI rows backed by **Steam Cloud's current
- * file listing**, not local rolling snapshots.
+ * Provides Steam Cloud entries for the save-history UI.
  *
- * Steam Cloud (per `steammessages_cloud.steamclient.proto`) keeps ONE record per filename
- * — there is no server-side version history. The user sees what they see on
- * `store.steampowered.com/account/remotestorageapp/?appid=X`: each file's name, size, and
- * last-modified time. To match the user's mental model of "the last 30 saves", we group
- * cloud files whose timestamps cluster within [GROUP_WINDOW_MS] of each other into one
- * "save event" entry — most games write all their save files together on Save, producing
- * one group per save action.
+ * Steam Cloud stores the current version of each filename, not a server-side version history.
+ * To approximate recent save events, files modified within [GROUP_WINDOW_MS] are grouped
+ * together. This mirrors games that update several save files during one save action.
  *
- * Restore semantics: tapping Restore on a group calls [SteamCloudSyncHelper.forceDownloadById]
- * which syncs the entire current cloud state to local. Since Steam Cloud has the SAME current
- * state regardless of which group the user picks, the restore is effectively idempotent
- * across groups — the grouping is a visibility aid, not a per-group download primitive.
+ * Restoring any group syncs the full current cloud state through
+ * [SteamCloudSyncHelper.forceDownloadById]. Groups only describe what changed together; they
+ * are not independently restorable snapshots.
  *
- * Rename: local-only label stored in SharedPrefs keyed on `<appId>:<groupId>`.
- * Delete: not supported (Steam manages cloud retention; the UI hides Delete for this storage).
+ * Labels are stored locally in SharedPrefs. Delete is unsupported because Steam manages cloud
+ * retention.
  *
- * Phase 9: the cloud file listing comes from the C++ WN-Steam-Client
- * ([SteamService.fetchCloudFileList] → [SteamAutoCloud.CloudFileChangeList]).
+ * Cloud file listings come from the C++ WN-Steam-Client through
+ * [SteamService.fetchCloudFileList] and [SteamAutoCloud.CloudFileChangeList].
  */
 object SteamCloudHistoryProvider {
     private const val TAG = "SteamCloudHistory"
 
-    /** Time window for grouping files into a "save event". 120s covers batched saves. */
+    /** Time window for grouping files into one save event. */
     private const val GROUP_WINDOW_MS = 120_000L
 
-    /** Maximum number of groups surfaced in the history UI. */
+    /** Maximum number of groups shown in the history UI. */
     private const val MAX_GROUPS = 30
 
-    /** SharedPrefs file for user-set group labels (Steam Cloud has no native label support). */
+    /** SharedPrefs file for user-set group labels. */
     private const val LABEL_PREFS = "steam_cloud_history_labels"
 
     /** Distinguishes "no cloud saves" from "Steam unreachable" for the UI. */
@@ -56,10 +50,8 @@ object SteamCloudHistoryProvider {
     }
 
     /**
-     * Fetch the Steam Cloud file list for [appId] and group the files into
-     * "save events" by timestamp clusters. Detailed variant returns
-     * [HistoryResult.Unreachable] when wn-session can't be reached so the
-     * UI can distinguish that from a genuinely empty save list.
+     * Fetches Steam Cloud files for [appId] and groups them by timestamp clusters.
+     * Returns [HistoryResult.Unreachable] so the UI can distinguish that from empty.
      */
     suspend fun listCloudSaveGroupsDetailed(
         context: Context,
@@ -170,13 +162,10 @@ object SteamCloudHistoryProvider {
     }
 
     /**
-     * Restore the cloud state by syncing the entire current cloud file set to local.
+     * Restores by syncing the full current Steam Cloud file set to local.
      *
-     * **Why a full sync rather than a per-group download:** Steam Cloud only stores the
-     * current version of each filename. Every group in the history list points at the SAME
-     * current cloud state — they differ only in which subset of files was last modified in
-     * a given time window. A full sync is correct, cheap, and gives identical behavior
-     * across group selections.
+     * Steam Cloud does not expose per-group snapshots, so every history group restores the
+     * same current cloud state.
      */
     suspend fun restoreSaveGroup(
         activity: Activity,
@@ -198,7 +187,7 @@ object SteamCloudHistoryProvider {
             }
         }
 
-    /** Persist the user-set label for [groupFileId] (local SharedPrefs, never sent to Steam). */
+    /** Persists the user-set label for [groupFileId]. */
     fun setLabel(context: Context, groupFileId: String, label: String?) {
         val prefs = context.getSharedPreferences(LABEL_PREFS, Context.MODE_PRIVATE)
         val edit = prefs.edit()
@@ -207,9 +196,7 @@ object SteamCloudHistoryProvider {
     }
 
     /**
-     * Stable group identifier: SHA-256 of sorted filenames + earliest timestamp, truncated
-     * to 16 hex chars. Stable across re-fetches as long as the cluster's file set and time
-     * window don't change.
+     * Builds a stable ID from the cluster's sorted filenames and earliest timestamp.
      */
     private fun buildGroupId(sortedFilenames: List<String>, earliestTs: Long): String {
         val md = MessageDigest.getInstance("SHA-256")
