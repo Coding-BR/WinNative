@@ -286,11 +286,6 @@ public abstract class ProcessHelper {
       pb.directory(workingDir);
       pb.environment().putAll(EnvironmentManager.getEnvVars());
       if (debugCallbacks.isEmpty()) {
-        // When WINEDEBUG is set, divert Wine's stderr/stdout to a rolling log
-        // file in the app's filesDir instead of /dev/null — otherwise every
-        // +module/+loaddll/+relay channel disappears and on-device launch
-        // failures can't be diagnosed. Path is fixed so we don't have to plumb
-        // a Context here; harmless for shells that aren't Wine.
         String wineDebug = EnvironmentManager.getEnvVars().get("WINEDEBUG");
         boolean wineDebugActive = wineDebug != null
                 && !wineDebug.isEmpty()

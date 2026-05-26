@@ -211,10 +211,6 @@ void WnLibraryStore::ingest_app_pics_response(
                     parse_csv_appids(dlc_csv->as_string(), app.dlc_app_ids);
                 }
             }
-            // PICS depots.branches.public.buildid — the public-branch
-            // build id used by ISteamApps.GetAppBuildId. Numeric VDF
-            // value. Falls back to 0 (no public branch / DLC apps that
-            // don't ship their own depots).
             if (const auto* depots = appinfo->child("depots")) {
                 if (const auto* branches = depots->child("branches")) {
                     if (const auto* pub = branches->child("public")) {

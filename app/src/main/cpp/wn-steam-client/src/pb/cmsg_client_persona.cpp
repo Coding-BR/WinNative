@@ -15,9 +15,6 @@ std::vector<uint8_t> CMsgClientRequestFriendData::serialize() const {
 }
 
 namespace {
-// Parse one rich_presence KV submessage: { 1 string key, 2 string value }.
-// Returns the (key, value) pair on success, nullopt on parse failure /
-// missing fields.
 std::optional<std::pair<std::string, std::string>>
 parse_kv_submessage(std::span<const uint8_t> body) noexcept {
     proto::Reader r(body);
@@ -39,8 +36,6 @@ parse_kv_submessage(std::span<const uint8_t> body) noexcept {
             return std::nullopt;
         }
     }
-    // Steam can send KV with empty value (signals "key removed"). Treat
-    // missing fields as empty strings — caller decides how to interpret.
     (void)got_k; (void)got_v;
     return std::make_pair(std::move(k), std::move(v));
 }
@@ -74,7 +69,6 @@ PersonaStateFriend::deserialize(std::span<const uint8_t> body) noexcept {
                 else return std::nullopt;
                 break;
             case 25: {
-                // CMsgClientPersonaState.Friend.rich_presence — repeated KV.
                 auto b = r.bytes();
                 if (!b) return std::nullopt;
                 auto kv = parse_kv_submessage(*b);

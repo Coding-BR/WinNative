@@ -384,10 +384,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeCreate(
     init_jni_session_globals(env);
     auto* h = new (std::nothrow) SessionHandle();
     if (!h) return 0;
-    // Register the CMClient as the process-wide \"active\" instance so
-    // libsteamclient.so's C-ABI bridge (cm_bridge.h) can dispatch CM
-    // operations into it. Weak-ptr only — the bridge doesn't extend
-    // lifetime, and nativeDestroy below clears the slot.
     wn_steam::wn_cm_bridge_set_active(h->client);
     return to_handle(h);
 }
@@ -397,10 +393,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeDestroy
         JNIEnv* /*env*/, jclass /*cls*/, jlong h) {
     auto* s = from_handle(h);
     if (!s) return;
-    // Clear the bridge BEFORE delete — pending stubs in libsteamclient.so
-    // attempting CM ops post-destroy would otherwise lock() a weak_ptr
-    // that resolves to a half-destroyed client. weak_ptr.lock() goes
-    // empty immediately on this call.
     wn_steam::wn_cm_bridge_clear_active();
     delete s;
 }
@@ -490,11 +482,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeDisconn
     s->client->disconnect();
 }
 
-// Clean hand-off variant: sends CMsgClientLogOff then disconnects.
-// Steam clears the session immediately so a subsequent
-// LogonWithRefreshToken (from the bootstrap's libsteamclient.so) on
-// the same account doesn't trip the concurrent-login anti-abuse
-// (EResult=15 AccessDenied). See cm_client.cpp::log_off_and_disconnect.
 JNIEXPORT void JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeLogOffAndDisconnect(
         JNIEnv* /*env*/, jclass /*cls*/, jlong h, jint flushMs) {
@@ -1231,9 +1218,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeDownloa
 // blocking calls the C++ job carries its own 30s timeout so fut.get() cannot
 // hang. synced_change_number is fixed at 0 here — the restore path always
 // wants the full list.
-// Blocking Cloud.GetUserQuota#1. Returns [total_bytes, used_bytes] as a
-// 2-element jlongArray, or null on failure / not logged on. 30s native
-// timeout. Both values fit in jlong (Steam quotas are well under 2^63).
 JNIEXPORT jlongArray JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetCloudUserQuota(
         JNIEnv* env, jclass /*cls*/, jlong h) {
@@ -1959,10 +1943,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeSetPers
     client->set_persona_state(static_cast<uint32_t>(persona_state));
 }
 
-// Fire-and-forget CMsgClientChangeStatus with player_name set —
-// the "rename" Steam round-trip. The server-pushed
-// CMsgClientPersonaState that follows echoes the new name back via
-// self_persona(). No-op when not logged on.
 JNIEXPORT void JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeSetPersonaName(
         JNIEnv* env, jclass /*cls*/, jlong h, jstring jname, jint persona_state) {
@@ -1988,8 +1968,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeRequest
     client->request_user_persona();
 }
 
-// Fire-and-forget CMsgClientRequestFriendData for an arbitrary set of
-// SteamID64s. Replies arrive async; read them via nativeGetFriendPersonas.
 JNIEXPORT void JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeRequestFriendPersonas(
         JNIEnv* env, jclass /*cls*/, jlong h, jlongArray sids, jint flags) {
@@ -2149,9 +2127,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetLice
     return env->NewStringUTF(j.c_str());
 }
 
-// Returns the cached CMsgClientFriendsList friend SteamID64s as a
-// jlongArray (mutual friends only, relationship == 3). Empty array until
-// the post-logon ClientFriendsList push has arrived. Non-blocking.
 JNIEXPORT jlongArray JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetFriendsList(
         JNIEnv* env, jclass /*cls*/, jlong h) {
@@ -2160,17 +2135,12 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetFrie
     auto ids = s->client->friends_list();
     jlongArray arr = env->NewLongArray(static_cast<jsize>(ids.size()));
     if (!arr || ids.empty()) return arr;
-    // jlong is signed 64-bit; SteamID64 fits as-is when reinterpreted.
     static_assert(sizeof(jlong) == sizeof(uint64_t), "jlong/uint64 size mismatch");
     env->SetLongArrayRegion(arr, 0, static_cast<jsize>(ids.size()),
                             reinterpret_cast<const jlong*>(ids.data()));
     return arr;
 }
 
-// Returns cached friend personas as a JSON array
-// [{"sid":<long>,"name":"...","state":<int>,"app":<int>},...].
-// Empty array until persona-state pushes have arrived. Names-only
-// snapshot — empty names are filtered out.
 JNIEXPORT jstring JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetFriendPersonas(
         JNIEnv* env, jclass /*cls*/, jlong h) {
@@ -2182,14 +2152,11 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeGetFrie
         if (i) j += ',';
         const auto& p = snaps[i];
         j += "{\"sid\":";
-        // Emit as signed so it round-trips through Kotlin's Long.
         j += std::to_string(static_cast<int64_t>(p.sid));
         j += ",\"name\":\"";
         j += cloud_json_escape(p.player_name);
         j += "\",\"state\":"; j += std::to_string(p.persona_state);
         j += ",\"app\":";     j += std::to_string(p.game_played_app_id);
-        // Avatar hash as lowercase hex (empty when not yet observed);
-        // SteamService routes it to WnLibSteamClient.setFriendAvatarHash.
         j += ",\"avatarHash\":\"";
         j += cloud_to_hex(p.avatar_hash);
         j += "\"}";
@@ -2311,18 +2278,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativePickCmU
     return env->NewStringUTF("");
 }
 
-// HYBRID STAGE-2 — mint a FRESH refresh token from the current one so
-// the bootstrap can log on with a token that has never been used,
-// bypassing Steam's concurrent-login anti-abuse (EResult=15) when both
-// wn-session and bootstrap want to be on the same account.
-//
-// Calls Authentication.GenerateAccessTokenForApp#1 with
-// renewal_type=Allow; the response carries a new refresh_token.
-// Synchronous from the caller's POV: the callback fires on the recv
-// thread, we wake the JNI thread via std::promise + std::future.
-//
-// Returns the new refresh_token as String, or null on any failure path
-// (not logged on / timeout / service error / empty response).
 JNIEXPORT jstring JNICALL
 Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeRenewRefreshToken(
         JNIEnv* env, jclass /*cls*/, jlong h,
@@ -2348,7 +2303,6 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeRenewRe
 
     s->client->call_service_method(
         "Authentication.GenerateAccessTokenForApp#1",
-        /*authed=*/ true,
         body,
         [promise](wn_steam::JobResult r) {
             if (r.eresult != 1 /*EResult.OK*/ || r.synthetic_failure) {

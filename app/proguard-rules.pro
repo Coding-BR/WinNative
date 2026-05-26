@@ -33,10 +33,8 @@
 # was triggered by R8 renaming WnConnectionObserver and the auth/library/
 # session callback observers the C++ JNI code finds by name.
 -keep class com.winlator.cmod.feature.stores.steam.wnsteam.** {
-    *;
 }
 -keepclassmembers class com.winlator.cmod.feature.stores.steam.wnsteam.** {
-    *;
 }
 # JNI also calls back into PrefManager / SteamService observers + Steam
 # data classes (UserFileInfo, AppMetadata, etc.). Keep the feature

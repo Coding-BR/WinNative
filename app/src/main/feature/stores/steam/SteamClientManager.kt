@@ -613,14 +613,6 @@ object SteamClientManager {
             return msiFile
         }
 
-        // Build a list of versions to try, in order. Some Proton builds bake
-        // a wine-mono version string that was never published as an MSI on
-        // dl.winehq.org (e.g. Proton 9.0's mscoree.dll claims 9.3.1 but
-        // winehq's archive only ships 9.3.0 — verified 2026-05-21 HTTP 404
-        // on /9.3.1/wine-mono-9.3.1-x86.msi). When the exact version 404s
-        // we walk PATCH versions back to .0, then try MINOR=.0 PATCH=.0,
-        // then accept any wine-mono MSI we already have on disk as a last
-        // resort. Anything functional is better than a stuck launcher.
         val (major, minor, patch) = version.split('.').map { it.toInt() }
         val candidates = mutableListOf<String>()
         candidates.add(version)
@@ -673,10 +665,6 @@ object SteamClientManager {
         }
         if (downloaded != null) return downloaded
 
-        // Last-resort fallback: use any wine-mono MSI we already have. Wine's
-        // Mono is generally backward/forward-compatible at the protocol level
-        // (it's all .NET Framework). Using 10.4.1 when 9.3.1 was requested is
-        // strictly better than failing the launch entirely.
         val anyExistingMsi = monoDir.listFiles()?.firstOrNull {
             it.name.matches(monoMsiPattern) && it.length() > 0
         }

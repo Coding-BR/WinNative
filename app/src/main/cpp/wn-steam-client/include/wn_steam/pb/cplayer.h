@@ -17,13 +17,6 @@
 
 namespace wn_steam::pb {
 
-// Player.SetRichPresence#1 request — write the local user's rich-
-// presence map for `appid`. The full new map replaces the prior set
-// on every call (the SDK contract: caller has the authoritative
-// version locally, this is a wholesale broadcast).
-//
-//   1 uint32 appid
-//   2 repeated KV rich_presence  { 1 string key, 2 string value }
 struct CPlayer_SetRichPresence_KV {
     std::string key;
     std::string value;

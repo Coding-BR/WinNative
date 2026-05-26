@@ -30,7 +30,6 @@ data class WnOwnedApp(
     val accessToken: String,
     val dlcAppIds: List<Int>,
     val sourcePackageIds: List<Int>,
-    /** PICS public-branch build id; 0 when no public branch / not yet resolved. */
     val buildId: Int = 0,
 )
 

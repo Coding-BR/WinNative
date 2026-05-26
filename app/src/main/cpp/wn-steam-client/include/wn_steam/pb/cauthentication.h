@@ -212,24 +212,6 @@ struct CAuthentication_BeginAuthSessionViaQR_Response {
     deserialize(std::span<const uint8_t> body) noexcept;
 };
 
-// ---------------------------------------------------------------------------
-// CAuthentication.GenerateAccessTokenForApp#1
-//
-// Mints a fresh access_token (and, when renewal_type == Allow, a fresh
-// refresh_token) from an existing refresh_token. The hybrid hand-off
-// uses this to give the bootstrap its OWN logon-independent token so
-// libsteamclient.so's LogonWithRefreshToken doesn't trip Steam's
-// concurrent-login anti-abuse against wn-session's token usage.
-//
-// Request field numbers (Valve's proto):
-//   1  string                  refresh_token   (current refresh token)
-//   2  fixed64                 steamid
-//   3  EAuthTokenRenewalType   renewal_type    (0 = None, 1 = Allow)
-//
-// Response field numbers:
-//   1  string                  access_token
-//   2  string                  refresh_token   (present iff renewal_type=Allow)
-// ---------------------------------------------------------------------------
 
 enum class EAuthTokenRenewalType : int32_t {
     None  = 0,

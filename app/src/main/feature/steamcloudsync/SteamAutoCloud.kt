@@ -181,13 +181,6 @@ object SteamAutoCloud {
 
     private fun hexToBytes(hex: String): ByteArray {
         if (hex.isEmpty()) return ByteArray(0)
-        // Odd-length or non-hex hex strings used to silently return an
-        // empty array — combined with .contentEquals against a real
-        // SHA-1, every file then flagged as "differs", spawning a
-        // spurious "Use Cloud / Use Local" conflict dialog (audit
-        // bonus fix). Now: WARN + still return empty (skip-on-error
-        // semantics — better than throwing mid-sync and losing the
-        // batch). Reject any character outside 0-9a-fA-F.
         if (hex.length % 2 != 0 || !hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
             Timber.w("hexToBytes: malformed input (len=%d, sample='%s') — returning empty array",
                 hex.length, hex.take(16))
@@ -730,32 +723,6 @@ object SteamAutoCloud {
                             } catch (_: Exception) {
                                 Files.move(tmpPath, actualFilePath, StandardCopyOption.REPLACE_EXISTING)
                             }
-                            // Preserve the cloud-side mtime UNCONDITIONALLY.
-                            // CloudFileInfo.timestamp is already in millis
-                            // (parseCloudFileChangeList scales the native
-                            // unix-seconds value at line 244).
-                            //
-                            // Why no `if (file.timestamp > 0)` guard: when
-                            // Steam's cloud returns time_stamp=0 for a file
-                            // (placeholder entries, certain delete-style
-                            // records, very old uploads that never had a
-                            // timestamp set), skipping the restore leaves
-                            // mtime at the atomic-write time (= "now"). On
-                            // the next launch, `localTimestamp` is `max()`
-                            // across all local mtimes, so even ONE such
-                            // drifty file makes the conflict UI report
-                            // "Local = current time" vs the cloud's real
-                            // time → false conflict on every re-launch
-                            // because the local timestamp keeps shifting
-                            // forward on each download.
-                            //
-                            // Setting mtime to epoch (1970-01-01) for
-                            // zero-timestamp files gives a stable sentinel
-                            // that doesn't drift and is visually
-                            // recognizable as "cloud-side timestamp was
-                            // unset". A prior bug here also multiplied
-                            // file.timestamp by 1000 and set mtimes to
-                            // year 58364 — fixed by this same hunk.
                             try {
                                 val mtimeMs = if (file.timestamp > 0) file.timestamp else 0L
                                 java.nio.file.Files.setLastModifiedTime(

@@ -42,7 +42,6 @@ object SteamCloudHistoryProvider {
     /** SharedPrefs file for user-set group labels. */
     private const val LABEL_PREFS = "steam_cloud_history_labels"
 
-    /** Distinguishes "no cloud saves" from "Steam unreachable" for the UI. */
     sealed class HistoryResult {
         data class Entries(val list: List<BackupHistoryEntry>) : HistoryResult()
         object Empty : HistoryResult()
@@ -50,10 +49,6 @@ object SteamCloudHistoryProvider {
     }
 
     /**
-     * Fetch the Steam Cloud file list for [appId] and group the files into
-     * "save events" by timestamp clusters. Detailed variant returns
-     * [HistoryResult.Unreachable] when wn-session can't be reached so the
-     * UI can distinguish that from a genuinely empty save list.
      */
     suspend fun listCloudSaveGroupsDetailed(
         context: Context,
@@ -71,7 +66,6 @@ object SteamCloudHistoryProvider {
             }
         }
 
-    /** Flat-list shim — empty list for both Empty + Unreachable. */
     suspend fun listCloudSaveGroups(
         context: Context,
         appId: Int,
@@ -81,10 +75,6 @@ object SteamCloudHistoryProvider {
             HistoryResult.Empty, HistoryResult.Unreachable -> emptyList()
         }
 
-    // Normalize a cloud file timestamp to epoch millis (files report seconds, millis, or double-scaled).
-    // Reject post-2100 results: Steam occasionally returns Long.MAX_VALUE-derived
-    // sentinel values (≈ 9.22e9 s ⇒ April 2262) for files with uninitialized
-    // time_stamp; clamp those to 0 so they don't dominate the sort.
     private fun toMillis(v: Long): Long {
         val ms = when {
             v <= 0L -> 0L
@@ -95,7 +85,6 @@ object SteamCloudHistoryProvider {
         return if (ms > 4_102_444_800_000L) 0L else ms
     }
 
-    /** Shared cluster + group-entry builder for both variants. */
     private fun buildEntries(
         context: Context,
         appId: Int,
@@ -108,9 +97,6 @@ object SteamCloudHistoryProvider {
 
         if (persistedFiles.isEmpty()) return emptyList()
 
-        // Cluster files by timestamp proximity. Walk sorted-DESC files; each new file
-        // either joins the open cluster (if its timestamp is within GROUP_WINDOW_MS of
-        // the cluster's most-recent member) or starts a fresh cluster.
         class FileCluster {
             val files = mutableListOf<SteamAutoCloud.CloudFileInfo>()
             val timestamps = mutableListOf<Long>()

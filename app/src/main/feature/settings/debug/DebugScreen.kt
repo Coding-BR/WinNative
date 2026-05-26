@@ -262,11 +262,6 @@ fun DebugScreen(
             SectionLabel("Experimental", modifier = Modifier.padding(top = 8.dp))
         }
 
-        // Hybrid Steam mode toggle retired 2026-05-20. libsteamclient.so is
-        // now the SINGLE Steam session for the whole app lifetime; there's
-        // no other mode to switch to. PrefManager.wnHybridMode default is
-        // TRUE; the receiver still supports `enable`/`disable` ops for
-        // diagnostic kill-switch but the UI exposure is gone.
 
         item(key = "tools_section") {
             SectionLabel(stringResource(R.string.settings_debug_section_tools), modifier = Modifier.padding(top = 8.dp))

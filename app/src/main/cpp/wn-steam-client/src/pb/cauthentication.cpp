@@ -363,9 +363,6 @@ CAuthentication_BeginAuthSessionViaQR_Response::deserialize(
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CAuthentication_AccessToken_GenerateForApp
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t>
 CAuthentication_AccessToken_GenerateForApp_Request::serialize() const {

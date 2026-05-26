@@ -1,41 +1,3 @@
-// wn-steam-launcher.exe — in-process Steam client host.
-//
-// Replaces the wn-steam-helper.exe Proton stub for Bionic Steam mode. Loads
-// Valve's REAL Windows steamclient64.dll into THIS process, drives the
-// CLIENTENGINE_INTERFACE_VERSION005 refresh-token logon, then launches the
-// game via Valve's IClientAppManager::LaunchApp (CreateProcess fallback) so
-// SteamStub-wrapped DRM exes self-decrypt. The game's steam_api64.dll then
-// talks to a LOCAL in-process
-// steamclient64.dll via Valve's normal IPC slot mechanism — no cross-process
-// bridge to the Android side needed. All Steam features (matchmaking, P2P,
-// SDR, friends, chat) flow through Valve's real client natively.
-//
-// Mirrors the IClientEngine/IClientUser dance we use in wn-steam-bootstrap on
-// the Android side (steam_bootstrap.cpp:687-770). Same vtable offsets — Valve
-// keeps the SDK ABI consistent across Windows and bionic-Linux builds for
-// CLIENTENGINE_INTERFACE_VERSION005.
-//
-// Reads from env (set by XServerDisplayActivity before launching us):
-//   WN_STEAM_TOKEN      Steam refresh token (JWT)
-//   WN_STEAM_USERNAME   account name
-//   WN_STEAM_STEAMID    64-bit Steam ID (decimal string)
-//   WN_STEAM_APPID      game app id (decimal string, informational)
-//
-// Argv:
-//   argv[1]             game .exe full Windows path (e.g.
-//                       "C:\Program Files (x86)\Steam\steamapps\common\Forest\TheForest.exe")
-//   argv[2..]           extra args passed through to the game
-//
-// Exit codes:
-//   0   game ran to completion
-//   1   missing argv / env (caller bug)
-//   2   LoadLibrary steamclient64.dll failed
-//   3   GetProcAddress CreateInterface failed
-//   4   Steam_CreateGlobalUser failed (pipe+user setup)
-//   5   CreateInterface(CLIENTENGINE_INTERFACE_VERSION005) returned null
-//   6   GetIClientUser returned null
-//   7   BLoggedOn never reached true (10s timeout)
-//   8   CreateProcess game.exe failed
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -49,8 +11,6 @@
 #include <string>
 #include <vector>
 
-// LoadLibraryEx search-path flags — fallbacks in case the mingw-w64 headers
-// gate them behind a higher _WIN32_WINNT than we compile at.
 #ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
 #define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
 #endif
@@ -64,87 +24,36 @@
 #define LOAD_IGNORE_CODE_AUTHZ_LEVEL 0x00000010
 #endif
 
-// Calling convention for steamclient's C++ virtual (vtable) methods. On a
-// 32-bit build those are MSVC __thiscall (this in ECX); on x86-64 there is
-// one convention so it expands to nothing. The flat Steam_* / CreateInterface
-// exports stay __cdecl (the compiler default) on both.
 #ifdef __i386__
 #define WN_THISCALL __thiscall
 #else
 #define WN_THISCALL
 #endif
 
-// IClientUser / IClientEngine vtable offsets — CONFIRMED by binary RE of
-// Valve's steamclient64.dll (steam_client_0403) AND by decompiling GameHub
-// SteamAgent's SteamCore::LoginToSteam (FUN_140055690).
-//
-// The Windows steamclient64.dll has NO `LogOnWithRefreshToken` method. The
-// online refresh-token logon SteamAgent performs is exactly 3 IClientUser
-// calls, in order:
-//   1. SetLoginToken(token, accountName)         +0x1C0
-//   2. GetSteamID(&out)  -> resolved CSteamID    +0x50
-//   3. LogOn(thatCSteamID)                       +0x08
-// SteamAgent does NOT call SetAccountNameForCachedCredentialLogin or
-// SetLoginInformation on the online path — those belong to the offline-mode
-// branch only. The old launcher mislabeled the offsets (from the bionic
-// libsteamclient.so) and called SetAccountNameForCachedCredentialLogin,
-// which the online CM logon never wants → EResult=15 AccessDenied.
 static const int kVtEngine_GetIClientUser   = 0x40;  // IClientEngine slot 8
-// IClientUser:
 static const int kVtUser_LogOn              = 0x08;  // slot  1: EResult LogOn(uint64 steamID)
 static const int kVtUser_BLoggedOn          = 0x20;  // slot  4: bool BLoggedOn()
 static const int kVtUser_GetSteamID         = 0x50;  // slot 10: CSteamID& GetSteamID(CSteamID& out)
 static const int kVtUser_BHasCachedCreds    = 0x188; // slot 49: bool BHasCachedCredentials(const char*)
 static const int kVtUser_SetLoginToken      = 0x1C0; // slot 56: EResult SetLoginToken(const char* token, const char* account)
 
-// IClientUser install-script engine slots — CONFIRMED from GameHub SteamAgent
-// (FUN_14005a850 / FUN_1400504a0) against steamclient64.dll. The agent runs the
-// game's installscript.vdf (VC++ redist, prerequisites, registry setup) through
-// these before LaunchApp; a prerequisite-dependent game won't boot without it.
 static const int kVtUser_RunInstallScript       = 0x310; // slot 98: bool RunInstallScript(AppId_t, int flags)
 static const int kVtUser_IsInstallScriptRunning = 0x318; // slot 99: int  IsInstallScriptRunning()
 static const int kVtUser_GetInstallScriptState  = 0x320; // slot 100: bool GetInstallScriptState(char*, uint32, int*, int*)
 
-// IClientEngine slot 43 — GetIClientAppManager(hUser, hPipe). CONFIRMED by
-// disassembling GameHub SteamAgent (FUN_140055180). IClientAppManager slot 2
-// — LaunchApp — CONFIRMED two ways: GameHub's SteamCore::LaunchApplication
-// call site (call [appmgr_vtable+0x10]) and the steamclient64.dll
-// IClientAppManager proxy vtable (0 InstallApp, 1 UninstallApp, 2 LaunchApp,
-// 3 ShutdownApp).
 static const int kVtEngine_GetIClientAppManager = 0x158; // IClientEngine slot 43
 static const int kVtAppMgr_LaunchApp            = 0x10;  // IClientAppManager slot 2
-// IClientAppManager slots — make steamclient see the game as FullyInstalled
-// before LaunchApp. RefreshAppInfo re-scans library folders; GetAppInstallState
-// returns EAppState bits (bit 2 = FullyInstalled). Verified working on-device.
 static const int kVtAppMgr_RefreshAppInfo       = 0x298; // void RefreshAppInfo()
 static const int kVtAppMgr_GetAppInstallState   = 0x20;  // int  GetAppInstallState(AppId_t)
 
-// IClientApps — request the PICS appinfo for the game before LaunchApp so
-// steamclient has the launch config loaded. Without this, LaunchApp's job
-// fails with EAppUpdateError=9 (MissingConfig) and silently doesn't spawn.
-// Slot offsets verified against steamclient64.dll's IClientApps proxy
-// thunk table (CONFIRMED in HEAD's launcher; GameHub's SteamCore::RefreshApps
-// uses the same call shape).
 static const int kVtEngine_GetIClientApps       = 0x88;  // slot 17: IClientApps*(hUser, hPipe)
 static const int kVtApps_RequestAppInfoUpdate   = 0x38;  // slot 7:  bool(AppId_t* ids, int n)
 
-// IClientUtils — used to poll LaunchApp's HSteamAPICall result so we can read
-// the EAppUpdateError that explains why the spawn silently didn't happen.
-// Slots verified by RE of GameHub SteamAgent's poll loop (FUN_14005d5c0 +
-// FUN_14005518... at VA 0x140055580, IClientUtils stored at this+0x78) +
-// cross-check with the IClientUtilsMap proxy vtable in steamclient64.dll @
-// 0x1392e6718.
 static const int kVtEngine_GetIClientUtils       = 0x70;  // slot 14: IClientUtils*(HSteamPipe)
 static const int kVtUtils_IsAPICallCompleted     = 0xB0;  // slot 22: bool(apiCall, *pbFailed)
 static const int kVtUtils_GetAPICallFailureReason = 0xB8; // slot 23: int(apiCall)  ESteamAPICallFailure
 static const int kVtUtils_GetAPICallResult       = 0xC0;  // slot 24: bool(apiCall, pCb, cubCb, iCbExpected, *pbFailed)
 
-// LaunchAppResult_t — k_iClientAppManagerCallbacks + 0xB = 0x1361 << 8 | 0x0b.
-// Size + error-offset extracted from FUN_140058f20 disassembly:
-//   mov $0x13610b, [%rsp+0x20]     iCallbackExpected
-//   mov $0x20c,   %r9d              cubCallback (524 bytes)
-//   lea -0x10(%rbp), %r8            buffer base
-//   cmp %esi, -0x8(%rbp)            error read at buffer+0x8
 static const int kLaunchAppResultCallbackId    = 0x13610B;
 static const int kLaunchAppResultSize          = 0x20C;
 static const int kLaunchResultErrorOffset      = 0x8;     // int32 EAppUpdateError
@@ -166,13 +75,8 @@ static void log_line(const char* fmt, ...) {
     if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
     buf[n] = '\n';
     buf[n + 1] = '\0';
-    // Wine routes stderr to the host log when launched under our XServer
-    // GuestProgramLauncher; that's the channel logcat sees.
     fputs(buf, stderr);
     OutputDebugStringA(buf);
-    // Also append to C:\wn-launcher.log so the logon trace is readable
-    // off-device via `adb ... cat .../drive_c/wn-launcher.log` — the
-    // launcher's stderr does NOT reliably reach wine_stderr.log.
     FILE* lf = fopen("C:\\wn-launcher.log", "a");
     if (lf) { fputs(buf, lf); fclose(lf); }
 }
@@ -183,7 +87,6 @@ static uint64_t env_u64(const char* name) {
     return (uint64_t) _strtoui64(v, NULL, 10);
 }
 
-// base64url alphabet value for one char, -1 if not a b64url digit.
 static int b64url_val(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -193,19 +96,12 @@ static int b64url_val(unsigned char c) {
     return -1;
 }
 
-// Decode + log the JWT *payload* (middle segment) of the refresh token.
-// The payload carries the account-metadata claims — aud (audience: must
-// include "client" for a Steam-client logon), exp (expiry), iat, iss,
-// sub (SteamID). Logging these makes an EResult=15 caused by an
-// expired / wrong-audience token diagnosable in one read. The signature
-// segment is NOT logged. Best-effort — silently skips on malformed input.
 static void log_token_claims(const char* token) {
     if (!token || !*token) { log_line("[wn-launcher] token: (empty)"); return; }
     const char* dot1 = strchr(token, '.');
     if (!dot1) { log_line("[wn-launcher] token: not a JWT (no '.')"); return; }
     const char* dot2 = strchr(dot1 + 1, '.');
     if (!dot2) { log_line("[wn-launcher] token: not a JWT (one '.')"); return; }
-    // Middle segment = base64url(payload).
     size_t seglen = (size_t)(dot2 - (dot1 + 1));
     if (seglen == 0 || seglen > 2000) {
         log_line("[wn-launcher] token: payload segment size unusable (%zu)", seglen);
@@ -230,9 +126,6 @@ static void log_token_claims(const char* token) {
     log_line("[wn-launcher] token JWT payload: %s", out);
 }
 
-// Write HKCU\Software\Valve\Steam\ActiveProcess so the game's steam_api64.dll
-// resolves SteamClientDll/SteamClientDll64 to our staged Valve binaries and
-// believes Steam is "running".
 static void seed_active_process_registry(uint32_t our_pid, uint32_t steam_account_id) {
     HKEY h = NULL;
     LONG rc = RegCreateKeyExA(HKEY_CURRENT_USER,
@@ -255,8 +148,6 @@ static void seed_active_process_registry(uint32_t our_pid, uint32_t steam_accoun
     RegSetValueExA(h, "ActiveUser",       0, REG_DWORD, (const BYTE*) &active_user, sizeof(active_user));
     RegCloseKey(h);
 
-    // Also write HKCU\Software\Valve\Steam\Apps\<appId>\Installed=1 for
-    // certain games that consult it before launching.
     const char* appIdStr = getenv("WN_STEAM_APPID");
     if (appIdStr && *appIdStr) {
         char keyPath[256];
@@ -273,14 +164,6 @@ static void seed_active_process_registry(uint32_t our_pid, uint32_t steam_accoun
             RegCloseKey(h2);
         }
     }
-    // GameHub model: write the full Steam-install registry contract so the
-    // game's GENUINE steam_api64.dll can locate the Steam dir and
-    // SetDllDirectory() it before loading steamclient64.dll. Without
-    // SteamPath set, steam_api64.dll loads steamclient64.dll without the
-    // Steam dir on the DLL search path, and steamclient64.dll's tier0_s64 /
-    // vstdlib_s64 imports fail to resolve (-> ntdll stubs -> page fault).
-    // Real Steam writes SteamPath forward-slash lowercase, InstallPath
-    // backslash. Mirrors what GameHub's SteamAgent writes.
     {
         const char* steamFwd  = "c:/program files (x86)/steam";
         const char* steamExe  = "c:/program files (x86)/steam/steam.exe";
@@ -303,7 +186,6 @@ static void seed_active_process_registry(uint32_t our_pid, uint32_t steam_accoun
                            (const BYTE*) steamFwd,  (DWORD) strlen(steamFwd) + 1);
             RegCloseKey(hm);
         }
-        // Some steam_api builds also consult the SteamPath env var.
         SetEnvironmentVariableA("SteamPath", steamBack);
     }
 
@@ -312,12 +194,6 @@ static void seed_active_process_registry(uint32_t our_pid, uint32_t steam_accoun
              our_pid, steam_account_id);
 }
 
-// Stage empty C:\Program Files (x86)\Steam\config\{config,local}.vdf.
-// Valve's steamclient64.dll stat()s these on its CreateGlobalUser /
-// CreateSteamPipe path and can stall/bail without an obvious error
-// when the config dir doesn't exist on a fresh prefix. Empty stubs
-// are enough for the stat to succeed; Valve repopulates them after a
-// successful logon. Mirrors steam_bootstrap.cpp's stage_steam_config_dir.
 static void stage_steam_config(void) {
     const char* cfgDir = "C:\\Program Files (x86)\\Steam\\config";
     CreateDirectoryA(cfgDir, NULL);  // no-op if it already exists
@@ -338,13 +214,6 @@ static void stage_steam_config(void) {
     }
 }
 
-// Write a minimal appmanifest_<appId>.acf so Valve's steamclient64.dll treats
-// the (self-staged) game as a fully-installed Steam app — IClientAppManager::
-// LaunchApp only launches *installed* apps. steamclient scans steamapps/*.acf
-// during init, so this MUST run before steamclient64.dll loads. installdir is
-// the path component right after "\steamapps\common\" in the game exe path;
-// StateFlags 4 = fully installed (the load-bearing field, per RE of GameHub's
-// SteamAgent — it ships no API installer, it relies on the on-disk ACF).
 static void stage_app_manifest(uint32_t appId, const char* gameExe) {
     if (appId == 0 || !gameExe) return;
     const char* marker = "\\steamapps\\common\\";
@@ -401,9 +270,6 @@ static void stage_app_manifest(uint32_t appId, const char* gameExe) {
              acf, installdir);
 }
 
-// Count running processes whose image name == exeName (case-insensitive,
-// basename). IClientAppManager::LaunchApp hands back no process handle, so
-// the LaunchApp path watches the process table to know when the game exits.
 static int count_process_by_name(const char* exeName) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return -1;
@@ -419,18 +285,6 @@ static int count_process_by_name(const char* exeName) {
     return count;
 }
 
-// True if `p` points into committed, executable memory. Used to sanity-check
-// runtime-built vtable slots before calling through them — MinGW's GCC has no
-// __try/__except, so this VirtualQuery probe is our guard against an offset
-// shift in a future steamclient build (a wrong slot reads a data/null pointer;
-// calling it would crash the launcher and abort the game launch).
-// Top-level unhandled-exception filter — logs the AV that Wine's ntdll
-// catches and turns into the opaque GLE=998. Note: VEH (AddVectored
-// ExceptionHandler) was tried first but its install call hung the launcher
-// on Proton 10 — Wine 10's ntdll appears to have a VEH bug. SEH /
-// UnhandledExceptionFilter doesn't go through that code path.
-// Dump every currently-loaded module's base + size + path. Called before
-// LoadLibrary so the UEF can map the fault IP to a module address range.
 static void dump_loaded_modules(const char* when) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
                                            GetCurrentProcessId());
@@ -491,7 +345,6 @@ static LONG WINAPI launcher_unhandled_filter(EXCEPTION_POINTERS* info) {
                  op, (unsigned long long) er->ExceptionInformation[1]);
     }
 
-    // Dump page info around the fault IP — explains why DEP fired.
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery(ip, &mbi, sizeof(mbi))) {
@@ -502,8 +355,6 @@ static LONG WINAPI launcher_unhandled_filter(EXCEPTION_POINTERS* info) {
         }
     }
 
-    // Context register dump (Rax-R15 + Rip + Rsp) — useful to spot
-    // which register held the bad function pointer just before the call.
     if (info->ContextRecord) {
         const CONTEXT* c = info->ContextRecord;
         log_line("[wn-launcher] UEF: ctx Rip=%llx Rsp=%llx Rbp=%llx",
@@ -516,7 +367,6 @@ static LONG WINAPI launcher_unhandled_filter(EXCEPTION_POINTERS* info) {
         log_line("[wn-launcher] UEF: ctx Rsi=%llx Rdi=%llx R8=%llx R9=%llx",
                  (unsigned long long) c->Rsi, (unsigned long long) c->Rdi,
                  (unsigned long long) c->R8,  (unsigned long long) c->R9);
-        // First 8 stack qwords — return-address chain hints.
         const uint64_t* sp = (const uint64_t*) c->Rsp;
         MEMORY_BASIC_INFORMATION smbi;
         if (sp && VirtualQuery((LPCVOID) sp, &smbi, sizeof(smbi))
@@ -534,24 +384,6 @@ static LONG WINAPI launcher_unhandled_filter(EXCEPTION_POINTERS* info) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// Install (idempotent) and start the "Steam Client Service" backed by
-// steamservice.exe so steamclient64.dll's IPC queue gets a consumer.
-// Without this, IClientAppManager::LaunchApp marshals the call into a
-// CSerializingBuffer + IPCClient::DispatchAndReturnAPICall, returns a
-// non-zero HSteamAPICall, and the work is silently dropped because there
-// is no peer process draining the named-event-backed pipe — verified by
-// Ghidra: the CAPIJobLaunchApp factory (steamclient64.dll @0x1384c1610)
-// and CUser::SpawnProcess (@0x1389d5dd0) are only reachable from a
-// server-side dispatcher that lives in steamservice.exe.
-//
-// GameHub's SteamAgent does the same (decompiled FUN_140052b40 /
-// FUN_1400531b0): OpenServiceW(L"Steam Client Service"), install if
-// missing via CreateService, StartService, poll status.
-//
-// Returns true iff the service is in SERVICE_RUNNING state when we
-// return. A false return is non-fatal — LaunchApp will still queue the
-// job and the launcher will fall through to the CreateProcess path that
-// already works for non-DRM games.
 static bool start_steam_client_service(void) {
     const char* kSvcName       = "Steam Client Service";
     const char* kSvcExe        = "C:\\Program Files (x86)\\Steam\\bin\\steamservice.exe";
@@ -645,57 +477,19 @@ static bool is_exec_ptr(void* p) {
            x == PAGE_EXECUTE_READWRITE || x == PAGE_EXECUTE_WRITECOPY;
 }
 
-// Steam Cloud sync is driven entirely on the Android side by wn-steam-client
-// (SteamLaunchCloudSync.syncBeforeLaunch / SteamExitCloudSync.syncOnExit).
-// The in-Wine IClientRemoteStorage::BeginAppSync path that used to live
-// here has been removed: steamclient's own auto-sync runs out-of-band on
-// logon, our explicit call was always declined (state=2 stable) and never
-// landed any bytes, so it was a no-op that just added latency + log noise.
 
-// -------------------------------------------------------------------------
-// Per-container redistributable installer with marker-file tracking.
-//
-// Replaces steamclient's RunInstallScript path for redistributables
-// (VC++, DirectX, etc.) shipped under the game's `_CommonRedist/` folder.
-// Steam's path silently fails on Wine for these installers — its
-// CreateProcess on `_CommonRedist/vcredist/2022/VC_redist.x64.exe` returns
-// ERROR_PATH_NOT_FOUND when the game install dir is a symlink (which it
-// always is under our /storage/emulated mount). We do the install
-// ourselves with CreateProcess + WaitForSingleObject and persist a marker
-// file inside the Wine prefix so the next launch in the same container
-// can skip already-installed redists.
-//
-// Tracking storage: `C:\wn-installed-redists.txt`. This lives inside the
-// per-container Wine prefix:
-//   <container.rootDir>/.wine/drive_c/wn-installed-redists.txt
-// Container deletion removes the prefix → marker goes with it. Recreating
-// a same-named container produces a new container ID and a new prefix
-// directory, so the marker is absent on first launch and redists install
-// fresh. No global state, no cross-container leakage.
-//
-// Format: one entry per line, tab-separated
-//   <filename>\t<size>\t<unix-timestamp>
-// Header comment line at top: `# wn-installed-redists v1`.
-// Match is by (filename, size) so a game update that replaces the
-// bundled installer's bytes triggers a clean reinstall.
-// -------------------------------------------------------------------------
 
 static const char* kRedistsMarkerPath = "C:\\wn-installed-redists.txt";
 
-// Derive the game's install directory from its full exe path.
-// Returns std::string for simplicity. Strips the trailing filename.
 static std::string game_dir_of(const char* gameExePath) {
     if (!gameExePath || !*gameExePath) return {};
     std::string p(gameExePath);
-    // Trim trailing backslash if any.
     while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
     auto pos = p.find_last_of("\\/");
     if (pos == std::string::npos) return {};
     return p.substr(0, pos);
 }
 
-// True if the marker file already records this (filename, size) pair.
-// Tolerant of a missing marker file (returns false).
 static bool redist_already_installed(const std::string& name, uint64_t size) {
     FILE* f = fopen(kRedistsMarkerPath, "r");
     if (!f) return false;
@@ -703,10 +497,8 @@ static bool redist_already_installed(const std::string& name, uint64_t size) {
     bool found = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
-        // Parse `<name>\t<size>\t<ts>` — name may contain spaces, never a tab.
         char* tab1 = strchr(line, '\t');
         if (!tab1) continue;
-        *tab1 = '\0';
         char* tab2 = strchr(tab1 + 1, '\t');
         if (!tab2) continue;
         uint64_t lineSize = _strtoui64(tab1 + 1, nullptr, 10);
@@ -716,13 +508,6 @@ static bool redist_already_installed(const std::string& name, uint64_t size) {
     return found;
 }
 
-// Append a new entry to the marker file. Creates the file with a header
-// on first use. The fourth column (exitCode) records the actual installer
-// exit so the user can see at a glance which installs succeeded vs which
-// refused (e.g. DXSETUP returning a Wine-specific code because the prefix
-// already has builtin d3dx9 DLLs). Both states result in a "marked, skip
-// on next launch" decision — only true timeouts (which never invoke this
-// function) leave the entry off the file so the user can retry.
 static void mark_redist_installed(const std::string& name, uint64_t size,
                                   uint32_t exitCode) {
     bool needHeader = false;
@@ -743,85 +528,35 @@ static void mark_redist_installed(const std::string& name, uint64_t size,
     fclose(f);
 }
 
-// Lowercase a copy of the input (ASCII only — installer names are
-// always plain ASCII).
 static std::string to_lower(const std::string& s) {
     std::string r = s;
     for (auto& c : r) c = (char) tolower((unsigned char) c);
     return r;
 }
 
-// Pick silent-install command-line args based on the installer's filename.
-// Different installer families use incompatible silent-flag conventions —
-// `/quiet` works for modern MSI bootstrappers (VC++ 2015-2022), but
-// DXSETUP.exe needs `/silent`, InnoSetup wants `/VERYSILENT`, NSIS uses
-// `/S`. Picking the wrong flag = installer pops a GUI dialog and waits
-// forever for user input (which is exactly the hang the user reported
-// with DXSETUP.exe under our prior `/quiet /norestart` default).
-//
-// Matrix sourced from each installer family's published silent-install
-// reference (Microsoft DirectX SDK docs, Visual C++ redistributable
-// command-line reference, InnoSetup setup command-line guide, NSIS
-// silent-install convention).
-//
-// Returns the args string to pass after the executable name. Does not
-// include the executable itself.
 static std::string silent_args_for(const std::string& filename) {
     std::string lower = to_lower(filename);
-    // DirectX 9.0c June 2010 redistributable (and older DXSetup builds).
     if (lower == "dxsetup.exe") return "/silent";
-    // Modern Visual C++ 2015-2022 redistributable bootstrapper.
     if (lower.rfind("vc_redist", 0) == 0) return "/quiet /norestart";
-    // Legacy Visual C++ 2005-2013 redistributable.
     if (lower.rfind("vcredist_", 0) == 0) return "/q /norestart";
-    // OpenAL Soft.
     if (lower == "oalinst.exe") return "/silent";
-    // PhysX system software installers (NVIDIA).
     if (lower.find("physx") != std::string::npos) return "/quiet";
-    // .NET Framework / .NET Runtime installers.
     if (lower.rfind("dotnetfx", 0) == 0
             || lower.rfind("dotnet", 0) == 0
             || lower.rfind("ndp", 0) == 0) {
         return "/q /norestart";
     }
-    // UE4/UE5 prerequisites bootstrapper.
     if (lower.find("prereqsetup") != std::string::npos
             || lower.find("ue4prereq") != std::string::npos
             || lower.find("ue5prereq") != std::string::npos) {
         return "/quiet /norestart";
     }
-    // InnoSetup (Unity prereqs, many Steam middleware installers).
-    // Heuristic: filename literally `setup.exe` — far from perfect but
-    // catches the InnoSetup convention.
     if (lower == "setup.exe") return "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
-    // Generic MSI-bootstrapper fallback. Works for ~80% of redist
-    // installers in the wild. If a specific installer hangs here add
-    // it to the dispatch above.
     return "/quiet /norestart";
 }
 
-// Three-way result from running a single redist installer:
-//   OK       — installer exited cleanly with 0 or 3010 (= success +
-//              reboot pending; we never reboot, harmless).
-//   FAILED   — installer ran and exited with a non-zero, non-3010 code.
-//              Mark anyway (don't retry) since the installer almost
-//              certainly knew what it was doing — common case is
-//              DXSETUP returning a Wine-specific code because the
-//              prefix already has builtin d3dx9 DLLs and it refuses
-//              to overwrite. Retrying every launch helps nobody and
-//              just adds 1-3 s of pointless work per launch.
-//   TIMEOUT  — silent install hung past 90 s. Almost always the wrong
-//              silent flag for this installer family (Inno/NSIS/etc.).
-//              Do NOT mark, so user can fix the dispatch and retry.
 enum class RedistInstallResult { OK, FAILED, TIMEOUT };
 
-// Run a single redist installer with the appropriate silent flags for
-// its installer family (see silent_args_for). Per-installer wait
-// capped at 90s — silent installs complete in <30s in practice; if
-// we hit 90s the installer is almost certainly hung on a GUI dialog
-// despite the silent flag (incorrect flag for this installer family).
-// Returns the exit code in *outExitCode (0xFFFFFFFF on CreateProcess
-// failure, 0xFFFFFFFE on timeout).
 static RedistInstallResult run_redist_installer(
         const std::filesystem::path& installer, uint32_t* outExitCode) {
     std::string fn = installer.filename().string();
@@ -869,7 +604,6 @@ static RedistInstallResult run_redist_installer(
                  "can retry once the right flag is added.",
                  fn.c_str(), args.c_str());
         TerminateProcess(pi.hProcess, 1);
-        // Wait briefly for kill to propagate, then collect.
         WaitForSingleObject(pi.hProcess, 5000);
         timedOut = true;
         exitCode = 0xFFFFFFFEu;  // sentinel for "killed by our timeout"
@@ -880,7 +614,6 @@ static RedistInstallResult run_redist_installer(
     if (timedOut) {
         return RedistInstallResult::TIMEOUT;
     }
-    // 0 = success, 3010 = success + reboot pending (we never reboot).
     bool ok = (exitCode == 0 || exitCode == 3010);
     log_line("[wn-launcher] redist install: %s exit=%lu (%s)",
              fn.c_str(), exitCode,
@@ -891,9 +624,6 @@ static RedistInstallResult run_redist_installer(
     return ok ? RedistInstallResult::OK : RedistInstallResult::FAILED;
 }
 
-// Main entry: scan <gameDir>/_CommonRedist/ for *.exe and install each
-// one not already recorded in the per-container marker file. No-op if
-// the folder doesn't exist or the game has no .exe redistributables.
 static void scan_and_install_redists(const char* gameExePath) {
     std::string gameDir = game_dir_of(gameExePath);
     if (gameDir.empty()) {
@@ -910,7 +640,6 @@ static void scan_and_install_redists(const char* gameExePath) {
     }
     log_line("[wn-launcher] redist scan: scanning %s", redistRoot.string().c_str());
 
-    // Collect every *.exe under _CommonRedist/.
     std::vector<std::filesystem::path> installers;
     for (auto it = std::filesystem::recursive_directory_iterator(
                 redistRoot, std::filesystem::directory_options::skip_permission_denied, ec);
@@ -962,20 +691,10 @@ static void scan_and_install_redists(const char* gameExePath) {
                 ++installed;
                 break;
             case RedistInstallResult::FAILED:
-                // Mark with the failure exit code so we don't re-run on
-                // every launch. Common case: DXSETUP refusing to install
-                // over Wine builtin DirectX 9 DLLs (returns a Wine-specific
-                // non-zero code). The launcher's job is to do its best; we
-                // don't keep banging on an installer that's told us it
-                // won't proceed.
                 mark_redist_installed(name, size, exitCode);
                 ++failedMarked;
                 break;
             case RedistInstallResult::TIMEOUT:
-                // Timeout almost always means the silent flag is wrong
-                // (Inno/NSIS/etc.) and the installer is hung on a GUI
-                // dialog. NOT marked, so the next launch retries after
-                // the user (or a code change) fixes silent_args_for.
                 ++timedOut;
                 break;
         }
@@ -988,14 +707,6 @@ static void scan_and_install_redists(const char* gameExePath) {
 int main(int argc, char** argv) {
     setbuf(stderr, NULL);
     setbuf(stdout, NULL);
-    // No console-hide step: this binary is linked --subsystem,windows
-    // (see build.sh), so Wine never attaches a console and never maps
-    // a visible console window. Earlier attempts to hide a console
-    // attached by --subsystem,console raced the X server and let the
-    // window briefly map before SW_HIDE took effect — which then
-    // satisfied isApplicationWindow() and prematurely closed the
-    // Android-side preloader. Truncate the log file at process start
-    // so each launch's trace is self-contained.
     { FILE* lf = fopen("C:\\wn-launcher.log", "w"); if (lf) fclose(lf); }
     log_line("[wn-launcher] Steam Launcher in-process Steam launcher starting (pid=%lu tid=%lu)",
              (unsigned long) GetCurrentProcessId(),
@@ -1018,36 +729,21 @@ int main(int argc, char** argv) {
              (unsigned long long) steamId,
              token ? (int) strlen(token) : 0,
              appId);
-    // Decode the refresh-token JWT claims so an EResult=15 caused by an
-    // expired / wrong-audience token is visible in wn-launcher.log.
     log_token_claims(token);
 
-    // Account ID (lower 32 bits of SteamID) — used for HKCU ActiveUser.
     uint32_t accId = (uint32_t)(steamId & 0xFFFFFFFFull);
     seed_active_process_registry(GetCurrentProcessId(), accId);
 
-    // Stage config/{config,local}.vdf stubs before loading steamclient64.dll.
     stage_steam_config();
 
-    // Stage appmanifest_<appId>.acf so steamclient sees the game as an
-    // installed Steam app — required for IClientAppManager::LaunchApp.
     stage_app_manifest(appId, gameExe);
 
-    // Log the TLS cert env so a logon timeout caused by a failed CM
-    // TLS handshake (no trusted CA) is diagnosable. XServerDisplayActivity
-    // sets STEAM_SSL_CERT_FILE in the Steam Launcher env block.
     {
         const char* sslCert = getenv("STEAM_SSL_CERT_FILE");
         log_line("[wn-launcher] STEAM_SSL_CERT_FILE=%s",
                  (sslCert && *sslCert) ? sslCert : "(unset)");
     }
 
-    // Env-propagation probe: log a handful of Proton/Wine env vars that
-    // we expect to inherit from the spawner so we can tell whether the
-    // env layer made it through wine -> winhandler -> steam.exe. If
-    // PROTON_DISABLE_LSTEAMCLIENT is "1" here but ntdll still prints no
-    // "lsteamclient disabled.", the gate is reading from a different
-    // source than libc getenv.
     {
         const char* probes[] = {
             "PROTON_DISABLE_LSTEAMCLIENT",
@@ -1068,33 +764,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // STEP 1: LoadLibrary Valve's real steamclient64.dll from the Steam
-    // dir, by FULL ABSOLUTE PATH so Wine's DllOverrides (which redirect a
-    // bare "steamclient64.dll" to the bionic bridge's lsteamclient.dll)
-    // don't kick in — the bridge's Steam_CreateGlobalUser is a stub.
-    //
-    // We host the 64-bit steamclient64.dll — the same binary GameHub's
-    // agent uses — so IClientAppManager::LaunchApp drives the game through
-    // steamclient's own app-launch path. We preload the dependency chain —
-    // Wine CRT thunks then Steam's own tier0_s64/vstdlib_s64 — and try a
-    // cascade of LoadLibrary strategies with cold-start backoff.
-    // ------------------------------------------------------------------
     const char* kSteamDir = "C:\\Program Files (x86)\\Steam";
     SetDllDirectoryA(kSteamDir);
     {
-        // Wine CRT thunks by short name (found in system32); Steam's
-        // siblings by absolute path. Every preload is best-effort — a
-        // missing optional DLL just logs and continues.
         struct Preload { const char* name; bool fullPath; };
-        // tier0_s64.dll and vstdlib_s64.dll INTENTIONALLY DROPPED from
-        // preload on Proton 10+. Their DllMain spawns a worker thread that
-        // later exits and trips Wine 10's stricter RtlProcessFlsData over
-        // a stale FLS callback (some other DLL's bad pointer; we saw a DEP
-        // AV at 0x7ffc90ae08 = unmapped). steamclient64.dll will pull both
-        // in via its import table when we LoadLibrary it; SetDllDirectory
-        // (steamDir) above gives the search path. CRT preloads stay — they
-        // never spawn a worker.
         const Preload preloads[] = {
             { "msvcr120.dll", false }, { "msvcp120.dll", false },
             { "vcruntime140.dll", false }, { "msvcp140.dll", false },
@@ -1128,10 +801,6 @@ int main(int argc, char** argv) {
     snprintf(steamclientPath, sizeof(steamclientPath),
              "%s\\steamclient64.dll", kSteamDir);
 
-    // Cascade of load strategies. Different flag combinations exercise
-    // different paths in Wine's PE loader; under FEX/arm64ec one often
-    // works where another faults. We never use DONT_RESOLVE_DLL_REFERENCES
-    // — it skips DllMain, leaving steamclient uninitialised.
     struct LoadAttempt { DWORD flags; const char* desc; };
     const LoadAttempt attempts[] = {
         { LOAD_WITH_ALTERED_SEARCH_PATH, "LOAD_WITH_ALTERED_SEARCH_PATH" },
@@ -1158,8 +827,6 @@ int main(int argc, char** argv) {
                  i + 1, kAttempts, attempts[i].desc, lastErr);
         Sleep(50);
     }
-    // Cold-start backoff: a freshly-booted prefix (wineserver warming,
-    // siblings still unpacking) can fail every strategy transiently.
     for (int round = 0; round < 3 && !lsc; round++) {
         log_line("[wn-launcher] steamclient64.dll cold-start retry "
                  "round %d/3 after 500ms", round + 1);
@@ -1173,8 +840,6 @@ int main(int argc, char** argv) {
                      "(retry round %d)", lsc, round + 1);
         }
     }
-    // Last resort: plain LoadLibraryA routes through a different loader
-    // path than LoadLibraryExA on some Wine builds.
     if (!lsc) {
         lsc = LoadLibraryA(steamclientPath);
         if (lsc) {
@@ -1185,8 +850,6 @@ int main(int argc, char** argv) {
         }
     }
     if (!lsc) {
-        // Distinguish "file bad" from "DllMain init faulted": a DATAFILE
-        // load maps the image without running its code.
         HMODULE probe = LoadLibraryExA(steamclientPath, NULL,
                                        LOAD_LIBRARY_AS_DATAFILE);
         if (probe) {
@@ -1227,19 +890,11 @@ int main(int argc, char** argv) {
         breakpadSetAppId(appId);
     }
 
-    // ------------------------------------------------------------------
-    // STEP 2: Create pipe + global user. Steam_CreateGlobalUser is the
-    // Valve flat-C entry point that allocates a pipe AND connects a
-    // global user in one call. (Same mechanism we use on the Android
-    // side via Steam_CreateGlobalUser on libsteamclient.so.)
-    // ------------------------------------------------------------------
     int pipe = 0;
     int hUser = 0;
     if (createGlobalUser) {
         hUser = createGlobalUser(&pipe);
     } else {
-        // Fallback path via ISteamClient ABI if the flat-C export is
-        // missing in this Steam build. Cheaper to add later if needed.
         log_line("[wn-launcher] Steam_CreateGlobalUser missing; falling back "
                  "to ISteamClient.CreateSteamPipe (not implemented yet)");
         return 4;
@@ -1252,11 +907,6 @@ int main(int argc, char** argv) {
     log_line("[wn-launcher] Steam_CreateGlobalUser OK pipe=%d user=%d",
              pipe, hUser);
 
-    // ------------------------------------------------------------------
-    // STEP 3: IClientEngine refresh-token logon. Same dance as
-    // wn-steam-bootstrap on Android side, just here we call Valve's
-    // Windows steamclient64.dll in our process.
-    // ------------------------------------------------------------------
     void* engine = NULL;
     if (haveCreds) {
         int err = 0;
@@ -1264,16 +914,9 @@ int main(int argc, char** argv) {
         if (!engine || err != 0) {
             log_line("[wn-launcher] CreateInterface(CLIENTENGINE_INTERFACE_VERSION005) "
                      "-> engine=%p err=%d", engine, err);
-            // Don't abort yet — Steam may still be reachable via cached
-            // session in config.vdf. Skip to BLoggedOn poll.
         } else {
             void** engine_vt = *(void***) engine;
             log_line("[wn-launcher] engine=%p vtable=%p", engine, engine_vt);
-            // First-run vtable hex dump — Valve's Windows steamclient64.dll
-            // is a different binary than the bionic libsteamclient.so, so a
-            // hidden slot reordering would otherwise SIGSEGV silently. Dump
-            // the first 16 engine slots so a 1-byte misalignment is a
-            // 30-second logcat read instead of a debugging marathon.
             for (int i = 0; i < 16; ++i) {
                 log_line("[wn-launcher] engine_vt[%2d] @ +0x%02x = %p",
                          i, i * 8, engine_vt[i]);
@@ -1287,38 +930,18 @@ int main(int argc, char** argv) {
 
             if (iuser) {
                 void** iuser_vt = *(void***) iuser;
-                // Defensive dump of IClientUser slots 0..60 — covers the
-                // logon methods we use: LogOn(1), BLoggedOn(4),
-                // BHasCachedCredentials(49), SetAccountNameForCached-
-                // CredentialLogin(50), SetLoginInformation(54),
-                // SetLoginToken(56). A Valve DLL update that reorders the
-                // vtable shows up here as a 30-second logcat read.
                 for (int i = 0; i < 60; ++i) {
                     log_line("[wn-launcher] iuser_vt[%2d] @ +0x%02x = %p",
                              i, i * 8, iuser_vt[i]);
                 }
 
-                // ── Refresh-token logon — DECOMPILED from GameHub's ──
-                // SteamAgent SteamCore::LoginToSteam (FUN_140055690),
-                // online path. Exactly three IClientUser calls, in order:
-                //   1. SetLoginToken(refreshToken, accountName)   +0x1C0
-                //   2. GetSteamID(&out)  → resolved CSteamID       +0x50
-                //   3. LogOn(thatCSteamID)                         +0x08
-                // SteamAgent does NOT call SetAccountNameForCached-
-                // CredentialLogin / SetLoginInformation here — those are
-                // the OFFLINE-mode branch. The result arrives async via
-                // the connection callbacks drained in STEP 4.
 
-                // Diagnostic only — BHasCachedCredentials (slot 49).
                 typedef bool (WN_THISCALL *BHasCachedCredsFn)(void* self, const char* user);
                 BHasCachedCredsFn hasCached = (BHasCachedCredsFn)
                     iuser_vt[kVtUser_BHasCachedCreds / 8];
                 log_line("[wn-launcher] BHasCachedCredentials(%s) = %d",
                          user, hasCached(iuser, user) ? 1 : 0);
 
-                // STEP 3.1 — SetLoginToken(refreshToken, accountName).
-                // Both args are C-strings (confirmed: SteamAgent passes
-                // RDX=token, R8=accountName).
                 typedef int (WN_THISCALL *SetLoginTokenFn)(void* self, const char* token,
                                                const char* account);
                 SetLoginTokenFn setLoginToken = (SetLoginTokenFn)
@@ -1327,11 +950,6 @@ int main(int argc, char** argv) {
                 log_line("[wn-launcher] SetLoginToken(tokenLen=%d, account=%s) -> %d",
                          (int) strlen(token), user, tokRc);
 
-                // STEP 3.2 — GetSteamID(&out): resolves the CSteamID now
-                // that the token is set. SteamAgent feeds THIS value to
-                // LogOn (not a caller-supplied SteamID). Valve's
-                // CSteamID& GetSteamID(CSteamID&) fills the out-arg and
-                // returns a pointer to it.
                 typedef void* (WN_THISCALL *GetSteamIDFn)(void* self, void* outBuf);
                 GetSteamIDFn getSteamID = (GetSteamIDFn)
                     iuser_vt[kVtUser_GetSteamID / 8];
@@ -1349,10 +967,6 @@ int main(int argc, char** argv) {
                              (unsigned long long) steamId);
                 }
 
-                // STEP 3.3 — LogOn(steamID). Returns EResult synchronously
-                // (immediate reject visible here); the final result still
-                // arrives via the SteamServersConnected/ConnectFailure
-                // callbacks drained in STEP 4.
                 typedef int (WN_THISCALL *LogOnFn)(void* self, uint64_t steamID);
                 LogOnFn logOn = (LogOnFn) iuser_vt[kVtUser_LogOn / 8];
                 int logonRc = logOn(iuser, logonSid);
@@ -1370,33 +984,17 @@ int main(int argc, char** argv) {
                  "(game may run in offline / no-auth mode)");
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4: Poll BLoggedOn up to 20s while draining pending callbacks.
-    //
-    // Decodes the connection callbacks (SteamServersConnected_t=101,
-    // SteamServerConnectFailure_t=102, SteamServersDisconnected_t=103)
-    // so a logon failure is diagnosable from one log read:
-    //   - 101 seen, BLoggedOn false  -> connected but auth pending/failed
-    //   - 102 seen + EResult         -> CM connection failed (3/16 = TLS/
-    //                                   network, 5/15 = bad token/auth)
-    //   - nothing seen               -> client engine never connected
-    // ------------------------------------------------------------------
     bool loggedOn = false;
     bool sawConnected = false, sawConnFail = false;
     int  connFailEResult = 0;
     int  polls = 0;
     if (bLoggedOn) {
-        // 60s. The i386 steamclient under FEX often fails its WebSocket CM
-        // attempts first and only connects after falling back to a UDP CM
-        // ~25s in, so a 20s window timed out just before logon completed.
-        // Hard auth failures (EResult 5/15/84) still bail early below.
         const int kMaxPolls = 600;  // 600 * 100ms = 60s
         char cbBuf[64] = {0};
         for (; polls < kMaxPolls; ++polls) {
             if (bGetCallback && freeLastCallback) {
                 while (bGetCallback(pipe, cbBuf)) {
                     int cbId = *(int*)(cbBuf + 4);
-                    // CallbackMsg_t: {hUser@0,iCallback@4,pubParam@8,cubParam@16}
                     void* param = *(void**)(cbBuf + 8);
                     if (cbId == 101) {
                         sawConnected = true;
@@ -1424,9 +1022,6 @@ int main(int argc, char** argv) {
                          polls + 1);
                 break;
             }
-            // A hard auth failure (bad/expired token, access denied,
-            // rate-limited) never recovers by waiting — bail at once
-            // instead of burning the remaining timeout.
             if (sawConnFail && (connFailEResult == 5 ||
                                 connFailEResult == 15 ||
                                 connFailEResult == 84)) {
@@ -1444,15 +1039,6 @@ int main(int argc, char** argv) {
                  polls, sawConnected ? 1 : 0, sawConnFail ? 1 : 0);
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4.4: Request fresh PICS appinfo for the game so steamclient has
-    // the launch config loaded before LaunchApp. Without this, LaunchApp
-    // accepts the job (returns a valid HSteamAPICall) but the CGameLauncher
-    // job aborts with EAppUpdateError=9 (MissingConfig) and silently never
-    // spawns the game — empirically observed on MHST (appId 2356560)
-    // via the LaunchAppResult_t poll added in STEP 5. Mirrors GameHub
-    // SteamCore::RefreshApps.
-    // ------------------------------------------------------------------
     if (loggedOn && engine && appId != 0) {
         void** engine_vt = *(void***) engine;
         typedef void* (WN_THISCALL *GetIClientAppsFn)(void* self, int hUser, int hPipe);
@@ -1474,8 +1060,6 @@ int main(int argc, char** argv) {
                 bool reqRc = reqInfo(iApps, appIds, 1);
                 log_line("[wn-launcher] RequestAppInfoUpdate(appId=%u) -> %d",
                          appId, reqRc ? 1 : 0);
-                // Wait for AppInfoUpdateComplete_t (callback id 1003) up
-                // to 10s, draining other callbacks meanwhile.
                 bool appInfoDone = false;
                 int  waited = 0;
                 for (int i = 0; i < 100 && !appInfoDone; ++i) {
@@ -1494,12 +1078,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4.5: Make steamclient treat the game as FullyInstalled before
-    // LaunchApp — without it LaunchApp's async job aborts and the game is
-    // never spawned. Mirrors GameHub SteamAgent's install-state gate
-    // (FUN_14005a850).
-    // ------------------------------------------------------------------
     if (loggedOn && engine && appId != 0) {
         void** engine_vt = *(void***) engine;
         typedef void* (WN_THISCALL *GetIfaceFn)(void* self, int hUser, int hPipe);
@@ -1507,9 +1085,6 @@ int main(int argc, char** argv) {
                            (engine, hUser, pipe);
         log_line("[wn-launcher] readiness: IClientAppManager=%p", appMgr);
 
-        // Refresh library/appinfo so the staged appmanifest_<id>.acf is
-        // parsed into steamclient's in-memory app-state table, then poll
-        // GetAppInstallState until k_EAppStateFullyInstalled (bit 2) is set.
         if (appMgr) {
             void** am_vt = *(void***) appMgr;
             void* refreshP = am_vt[kVtAppMgr_RefreshAppInfo / 8];
@@ -1540,31 +1115,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4.5: Scan the game's _CommonRedist/ folder and run each
-    // *.exe redistributable installer that hasn't already been installed
-    // in THIS container. Replaces steamclient's RunInstallScript path
-    // (which silently fails on Wine because Steam's CreateProcess on
-    // the redist installers returns ERROR_PATH_NOT_FOUND when the game
-    // install dir is a /storage/emulated symlink — `step 1/0` then
-    // never advances, locking the launcher).
-    //
-    // Tracking is per-container: the marker file lives at
-    //   C:\wn-installed-redists.txt
-    // which is inside the Wine prefix (deleted when the container is
-    // deleted, fresh when a same-named container is recreated with a
-    // new ID). Each entry is `<filename>\t<size>\t<unix-ts>`. Re-check
-    // is by (filename, size) — a game update that changes the bundled
-    // installer's bytes triggers reinstall.
-    //
-    // Skipped if no _CommonRedist/ folder exists.
-    // ------------------------------------------------------------------
     scan_and_install_redists(gameExe);
 
-    // STEP 4.6 is intentionally skipped when scan_and_install_redists
-    // ran — the scan handles redistributables directly and Steam's
-    // RunInstallScript is the same broken path. The original block is
-    // kept below behind a compile-time flag for emergency revert.
     constexpr bool kRunSteamInstallScript = false;
     if (kRunSteamInstallScript && loggedOn && engine && appId != 0) {
         void** engine_vt = *(void***) engine;
@@ -1597,25 +1149,6 @@ int main(int argc, char** argv) {
                         (IsInstallScriptRunningFn) progP;
                     GetInstallScriptStateFn getState =
                         (GetInstallScriptStateFn) stateP;
-                    // kMaxWaitMs: hard ceiling — the original 180s safety
-                    //   net for a script that's actually doing real work.
-                    // kEmptyScriptGraceMs: short grace for total_steps to
-                    //   populate after RunInstallScript returns. Many
-                    //   modern Steam games ship an installscript.vdf that
-                    //   declares no actual steps (UE4/Unity games whose
-                    //   redistributables are bundled under _CommonRedist
-                    //   and were already run at install time). Steam
-                    //   returns RunInstallScript=true but the script's
-                    //   total_steps stays at 0. Without breaking out we
-                    //   loop the full 180s waiting for steps that will
-                    //   never appear — locking up the launcher and the
-                    //   splash screen for any such game.
-                    //   Symptom we're fixing: log shows `step 1/0` and
-                    //   then no progress for the full 180s before
-                    //   proceeding to steamservice → LaunchApp.
-                    // kNoProgressMs: catch a script that DOES report a
-                    //   real total but stalls on one step (network
-                    //   redistributable download blocked, etc.).
                     const int kMaxWaitMs = 180000;
                     const int kEmptyScriptGraceMs = 3000;
                     const int kNoProgressMs = 30000;
@@ -1638,15 +1171,11 @@ int main(int argc, char** argv) {
                                 log_line("[wn-launcher] install script: step %d/%d",
                                          stepNo, stepCount);
                             }
-                            // Empty / no-op script: total never published.
-                            // After the grace period, assume nothing real
-                            // is going to run and proceed.
                             if (stepCount == 0
                                     && waited >= kEmptyScriptGraceMs) {
                                 breakReason = "empty (total_steps=0)";
                                 break;
                             }
-                            // Real script but stuck on one step.
                             if (waited - lastProgressAtMs >= kNoProgressMs) {
                                 breakReason = "no-progress timeout";
                                 break;
@@ -1668,34 +1197,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Cloud sync: driven entirely Android-side by wn-steam-client; no
-    // in-Wine step here.
 
-    // ------------------------------------------------------------------
-    // STEP 4.8: Bring up steamservice.exe as the IPC backend so
-    // IClientAppManager::LaunchApp's marshaled job has someone to drain
-    // the named-event queue. Without this, LaunchApp returns a valid
-    // HSteamAPICall but never spawns the game; the launcher falls through
-    // to the CreateProcess fallback below (which is fine for non-DRM
-    // games, but bypasses steamclient's CGameLauncher path that SteamStub
-    // DRM games need for in-process self-decryption).
-    //
-    // No-op if steamservice.exe is not staged in <Steam>/bin/. The
-    // CreateProcess fallback then carries the launch as before.
-    // ------------------------------------------------------------------
     bool svcRunning = start_steam_client_service();
     log_line("[wn-launcher] steamservice running: %d", svcRunning ? 1 : 0);
 
-    // ------------------------------------------------------------------
-    // STEP 5: Launch the game. Preferred path is Valve's own
-    // IClientAppManager::LaunchApp — steamclient sets up the full app
-    // environment (the SteamStub DRM decryption context, app-running
-    // registration, overlay) exactly as the desktop client does, so a
-    // DRM-wrapped exe self-decrypts. If LaunchApp is unavailable or
-    // fails, fall back to a direct CreateProcess (the pre-LaunchApp
-    // behaviour — fine for non-DRM games).
-    // ------------------------------------------------------------------
-    // Compose the CreateProcess fallback cmdline (argv[1]=exe, argv[2..]=extras).
     char cmdline[4096];
     int  cmdpos = 0;
     cmdpos += snprintf(cmdline + cmdpos, sizeof(cmdline) - cmdpos,
@@ -1707,7 +1212,6 @@ int main(int argc, char** argv) {
     }
     cmdline[sizeof(cmdline) - 1] = '\0';
 
-    // Game CWD = dirname(gameExe); exe basename = LaunchApp exit-watch key.
     char gameCwd[MAX_PATH];
     strncpy(gameCwd, gameExe, sizeof(gameCwd) - 1);
     gameCwd[sizeof(gameCwd) - 1] = '\0';
@@ -1715,7 +1219,6 @@ int main(int argc, char** argv) {
     const char* exeName = strrchr(gameExe, '\\');
     exeName = exeName ? exeName + 1 : gameExe;
 
-    // STEP 5a — try IClientAppManager::LaunchApp.
     bool launchedViaApp = false;
     if (engine && appId != 0) {
         void** engine_vt = *(void***) engine;
@@ -1726,14 +1229,6 @@ int main(int argc, char** argv) {
         log_line("[wn-launcher] IClientEngine.GetIClientAppManager -> %p", appMgr);
         if (appMgr) {
             void** appMgr_vt = *(void***) appMgr;
-            // LaunchApp returns an HSteamAPICall (async handle), NOT a
-            // success code. CONFIRMED arg order from GameHub's
-            // SteamCore::LaunchApplication decompile (FUN_140058f20):
-            //   arg2 CGameID*      — 8 bytes; low dword = appId & 0xFFFFFF
-            //                        (k_EGameIDTypeApp, mod/instance = 0)
-            //   arg3 uLaunchOption — 0 for a normal launch
-            //   arg4 ELaunchSource — 300 (dash_applaunch)
-            //   arg5 pszUserArgs   — "" when there are no launch options
             typedef uint64_t (WN_THISCALL *LaunchAppFn)(void* self, void* pGameId,
                                             uint32_t uLaunchOption,
                                             uint32_t eLaunchSource,
@@ -1746,13 +1241,6 @@ int main(int argc, char** argv) {
                      "-> HSteamAPICall=0x%llx", appId,
                      (unsigned long long) apiCall);
 
-            // Poll the LaunchAppResult_t to surface the EAppUpdateError
-            // that explains why the spawn silently doesn't happen. This is
-            // a diagnostic gate, not a control-flow one — we still
-            // continue to the process-watch loop below, then fall back to
-            // CreateProcess if no game process appears, but the logged
-            // error code tells us exactly which precondition LaunchApp
-            // bailed on. Mirrors GameHub SteamAgent's FUN_14005d5c0.
             if (apiCall != 0) {
                 typedef void* (WN_THISCALL *GetIClientUtilsFn)(void* self, int hPipe);
                 GetIClientUtilsFn getUtils = (GetIClientUtilsFn)
@@ -1822,8 +1310,6 @@ int main(int argc, char** argv) {
                                      "0xE=AppLocked 0xF=OtherSessionPlaying "
                                      "0x10=AlreadyRunning 0x21=33 0x23=35 0x2D=45)",
                                      waited, got ? 1 : 0, resFailed ? 1 : 0, eAppError);
-                            // Hex dump first 32 bytes of the result struct so a
-                            // future RE pass can verify the field layout.
                             char hex[3 * 32 + 1];
                             int hp = 0;
                             for (int i = 0; i < 32; ++i) {
@@ -1839,10 +1325,6 @@ int main(int argc, char** argv) {
             }
 
             if (apiCall != 0) {
-                // LaunchApp queued the launch asynchronously. Wait up to 60s
-                // for the game process to appear, draining callbacks so
-                // steamclient's launch job advances; if it never shows, fall
-                // back to CreateProcess.
                 for (int i = 0; i < 120 && !launchedViaApp; ++i) {
                     if (count_process_by_name(exeName) > 0) {
                         launchedViaApp = true;
@@ -1866,9 +1348,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // STEP 5b — LaunchApp brought the game up: stay alive (our process
-    // hosts the Steam session) until the game exits. LaunchApp gives no
-    // process handle, so watch the process table by exe name.
     if (launchedViaApp) {
         log_line("[wn-launcher] watching \"%s\" for exit (LaunchApp path)", exeName);
         int absent = 0;
@@ -1881,12 +1360,10 @@ int main(int argc, char** argv) {
             absent = (count_process_by_name(exeName) != 0) ? 0 : absent + 1;
         }
         log_line("[wn-launcher] game \"%s\" exited (LaunchApp path)", exeName);
-        // Cloud upload at exit is driven Android-side by SteamExitCloudSync.
         log_line("[wn-launcher] Steam Launcher shutdown");
         return 0;
     }
 
-    // STEP 5c — fallback: direct CreateProcess.
     log_line("[wn-launcher] launching (CreateProcess): %s", cmdline);
     log_line("[wn-launcher] cwd: %s", gameCwd);
     STARTUPINFOA si;
@@ -1913,7 +1390,6 @@ int main(int argc, char** argv) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
-    // Cloud upload at exit is driven Android-side by SteamExitCloudSync.
 
     log_line("[wn-launcher] Steam Launcher shutdown");
     return 0;

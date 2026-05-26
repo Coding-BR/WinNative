@@ -21,14 +21,6 @@ std::vector<uint8_t> CMsgClientMMSGetLobbyList::serialize() const {
         proto::Writer fw(sub);
         if (!f.key.empty())   fw.string_field(1, f.key);
         if (!f.value.empty()) fw.string_field(2, f.value);
-        // Both comparision (typo in proto) and filter_type are non-zero
-        // meaningful for some games (e.g. NearValue=3 with comparision=0),
-        // so emit them even when 0 — `int32_field_force` matches what we
-        // do for crc_stats in ClientStoreUserStats2.
-        // Equal (0) and String (0) are the SDK defaults — skipping the
-        // field via int32_field's zero-drop is wire-equivalent. Callers
-        // wanting a different comparison/filter explicitly set nonzero
-        // values which then get serialized.
         fw.int32_field(3, f.comparision);
         fw.int32_field(4, f.filter_type);
         w.submessage_field(6, sub);
@@ -75,7 +67,6 @@ parse_lobby_entry(std::span<const uint8_t> body) noexcept {
                 else return std::nullopt;
                 break;
             case 7: {
-                // proto `float` is wire type Fixed32 (4 bytes IEEE-754).
                 auto raw = r.fixed32();
                 if (!raw) return std::nullopt;
                 std::memcpy(&e.distance, &*raw, sizeof(float));

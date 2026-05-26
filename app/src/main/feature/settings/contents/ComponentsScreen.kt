@@ -545,9 +545,6 @@ private fun ComponentItemCard(
             }
             Spacer(Modifier.width(13.dp))
             Column(modifier = Modifier.weight(1f)) {
-                // Marquee: TextOverflow.Ellipsis renders "..." until the text
-                // overflows, then basicMarquee scrolls it left to reveal the
-                // remainder, pauses 5 s, repeats. No-op for short labels.
                 Text(
                     text = item.verName,
                     color = TextPrimary,

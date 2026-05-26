@@ -26,12 +26,7 @@ struct CMsgClientRequestFriendData {
 };
 
 // CMsgClientPersonaState.Friend — only the fields the UI needs.
-//   1 fixed64 friendid           2 uint32 persona_state
 //   3 uint32 game_played_app_id 15 string player_name
-//  25 repeated KV rich_presence 31 bytes  avatar_hash
-//  55 string game_name          56 fixed64 gameid
-//
-// KV submessage: { 1 string key, 2 string value }.
 struct PersonaStateFriend {
     uint64_t             friendid           = 0;
     uint32_t             persona_state      = 0;
@@ -40,10 +35,6 @@ struct PersonaStateFriend {
     std::vector<uint8_t> avatar_hash;
     std::string          game_name;
     uint64_t             gameid             = 0;
-    // CMsgClientPersonaState.Friend.rich_presence — repeated KV pairs
-    // representing the friend's rich-presence map. Empty when this
-    // PersonaState slice didn't carry RP (request flag bit 0x800
-    // wasn't set, or Steam had no data).
     std::vector<std::pair<std::string, std::string>> rich_presence;
 
     [[nodiscard]] static std::optional<PersonaStateFriend>

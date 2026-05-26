@@ -4,21 +4,11 @@
 
 namespace wn_steam::pb {
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSCreateLobby — serializer
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSCreateLobby::serialize() const {
     std::vector<uint8_t> out;
     proto::Writer w(out);
     w.uint32_field(1, app_id);
-    // max_members and lobby_type are meaningful when 0 (a 0-member lobby
-    // isn't valid, but ELobbyType::Private is 0 — drop-zero would change
-    // semantics from Private to "absent" which is "Public" per the
-    // server's proto2 default fallback). Send them through int32_field
-    // which drops zeros for max_members (Private:0 lobby_type means
-    // omit field → server uses ELobbyType.Public default); callers MUST
-    // pass nonzero max_members in practice.
     w.int32_field(2, max_members);
     w.int32_field(3, lobby_type);
     w.int32_field(4, lobby_flags);
@@ -27,9 +17,6 @@ std::vector<uint8_t> CMsgClientMMSCreateLobby::serialize() const {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSCreateLobbyResponse — parser
-// ---------------------------------------------------------------------------
 
 std::optional<CMsgClientMMSCreateLobbyResponse>
 CMsgClientMMSCreateLobbyResponse::deserialize(std::span<const uint8_t> body) noexcept {
@@ -60,9 +47,6 @@ CMsgClientMMSCreateLobbyResponse::deserialize(std::span<const uint8_t> body) noe
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSJoinLobby — serializer
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSJoinLobby::serialize() const {
     std::vector<uint8_t> out;
@@ -73,9 +57,6 @@ std::vector<uint8_t> CMsgClientMMSJoinLobby::serialize() const {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSJoinLobbyResponse — parser (incl. repeated Member sub)
-// ---------------------------------------------------------------------------
 
 static std::optional<CMsgClientMMSJoinLobbyResponseMember>
 parse_join_member(std::span<const uint8_t> body) noexcept {
@@ -171,10 +152,6 @@ CMsgClientMMSJoinLobbyResponse::deserialize(std::span<const uint8_t> body) noexc
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSLeaveLobby — serializer (fire-and-forget; response we'll
-// route through JobManager but we don't gate the SDK callback on it).
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSLeaveLobby::serialize() const {
     std::vector<uint8_t> out;
@@ -184,9 +161,6 @@ std::vector<uint8_t> CMsgClientMMSLeaveLobby::serialize() const {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSSetLobbyData — serializer + Response parser
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSSetLobbyData::serialize() const {
     std::vector<uint8_t> out;
@@ -230,9 +204,6 @@ CMsgClientMMSSetLobbyDataResponse::deserialize(std::span<const uint8_t> body) no
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSSendLobbyChatMsg — serializer (fire-and-forget)
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSSendLobbyChatMsg::serialize() const {
     std::vector<uint8_t> out;
@@ -243,9 +214,6 @@ std::vector<uint8_t> CMsgClientMMSSendLobbyChatMsg::serialize() const {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSLobbyChatMsg — server-push decoder
-// ---------------------------------------------------------------------------
 
 std::optional<CMsgClientMMSLobbyChatMsg>
 CMsgClientMMSLobbyChatMsg::deserialize(std::span<const uint8_t> body) noexcept {
@@ -281,10 +249,6 @@ CMsgClientMMSLobbyChatMsg::deserialize(std::span<const uint8_t> body) noexcept {
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSUserJoinedOrLeftLobby — server-push decoder (shared
-// shape for EMsg 6619 + 6620; the EMsg dispatch differentiates them).
-// ---------------------------------------------------------------------------
 
 std::optional<CMsgClientMMSUserJoinedOrLeftLobby>
 CMsgClientMMSUserJoinedOrLeftLobby::deserialize(std::span<const uint8_t> body) noexcept {
@@ -320,9 +284,6 @@ CMsgClientMMSUserJoinedOrLeftLobby::deserialize(std::span<const uint8_t> body) n
     return m;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSInviteToLobby — serializer (fire-and-forget)
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSInviteToLobby::serialize() const {
     std::vector<uint8_t> out;
@@ -333,9 +294,6 @@ std::vector<uint8_t> CMsgClientMMSInviteToLobby::serialize() const {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// CMsgClientMMSSetLobbyOwner — serializer + Response parser
-// ---------------------------------------------------------------------------
 
 std::vector<uint8_t> CMsgClientMMSSetLobbyOwner::serialize() const {
     std::vector<uint8_t> out;

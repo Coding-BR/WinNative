@@ -108,11 +108,6 @@ enum class EMsg : uint32_t {
     ServiceMethodSendToClient            = 152,
     ServiceMethodCallFromClientNonAuthed = 9804,
 
-    // ISteamMatchmaking lobby protocol (CMsgClientMMS*). All proto-flagged
-    // client messages — same envelope shape as ClientGetUserStats. Verified
-    // against Valve's real linux64/steamclient.so mangled C++ symbols
-    // ("12CProtoBufMsgI{LEN}CMsgClientMMS*E") and SteamKit2 emsg.steamd.
-    // EMsg 6600 is the MMSBase anchor; 6601 ramps up sequentially.
     ClientMMSCreateLobby            = 6601,
     ClientMMSCreateLobbyResponse    = 6602,
     ClientMMSJoinLobby              = 6603,

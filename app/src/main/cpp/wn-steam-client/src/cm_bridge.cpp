@@ -1,16 +1,3 @@
-// Implementation of the C-ABI bridge into the active CMClient.
-//
-// Design notes:
-//   • Single weak_ptr — there's at most one signed-in CMClient at a
-//     time in this app, so a list is overkill. A future multi-account
-//     architecture could switch to a small map keyed by steam_id.
-//   • shared_mutex over the weak_ptr — multiple concurrent readers
-//     (libsteamclient.so stubs from any caller thread) share the
-//     read lock; the wn-session-jni-side set/clear takes an exclusive
-//     write lock briefly.
-//   • Strong-ref-then-release: every public C function locks-snapshots-
-//     unlocks before invoking CMClient methods, so a long-running CM
-//     send doesn't hold the bridge mutex.
 
 #include "wn_steam/cm_bridge.h"
 #include "wn_steam/cm_client.h"
@@ -49,8 +36,6 @@ std::weak_ptr<wn_steam::CMClient>& active_slot() {
     return w;
 }
 
-// Snapshot the active client to a strong reference under the read
-// lock, release the lock, return the strong ref (may be empty).
 std::shared_ptr<wn_steam::CMClient> snapshot_active() {
     std::shared_lock<std::shared_mutex> lk(bridge_mu());
     return active_slot().lock();
@@ -78,10 +63,6 @@ bool wn_cm_set_persona_state(int32_t persona_state) {
     if (persona_state < 0) return false;
     auto client = snapshot_active();
     if (!client) {
-        // Frequent enough at cold boot (libsteamclient.so seedFromPrefManager
-        // fires before wn-session brings up its CMClient) that we keep this
-        // at DEBUG, not INFO, to avoid log spam. INFO would print on every
-        // cold start.
         __android_log_print(ANDROID_LOG_DEBUG, WN_BRIDGE_TAG,
             "set_persona_state(%d): no active CMClient — dropped", persona_state);
         return false;
@@ -114,9 +95,6 @@ bool wn_cm_request_user_info(uint64_t steam_id, int32_t flags) {
             (unsigned long long)steam_id);
         return false;
     }
-    // EClientPersonaStateFlag default = name(1) | state(2) | game(4) | avatar(64)
-    // = 0x47 — the same standard set the wn-session uses in the persona
-    // collector. flags<=0 → use that default.
     uint32_t f = (flags <= 0) ? 0x47u : static_cast<uint32_t>(flags);
     client->request_friend_personas({steam_id}, f);
     WN_BRIDGE_LOGI("request_user_info(%llu, flags=0x%x): → live CMClient",
@@ -191,10 +169,6 @@ bool wn_cm_notify_games_played(uint32_t app_id) {
     wn_steam::pb::CMsgClientGamesPlayed msg;
     if (app_id != 0) {
         wn_steam::pb::GamePlayedEntry entry;
-        // game_id is a fixed64 — for plain games (non-mod, non-shortcut)
-        // it's just the app_id; for mods/shortcuts the upper bits encode
-        // mod info. Our open-source path always launches the real Steam
-        // app id so the simple form is correct.
         entry.game_id = static_cast<uint64_t>(app_id);
         msg.games_played.push_back(std::move(entry));
     }
@@ -231,7 +205,6 @@ bool wn_cm_get_cached_app_ownership_ticket(uint32_t app_id,
     }
     auto entry = client->tickets().get(app_id);
     if (!entry || entry->eresult != 1 /*OK*/ || entry->ticket.empty()) {
-        // Cache miss is normal until pre-fetch runs — don't log at INFO.
         __android_log_print(ANDROID_LOG_DEBUG, WN_BRIDGE_TAG,
             "get_cached_app_ownership_ticket(%u): cache miss", app_id);
         if (out_len) *out_len = 0;
@@ -241,9 +214,6 @@ bool wn_cm_get_cached_app_ownership_ticket(uint32_t app_id,
     if (out_len) *out_len = actual;
     if (!out_buf || max_len == 0) return false;          // caller wanted size only
     if (actual > max_len) {
-        // Partial-fill is dangerous — the ticket would be corrupted.
-        // SDK contract is "tell caller required size; they retry with
-        // bigger buffer". Return false; *out_len is already set.
         return false;
     }
     std::memcpy(out_buf, entry->ticket.data(), actual);
@@ -253,8 +223,6 @@ bool wn_cm_get_cached_app_ownership_ticket(uint32_t app_id,
 }
 
 namespace {
-// Reactive observer slot. atomic<fn-ptr> so dispatch on the CM transport
-// thread doesn't need a mutex; register/clear are single 8-byte stores.
 std::atomic<WnCmPersonaObserverFn> g_persona_observer{nullptr};
 }  // namespace
 
@@ -386,9 +354,6 @@ bool wn_cm_request_user_info_bulk(const uint64_t* sids, size_t count, int32_t fl
             count);
         return false;
     }
-    // Filter zeros — callers commonly pass slot-by-slot iteration
-    // arrays that include unset entries. Drops invalid sids without
-    // failing the whole batch.
     std::vector<uint64_t> v;
     v.reserve(count);
     for (size_t i = 0; i < count; ++i) {
@@ -402,13 +367,6 @@ bool wn_cm_request_user_info_bulk(const uint64_t* sids, size_t count, int32_t fl
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// ISteamMatchmaking lobby browser (Phase A) — bridges from libsteamclient
-// .so's ISteamMatchmaking::RequestLobbyList slot 4 into wn-steam-client's
-// CMClient::lobby_get_list. The CB pointer is shared per-call (libsteam
-// client.so allocs an hCall, hands the CB through; we invoke once when
-// the response lands).
-// ---------------------------------------------------------------------------
 
 static std::atomic<WnCmLobbyDataObserverFn> g_lobby_data_observer{nullptr};
 
@@ -418,24 +376,12 @@ void wn_cm_bridge_register_lobby_data_observer(WnCmLobbyDataObserverFn fn) {
                    reinterpret_cast<void*>(fn));
 }
 
-// Cross-process state-sync directory. App-process writers (task #164
-// follow-up) drop wn_lobby_<appid>.txt files here; wine-side callers
-// without an in-process CMClient (Forest's libsteamclient.so instance)
-// fall back to reading them. Env override lets the launching activity
-// align the paths between processes (app sees imagefs/tmp/, wine sees
-// /tmp/ after proot chroot — same physical directory if the env is
-// set right).
 static std::string wn_state_dir() {
     const char* d = std::getenv("WN_STATE_DIR");
     if (d && *d) return std::string(d);
     return "/tmp";
 }
 
-// Symmetric writer for cross-process state sync — invoked from the
-// in-process-CMClient response path (app process). The wine-side
-// reader (try_lobby_list_from_file below) picks this up on the next
-// RequestLobbyList call. Atomic via tmp-file + rename so a partial
-// write never produces a corrupt file for a concurrent reader.
 static void write_lobby_list_to_file(uint32_t app_id,
                                      int32_t eresult,
                                      const WnCmLobbyEntry* entries,
@@ -459,20 +405,12 @@ static void write_lobby_list_to_file(uint32_t app_id,
                    app_id, final_path.c_str(), count, eresult);
 }
 
-// PE-bridge callback-dispatch function pointers, populated lazily
-// from ${WN_STATE_DIR}/wnb_ptrs.txt — written there by the PE bridge
-// (steam_api_bridge_callbacks.c::wnb_publish_dispatch_pointers) on
-// its first matchmaking call. Same wine process, raw addresses
-// across the libsteamclient.so / steam_api64.dll module boundary.
 typedef void (*WnbDispatchCallbackFn)(int iCallback, const void* data, size_t data_size);
 typedef void (*WnbDispatchCallResultFn)(uint64_t hAPICall, int io_failure,
                                         const void* data, size_t data_size);
 static std::atomic<WnbDispatchCallbackFn>   g_wnb_dispatch_cb{nullptr};
 static std::atomic<WnbDispatchCallResultFn> g_wnb_dispatch_cr{nullptr};
 
-// Load function pointers from the publish file (idempotent — once
-// loaded, subsequent calls are no-ops). PE bridge writes the file in
-// its first matchmaking init; wine-side reader picks them up here.
 static void load_wnb_dispatch_pointers(void) {
     if (g_wnb_dispatch_cb.load(std::memory_order_acquire) != nullptr) return;
     std::string path = wn_state_dir() + "/wnb_ptrs.txt";
@@ -496,14 +434,11 @@ static void load_wnb_dispatch_pointers(void) {
     }
 }
 
-// Parse the line-delimited snapshot file at `path` into out_eresult +
-// out_lobbies. Returns false if file doesn't exist or is malformed.
 static bool parse_lobby_state_file(const std::string& path,
                                    int32_t* out_eresult,
                                    std::vector<WnCmLobbyEntry>* out_lobbies) {
     std::ifstream f(path);
     if (!f) return false;
-    *out_eresult = 0;
     out_lobbies->clear();
     std::string line;
     while (std::getline(f, line)) {
@@ -527,8 +462,6 @@ static bool parse_lobby_state_file(const std::string& path,
     return true;
 }
 
-// Write a request file the app-side poller picks up. Atomic via
-// tmp+rename so the poller never sees a partial request.
 static void write_lobby_request_file(uint32_t app_id) {
     std::string dir = wn_state_dir();
     std::string final_path = dir + "/wn_lobby_req_" + std::to_string(app_id) + ".txt";
@@ -542,29 +475,6 @@ static void write_lobby_request_file(uint32_t app_id) {
     std::rename(tmp_path.c_str(), final_path.c_str());
 }
 
-// Line-delimited cross-process lobby snapshot. The wine-side variant
-// (no in-process CMClient) drops a request file and polls for the
-// response with a short timeout. The app-side state-sync poller
-// (start_state_sync_poller below, spawned from nativeInit) reads the
-// request, queries CMClient, writes the response file.
-//
-// Format:
-//   app_id <uint32>
-//   fetched <unix_ts>
-//   eresult <int32>
-//   lobby <steam_id64> <max_members>
-//   ...
-// Returns true if cb was already fired (handled either from a fresh
-// existing file or after request/response round-trip).
-// Fan out a lobby-list result to the PE-bridge listener registry. cb
-// (passed by caller) queues into libsteamclient.so's internal pending-
-// callback table, but the game's CCallResult is registered via
-// SteamAPI_RegisterCallResult (gbe_fork override in our PE bridge);
-// that registry is in a different module + isn't aware of our queue.
-// wnb_dispatch_call_result invokes vt[1] CCallResult::Run directly on
-// the game's listener — same wine process, raw fn pointer published
-// via wnb_ptrs.txt. Late-bind aware: stashes by hCall if the game
-// hasn't registered yet.
 static void dispatch_lobby_list_to_wnb(uint64_t hCall,
                                        int32_t eresult,
                                        size_t lobby_count) {
@@ -600,7 +510,6 @@ static bool try_lobby_list_from_file(uint64_t hCall,
         return true;
     };
 
-    // If a recent response file exists (mtime within 30s), use it.
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0) {
         time_t now = std::time(nullptr);
@@ -609,9 +518,6 @@ static bool try_lobby_list_from_file(uint64_t hCall,
         }
     }
 
-    // Otherwise drop a request and poll briefly. App-side poller
-    // (start_state_sync_poller) sees the request, calls CMClient,
-    // writes the response. Total budget ~3s.
     write_lobby_request_file(app_id);
     constexpr int kMaxAttempts = 30;  // 30 * 100ms = 3s
     for (int i = 0; i < kMaxAttempts; ++i) {
@@ -624,22 +530,10 @@ static bool try_lobby_list_from_file(uint64_t hCall,
     WN_BRIDGE_LOGI("lobby_get_list(%u): request-file timeout — synthetic empty",
                    app_id);
     cb(hCall, /*eresult=*/1, nullptr, 0);  // success-but-empty
-    // Still fan out to PE bridge listeners — without this the game's
-    // CCallResult never sees a result and stalls on "Failed to fetch".
     dispatch_lobby_list_to_wnb(hCall, /*eresult=*/1, /*lobby_count=*/0);
     return true;
 }
 
-// Poll the state-sync directory for wn_lobby_req_*.txt files and
-// fulfill each one by calling wn_cm_lobby_get_list on the in-process
-// CMClient. The writer side (already shipped) mirrors the response to
-// the wn_lobby_<appid>.txt file the wine-side reader is polling.
-//
-// Runs on a detached thread spawned from nativeInit (app process only —
-// the wine process's libwnsteam.so instance doesn't have a CMClient so
-// any request files it generates wait for the app poller). Wakes every
-// 1 second; that's fine for game-launch UX (lobby request → response
-// completes in ~1-2s).
 static void state_sync_poller_loop() {
     pthread_setname_np(pthread_self(), "wn-state-sync");
     WN_BRIDGE_LOGI("state-sync poller started");
@@ -653,7 +547,6 @@ static void state_sync_poller_loop() {
             std::string name = ent->d_name;
             if (name.rfind("wn_lobby_req_", 0) != 0) continue;
             if (name.size() < 20 || name.substr(name.size() - 4) != ".txt") continue;
-            // Extract app_id from filename "wn_lobby_req_<appid>.txt"
             std::string app_str = name.substr(13, name.size() - 13 - 4);
             uint32_t app_id = 0;
             try { app_id = static_cast<uint32_t>(std::stoul(app_str)); }
@@ -662,13 +555,9 @@ static void state_sync_poller_loop() {
             std::string req_path = dir + "/" + name;
             int unlink_rc = ::unlink(req_path.c_str());
             int unlink_errno = errno;
-            // Fulfill via in-process CMClient. Noop callback — the
-            // writer side fires before the callback and is what the
-            // wine-side reader picks up.
             WN_BRIDGE_LOGI("state-sync: fulfilling request for app=%u unlink=%d/%d",
                            app_id, unlink_rc, unlink_rc == 0 ? 0 : unlink_errno);
             bool dispatched = wn_cm_lobby_get_list(
-                /*hCall=*/0, app_id, /*num=*/0,
                 nullptr, nullptr, nullptr, nullptr, 0,
                 [](uint64_t, int32_t, const WnCmLobbyEntry*, size_t) {});
             if (!dispatched) {
@@ -698,9 +587,6 @@ bool wn_cm_lobby_get_list(uint64_t hCall,
     if (app_id == 0 || !cb) return false;
     auto client = snapshot_active();
     if (!client) {
-        // No in-process CMClient (typical for Forest's wine-side
-        // libsteamclient.so instance). Fall back to a cross-process
-        // state file the app process writes — see task #164.
         if (try_lobby_list_from_file(hCall, app_id, cb)) {
             return true;
         }
@@ -720,18 +606,11 @@ bool wn_cm_lobby_get_list(uint64_t hCall,
         filters.push_back(std::move(f));
     }
 
-    // Install one-shot lobby observer: the CMClient registers the
-    // observer permanently (set_lobby_data_observer), so the cm_bridge
-    // observer dispatch is the steady-state path. Here we just register
-    // ONE bridge-level observer to forward every push to libsteamclient
-    // .so via g_lobby_data_observer.
     client->set_lobby_data_observer([](const wn_steam::pb::CMsgClientMMSLobbyData& msg) {
         auto fn = g_lobby_data_observer.load(std::memory_order_acquire);
         if (!fn) return;
         std::vector<WnCmLobbyMember> members;
         members.reserve(msg.members.size());
-        // Strings are referenced by pointer; keep the originals alive
-        // for the duration of the fn() call.
         for (const auto& m : msg.members) {
             WnCmLobbyMember bm{};
             bm.steam_id      = m.steam_id;
@@ -761,10 +640,6 @@ bool wn_cm_lobby_get_list(uint64_t hCall,
         num_lobbies_requested,
         [hCall, app_id, cb](std::optional<wn_steam::pb::CMsgClientMMSGetLobbyListResponse> resp) {
             if (!resp) {
-                // Write an empty-list file too so a wine-side reader
-                // doesn't spin forever waiting for a response that
-                // never came. eresult=-1 distinguishes synthetic
-                // failure from a real empty list (which uses eresult=1).
                 write_lobby_list_to_file(app_id, -1, nullptr, 0);
                 cb(hCall, /*synthetic-failure*/ -1, nullptr, 0);
                 return;
@@ -783,10 +658,6 @@ bool wn_cm_lobby_get_list(uint64_t hCall,
                 e.distance    = L.distance;
                 entries.push_back(e);
             }
-            // Mirror to the cross-process state file so a wine-side
-            // libsteamclient.so caller (Forest's instance) without an
-            // in-process CMClient gets real lobby data on its next
-            // RequestLobbyList — see task #164.
             write_lobby_list_to_file(app_id, resp->eresult,
                                      entries.empty() ? nullptr : entries.data(),
                                      entries.size());
@@ -801,11 +672,6 @@ bool wn_cm_lobby_get_list(uint64_t hCall,
     return true;
 }
 
-// CreateLobby — fan-out to CMClient::lobby_create, marshal response
-// back through the C-ABI callback. On success, additionally synthesize
-// a LobbyDataObserver event for the freshly-created lobby so the
-// libsteamclient.so cache is primed before the LobbyEnter_t fires (per
-// SDK contract: CreateLobby fires both LobbyCreated_t and LobbyEnter_t).
 bool wn_cm_lobby_create(uint64_t hCall,
                         uint32_t app_id,
                         int32_t lobby_type,
@@ -826,10 +692,6 @@ bool wn_cm_lobby_create(uint64_t hCall,
                 cb(hCall, /*synthetic-failure*/ -1, 0);
                 return;
             }
-            // On success, prime the lobby cache via the data observer
-            // so the immediately-following LobbyEnter_t finds the
-            // owner/members already populated. The host is the only
-            // member at this point.
             if (resp->eresult == 1 && resp->steam_id_lobby != 0) {
                 auto fn = g_lobby_data_observer.load(std::memory_order_acquire);
                 if (fn) {
@@ -859,9 +721,6 @@ bool wn_cm_lobby_create(uint64_t hCall,
     return true;
 }
 
-// JoinLobby — fan-out to CMClient::lobby_join, marshal the rich
-// response (member list + metadata) into pushed().active_lobbies via
-// the lobby-data observer before signalling LobbyEnter_t.
 bool wn_cm_lobby_join(uint64_t hCall,
                       uint32_t app_id,
                       uint64_t lobby_sid,
@@ -881,9 +740,6 @@ bool wn_cm_lobby_join(uint64_t hCall,
                 cb(hCall, /*synthetic-failure*/ -1, lobby_sid);
                 return;
             }
-            // Mirror response into pushed().active_lobbies via the
-            // observer so GetLobbyData / GetNumLobbyMembers / GetLobby
-            // Owner reads after LobbyEnter_t fires see real data.
             if (resp->chat_room_enter_response == 1 /*Success*/) {
                 auto fn = g_lobby_data_observer.load(std::memory_order_acquire);
                 if (fn) {
@@ -956,10 +812,6 @@ bool wn_cm_lobby_send_chat(uint32_t app_id, uint64_t lobby_sid,
                        static_cast<unsigned long long>(lobby_sid));
         return false;
     }
-    // Lazy-install the chat-msg + membership observers the first time
-    // a chat send happens (same model as lobby_get_list installing the
-    // lobby-data observer). They translate from CMClient's proto-typed
-    // observers to the C-ABI POD-typed bridge observers.
     static std::once_flag once;
     std::call_once(once, [&]() {
         auto client2 = client;

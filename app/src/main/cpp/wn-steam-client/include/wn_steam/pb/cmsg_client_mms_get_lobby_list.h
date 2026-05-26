@@ -6,46 +6,6 @@
 #include <string>
 #include <vector>
 
-// CMsgClientMMSGetLobbyList (EMsg 6607) / Response (EMsg 6608).
-//
-// Verified against SteamKit2's
-//   Resources/Protobufs/steam/steammessages_clientserver_mms.proto:
-//
-//   message CMsgClientMMSGetLobbyList {
-//     message Filter {
-//       optional string key            = 1;
-//       optional string value          = 2;
-//       optional int32  comparision    = 3;   // sic — proto typo upstream
-//       optional int32  filter_type    = 4;
-//     }
-//     optional uint32 app_id                = 1;
-//     optional int32  num_lobbies_requested = 3;
-//     optional uint32 cell_id               = 4;
-//     repeated Filter filters               = 6;
-//     optional CMsgIPAddress public_ip      = 7;     // we leave unset
-//     optional string network_ping_location = 8;     // we leave unset
-//   }
-//
-//   message CMsgClientMMSGetLobbyListResponse {
-//     message Lobby {
-//       optional fixed64 steam_id    = 1;
-//       optional int32   max_members = 2;
-//       optional int32   lobby_type  = 3;
-//       optional int32   lobby_flags = 4;
-//       optional bytes   metadata    = 5;
-//       optional int32   num_members = 6;
-//       optional float   distance    = 7;
-//       optional int64   weight      = 8;
-//       optional int32   ping        = 9;
-//       optional int32   missing_ping= 10;
-//     }
-//     optional uint32          app_id  = 1;
-//     optional int32           eresult = 3 [default = 2];   // EResult.Fail
-//     repeated Lobby           lobbies = 4;
-//   }
-//
-// We model only the field set we actually exchange today; the wire
-// parser is tolerant of unknown fields via skip().
 
 namespace wn_steam::pb {
 

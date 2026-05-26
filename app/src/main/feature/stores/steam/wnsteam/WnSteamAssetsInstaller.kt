@@ -16,34 +16,14 @@ object WnSteamAssetsInstaller {
     private const val STEAM_TZST    = "steam-androidarm64.tzst"
     private const val LSC_ARM64EC   = "lsteamclient-arm64ec.tzst"
     private const val LSC_X86_64    = "lsteamclient-x86_64.tzst"
-    // Use our own steampipe asset under wnsteam/ — the bundled
-    // assets/steampipe/ is the Goldberg-style 18MB DLL used by ColdClient
-    // mode; we want the GameNative-derived 7.3MB bridge that calls
-    // LoadLibrary("steamclient64.dll") and engages our libsteamclient.so.
     private const val STEAMPIPE_API64 = "wnsteam/steampipe/steam_api64.dll"
     private const val STEAMPIPE_API32 = "wnsteam/steampipe/steam_api.dll"
-    // Steam Launcher — Valve's REAL Windows Steam binaries bundle.
     private const val VALVE_STEAM_X64 = "valve-steam-x86_64.tzst"
-    // gbe_fork backend the bridge PE-export-forwards to. Staged
-    // alongside the bridge so the Windows loader can resolve forwarder
-    // entries at LoadLibrary time.
     private const val STEAMPIPE_ORIGINAL_API64 = "wnsteam/steampipe/original_steam_api64.dll"
 
     fun isSupportedFor(container: Container): Boolean =
         lsteamclientArchive(container) != null
 
-    /**
-     * Run the install pass for [container]. Safe to call on every launch;
-     * idempotent via the sentinel files written under [stamp].
-     */
-    /**
-     * Container-independent half of [install]: extract the bionic Steam
-     * runtime (libsteamclient.so + libsteamnetworkingsockets / steamservice /
-     * tier0 / vstdlib) into `usr/lib/`, and stage the bridge copy of
-     * libsteamclient.so in filesDir. Safe to call early — e.g. at Steam
-     * login, before any container is chosen — to pre-warm WnSteamBootstrap.
-     * Idempotent via the stamp file.
-     */
     fun installBionicRuntime(context: Context): Boolean {
         val imageFs = ImageFs.find(context)
         val apkId = apkStamp(context)
@@ -62,142 +42,10 @@ object WnSteamAssetsInstaller {
             }
             steamStamp.writeText(apkId)
         }
-        // 2026-05-21: DISABLED. Keeping Valve's real bionic
-        // libsteamclient.so (37 MB, shipped inside steam-androidarm64
-        // .tzst) at imagefs/usr/lib/. Our overlay was replacing it
-        // with the 1.4 MB custom build from app/src/main/cpp/wn-
-        // libsteamclient/, which broke the wine PE bridge's
-        // matchmaking/P2P/SDR path — Forest's MULTIPLAYER got fake
-        // gbe state instead of real Steam lobbies.
-        //
-        // The custom libsteamclient.so still ships in the APK at
-        // applicationInfo.nativeLibraryDir, and the app's JNI side
-        // continues to use it via System.loadLibrary("steamclient").
-        // Wine bridge talks to the imagefs path (now Valve's binary),
-        // app JNI talks to the APK lib path (still ours) — same name,
-        // different files, no conflict. See
-        // [[project-bionic-use-valve-lsclient]] for full diagnosis.
-        //
-        // 2026-05-21: overlay DISABLED so Valve's 37 MB bionic libsteamclient.so
-        // stays at imagefs/usr/lib/ — the wine PE bridge dlopens it from there
-        // and its full ISteam* surface (real CM, real matchmaking, real SDR)
-        // takes over for game-side calls. WnLibSteamClient.kt now loads the
-        // JNI side via System.loadLibrary("steamclient") which resolves to the
-        // APK's nativeLibraryDir (our open-source build with JNI symbols), so
-        // the regression diagnosed earlier ("No implementation found for
-        // nativePollOverlayRequest") is fixed: Kotlin JNI and wine guest see
-        // different libraries by design.
-        // overlayOpenSourceLibsteamclient(context, imageFs)
-        // Stage a copy of libsteamclient.so directly in filesDir,
-        // at the short path the patched lsteamclient.so will dlopen (see
-        // patchLsteamclientLibPath — the imagefs/usr/lib path is too long
-        // for lsteamclient.so's fixed 65-byte path field).
         stageBridgeLibsteamclient(context, imageFs)
         return true
     }
 
-    /**
-     * Replace the libsteamclient.so under
-     * `<rootDir>/usr/lib/` with the open-source build from
-     * `app/src/main/cpp/wn-libsteamclient/`. The NDK installs it into
-     * `applicationInfo.nativeLibraryDir` — same dir [System.loadLibrary]
-     * resolves against — so we just copy that file over.
-     *
-     * Returns true on success or no-op (already overlaid + up to date).
-     * Idempotent — keyed by source mtime in a stamp file alongside.
-     */
-    private fun overlayOpenSourceLibsteamclient(context: Context, imageFs: ImageFs): Boolean {
-        val src = File(context.applicationInfo.nativeLibraryDir, "libsteamclient.so")
-        if (!src.exists()) {
-            Timber.tag(TAG).w("overlay: %s missing from APK — skipping (using bundled fallback)",
-                src.absolutePath)
-            return false
-        }
-        val dest = File(imageFs.rootDir, "usr/lib/libsteamclient.so")
-        // Fingerprint by (size, full-SHA256-hex). APK install doesn't
-        // update file mtime reliably across reinstalls, and an earlier
-        // size+first-16-bytes-hex fingerprint falsely accepted stale
-        // .so files because the ELF prefix is identical across every
-        // arm64 build (see fingerprint() docstring). Full SHA-256 over
-        // a 1.4 MB .so is ~15ms — fine for once-per-app-boot.
-        val stamp = File(imageFs.libDir, ".wn-libsteamclient.overlay.stamp")
-        val srcFingerprint = fingerprint(src)
-        if (stamp.exists() && stamp.readText().trim() == srcFingerprint && dest.exists()
-            && dest.length() == src.length()) {
-            Timber.tag(TAG).d("overlay: dest already matches src (%s) — skipping copy", srcFingerprint)
-            return true
-        }
-        Timber.tag(TAG).i("overlay: src=%d bytes dest=%d bytes — copying open-source build",
-            src.length(), if (dest.exists()) dest.length() else -1)
-        return try {
-            // Make sure dest dir exists (defensive; extractor should
-            // have created it from the .tzst). Then atomic-ish rename:
-            // copy to .new, then rename over the live file so a half-
-            // written file never gets read by a parallel prewarm.
-            dest.parentFile?.mkdirs()
-            val tmp = File(dest.parentFile, "libsteamclient.so.new")
-            src.copyTo(tmp, overwrite = true)
-            tmp.renameTo(dest) || run {
-                tmp.copyTo(dest, overwrite = true); tmp.delete(); true
-            }
-            stamp.writeText(srcFingerprint)
-            Timber.tag(TAG).i("overlay: open-source libsteamclient.so (%d bytes) -> %s (fp=%s)",
-                dest.length(), dest.absolutePath, srcFingerprint)
-            true
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "overlay failed; bootstrap will use bundled fallback")
-            false
-        }
-    }
-
-    /**
-     * Content fingerprint — full SHA-256 of the file. Earlier
-     * implementation used size + first-16-bytes-hex which falsely
-     * accepted stale .so files across reinstalls: two arm64 ELF .so
-     * builds always share the same first 16 bytes (ELF magic + ABI
-     * marker + ELF version) and an unchanged build size happens often
-     * when the C++ change only flips an initializer value. Result: the
-     * overlay-stamp check returned "up to date" even when the APK
-     * shipped a freshly-rebuilt .so. Captured concretely as
-     * BIsSubscribed env-fallback shipping but Stage2 still showing
-     * `cloud_account=0` because the on-device extracted .so was the
-     * pre-default-flip build. Full SHA-256 is ~12ms for our 1.4MB .so
-     * — cheap enough for once-per-app-boot, and stable proof.
-     */
-    private fun fingerprint(f: File): String {
-        return try {
-            val md = java.security.MessageDigest.getInstance("SHA-256")
-            java.io.FileInputStream(f).use { fis ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = fis.read(buf)
-                    if (n <= 0) break
-                    md.update(buf, 0, n)
-                }
-            }
-            buildString {
-                append(f.length())
-                append('_')
-                md.digest().forEach { append(String.format("%02x", it)) }
-            }
-        } catch (_: Exception) {
-            "size${f.length()}"
-        }
-    }
-
-    /**
-     * Identity token that changes whenever the APK is (re)installed,
-     * updated, or sideloaded. `lastUpdateTime` is bumped by the package
-     * manager on every install — including an `adb install -r` of the
-     * same versionCode during development — so it is the precise signal
-     * for "the bundled assets may have changed, re-stage them."
-     *
-     * Staleness was a real bug: the tzst extractors below gated purely
-     * on a stamp file *existing*, so a freshly-installed APK silently
-     * reused the previous install's extracted binaries (a stale
-     * steamclient64.dll / launcher payload). On failure we return a
-     * unique value so the caller always re-extracts — never stale.
-     */
     @Suppress("DEPRECATION")
     private fun apkStamp(context: Context): String {
         return try {
@@ -209,7 +57,6 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    /** True when [stamp] is missing or was written by a different APK. */
     private fun stampStale(stamp: File, apkId: String): Boolean {
         return try {
             !stamp.exists() || stamp.readText().trim() != apkId
@@ -219,7 +66,6 @@ object WnSteamAssetsInstaller {
     }
 
     fun install(context: Context, container: Container): Boolean {
-        // 1) Linux/Android side — usr/lib/ libsteamclient.so + friends.
         if (!installBionicRuntime(context)) return false
         val imageFs = ImageFs.find(context)
 
@@ -275,8 +121,6 @@ object WnSteamAssetsInstaller {
                 parentFile?.mkdirs()
             }
             unixSoSrc.copyTo(unixSoDest, overwrite = true)
-            // De-hardcode the bionic libsteamclient.so path baked into the
-            // prebuilt lsteamclient.so (see patchLsteamclientLibPath).
             patchLsteamclientLibPath(unixSoDest, context)
         }
 
@@ -286,40 +130,10 @@ object WnSteamAssetsInstaller {
         return true
     }
 
-    /** filesDir path the patched lsteamclient.so dlopens libsteamclient.so from. */
     fun bridgeLibPath(context: Context): File =
         File(context.filesDir, "libsteamclient.so")
 
-    /**
-     * Stage Valve's `steamservice.exe` (the Steam Client Service binary) at
-     * `<Steam>/bin/steamservice.exe` inside the container. The in-Wine
-     * launcher (steam.exe / main.cpp:start_steam_client_service) installs +
-     * starts this as a Win32 service so steamclient64.dll's IPC queue gets
-     * a consumer — that's the prerequisite for
-     * IClientAppManager::LaunchApp to actually spawn the game (otherwise
-     * the call is silently dropped and we fall through to CreateProcess).
-     * GameHub does the same; the binary lives at exactly the same relative
-     * path in their install.
-     *
-     * No-op (returns false) if the asset is not bundled in this APK. The
-     * launcher's bootstrap then logs "steamservice: binary not present"
-     * and falls through to CreateProcess.
-     */
     fun installPlanWSteamService(context: Context, container: Container): Boolean {
-        // <Steam>/bin/ payload for the Steam Client Service:
-        //   steamservice.exe          — the service binary
-        //   steamservice.dll          — companion the service loads at runtime
-        //   service_current_versions.vdf  — Valve-signed manifest declaring
-        //                                   current versions of the service
-        //                                   binaries; the service refuses to
-        //                                   complete startup without it (its
-        //                                   own log: "Could not load version
-        //                                   info" / "Could not load required
-        //                                   version info" → ERROR), which
-        //                                   makes the SCM say RUNNING but
-        //                                   the IPC drainer never engages.
-        //   service_minimum_versions.vdf  — companion VDF for the minimum-
-        //                                   version check.
         val exeAsset    = "$ASSET_DIR/bionic/steamservice.exe"
         val dllAsset    = "$ASSET_DIR/bionic/steamservice.dll"
         val curVdfAsset = "$ASSET_DIR/bionic/service_current_versions.vdf"
@@ -363,20 +177,6 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    /**
-     * Ensure the planW Steam dir is a container-local REAL directory, not a
-     * symlink into the shared steam-client-store. MUST be called before any
-     * cloud-save download path runs: if Steam dir is a symlink at write time,
-     * the cloud bytes land in the shared store, and the later (per-launch)
-     * installPlanWValveSteam-driven symlink → real-dir flip orphans them
-     * there. Also rescues any USERDATA that already got orphaned in the
-     * shared store from a prior launch — copies (doesn't move) so the
-     * shared store stays pristine for Bionic / ColdClient modes that
-     * legitimately use it as a symlink target.
-     *
-     * Idempotent: on a fresh container (real dir, no stale shared userdata)
-     * this is a no-op aside from the mkdirs.
-     */
     fun ensureRealSteamDir(context: Context, container: Container) {
         val imageFs = ImageFs.find(context)
         val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
@@ -398,9 +198,6 @@ object WnSteamAssetsInstaller {
         }
         steamDir.mkdirs()
 
-        // Rescue orphaned userdata from the shared store. Game saves the
-        // user downloaded while Steam dir was a symlink live here and the
-        // in-Wine real Steam (planW) can no longer see them.
         val sharedUserdata = File(sharedSteam, "userdata")
         if (!sharedUserdata.isDirectory) return
         val realUserdata = File(steamDir, "userdata").apply { mkdirs() }
@@ -411,17 +208,10 @@ object WnSteamAssetsInstaller {
             accountDir.listFiles()?.forEach { appDir ->
                 if (!appDir.isDirectory) return@forEach
                 val appIdName = appDir.name
-                // Migrate game userdata (numeric appId) only; skip Steam
-                // Client's own '7' / 'config' — those are legitimately
-                // owned by whichever mode last wrote them, and planW's
-                // real Steam will populate them fresh on logon.
                 if (appIdName == "7" || appIdName == "config") return@forEach
                 if (!appIdName.all { it.isDigit() }) return@forEach
                 val destAccountDir = File(realUserdata, accountDir.name)
                 val destAppDir = File(destAccountDir, appIdName)
-                // Skip if real dest already has any file — assume it's
-                // current and we shouldn't clobber it with the (possibly
-                // older) shared-store copy.
                 val destAlreadyPopulated = destAppDir.isDirectory &&
                     destAppDir.walkTopDown().filter { it.isFile }.any()
                 if (destAlreadyPopulated) return@forEach
@@ -446,23 +236,6 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    /**
-     * Place the Proton lsteamclient bridge — by its REAL name
-     * `lsteamclient.dll` — into [container]'s own `system32` + `syswow64`,
-     * and stage its unix-side `lsteamclient.so`. Per-container and
-     * self-contained: re-extracts the archive each call rather than
-     * relying on the global install stamp (which only ever tracked the
-     * first container, leaving every other container without the DLLs —
-     * the `64=false 32=false` bug).
-     *
-     * The DLL keeps its real name on purpose: Wine pairs a PE module
-     * with its unix counterpart by base name, so `lsteamclient.dll` must
-     * stay `lsteamclient.dll` to find `lsteamclient.so`. The game is
-     * pointed at it via the ActiveProcess `SteamClientDll{,64}` registry
-     * values, not by renaming it to `steamclient64.dll`.
-     *
-     * Returns true if the 64-bit bridge DLL was placed.
-     */
     fun installSteamclientBridgeIntoContainer(context: Context, container: Container): Boolean {
         val archive = lsteamclientArchive(container)
         if (archive == null) {
@@ -503,10 +276,6 @@ object WnSteamAssetsInstaller {
             val dest = File(imageFs.libDir, "wine/$unixSide/lsteamclient.so")
                 .apply { parentFile?.mkdirs() }
             unixSo.copyTo(dest, overwrite = true)
-            // The prebuilt lsteamclient.so has the libsteamclient.so path
-            // hardcoded to GameNative's package — patch it to ours, here,
-            // so the deployed bridge is always patched regardless of the
-            // order install()/installBionicRuntime run in.
             patchLsteamclientLibPath(dest, context)
         }
         staging.deleteRecursively()
@@ -515,36 +284,9 @@ object WnSteamAssetsInstaller {
         return placed64
     }
 
-    /**
-     * Steam Launcher — extract Valve's REAL Windows Steam binaries (steamclient64.dll,
-     * Steam.dll, Steam2.dll, tier0_s64.dll, vstdlib_s64.dll, and their 32-bit
-     * variants) into the container's wine prefix at
-     * `C:\Program Files (x86)\Steam\`. These are the binaries our
-     * wn-steam-launcher.exe LoadLibrarys to host Valve's Steam client
-     * IN-PROCESS with the game — eliminating the cross-process bridge that
-     * blocks Steam Networking Sockets / SDR / P2P callbacks under our
-     * current Bionic Steam mode.
-     *
-     * Source asset: `assets/wnsteam/bionic/valve-steam-x86_64.tzst`
-     * (~16 MB compressed; ~50 MB unpacked).
-     *
-     * Idempotent — checks for a stamp file in the Steam dir.
-     *
-     * Returns true iff all required binaries landed in the prefix.
-     */
     fun installPlanWValveSteam(context: Context, container: Container): Boolean {
         val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
-        // Centralized real-dir flip + shared-store userdata rescue. This MUST
-        // run here, AFTER setSteamClientVisibility's
-        // moveSteamDirectoryIntoBackingStore pass which moves any prior
-        // real-dir Steam contents (including userdata!) into
-        // .shared/steam-client-store/ — without rescuing it back, the
-        // freshly-created planW Steam dir would be empty and the user
-        // would see "create new save" every launch even after a successful
-        // cloud download.
         ensureRealSteamDir(context, container)
-        // Cache extracted Valve binaries in filesDir/wnsteam-planw-cache/
-        // so we only pay the ~16 MB zstd unpack once.
         val apkId = apkStamp(context)
         val cache = File(context.filesDir, "wnsteam-planw-cache")
         val cacheStamp = File(cache, ".planw-valve-steam.stamp")
@@ -565,16 +307,6 @@ object WnSteamAssetsInstaller {
                 cache.absolutePath, cache.listFiles()?.size ?: 0)
         }
 
-        // Per-container stage stamp. The planW launch path explicitly skips
-        // installBionicSteamPathOverlay (XServerDisplayActivity.java sets
-        // bionicOverlayOk=false when planWActive), so no other step in planW
-        // mode rewrites steamclient64.dll between launches — repeating the
-        // ~50 MB cache → Steam dir copy + system32 dep copy on every launch
-        // is wasted work. Gate on apkStamp (re-stage after APK updates) AND
-        // on a size match between cached vs deployed steamclient64.dll
-        // (catches cross-mode reuse where Bionic mode's overlay shrunk it
-        // to the ~1.4 MB bridge), AND on the system32 tier0 dep still
-        // being present (system32 wipe → re-stage).
         val stageStamp = File(steamDir, ".wn-planw-stage.stamp")
         val cachedSc64 = File(cache, "steamclient64.dll")
         val deployedSc64 = File(steamDir, "steamclient64.dll")
@@ -603,13 +335,6 @@ object WnSteamAssetsInstaller {
         Timber.tag(TAG).i("planW: staged %d Valve Steam DLLs into %s (from cache)",
             copied, steamDir.absolutePath)
 
-        // steamclient64.dll imports tier0_s64.dll + vstdlib_s64.dll. Whoever
-        // loads steamclient64.dll in the game process — our bridge, Valve's
-        // own steam_api, or the game's SteamStub DRM stub — resolves those
-        // deps on the DEFAULT DLL search path, NOT the Steam dir, so they
-        // must also live in system32. Without this, steamclient64.dll's
-        // tier0 imports stub out (Wine pins the stubs in ntdll) and
-        // process_attach page-faults — the game fails to boot.
         val system32 = File(container.rootDir, ".wine/drive_c/windows/system32")
             .apply { mkdirs() }
         val syswow64 = File(container.rootDir, ".wine/drive_c/windows/syswow64")
@@ -643,30 +368,14 @@ object WnSteamAssetsInstaller {
         return copied >= 5  // steamclient64 + Steam + Steam2 + tier0 + vstdlib (at minimum)
     }
 
-    /**
-     * Steam Launcher — install our `steam.exe` (the in-process Steam host
-     * built from `app/src/main/cpp/wn-steam-launcher/`) into the container's
-     * Steam dir. Named `steam.exe` on disk because steamclient's
-     * IClientAppManager::LaunchApp / CGameLauncher path only spawns the
-     * game when the hosting process looks like real Steam (matches what
-     * GameHub does); under our older `wn-steam-launcher.exe` name LaunchApp
-     * queued the launch but never produced a child process and we had to
-     * fall through to CreateProcess. Replaces the wn-steam-helper.exe path
-     * for Steam Launcher launches.
-     */
     fun installPlanWLauncher(context: Context, container: Container): Boolean {
         val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
-        // Same symlink-defense as installPlanWValveSteam — if Steam Launcher is the
-        // first to touch the Steam dir on this launch, it may still be a
-        // symlink to the shared store.
         val steamPath = steamDir.toPath()
         if (java.nio.file.Files.isSymbolicLink(steamPath)) {
             try { java.nio.file.Files.delete(steamPath) } catch (_: Exception) {}
         }
         steamDir.mkdirs()
         val dst = File(steamDir, "steam.exe")
-        // Also remove any stale copy from the older binary name so a
-        // mid-rollout container doesn't end up with both files.
         File(steamDir, "wn-steam-launcher.exe").let { if (it.exists()) it.delete() }
         if (dst.exists()) { try { dst.delete() } catch (_: Exception) {} }
         val ok = try {
@@ -680,12 +389,6 @@ object WnSteamAssetsInstaller {
             Timber.tag(TAG).e(e, "planW: failed to install steam.exe")
             false
         }
-        // Copy the CA bundle into the Steam dir so Valve's steamclient64.dll
-        // can TLS-verify its CM connection. Valve's bionic libsteamclient.so
-        // needs STEAM_SSL_CERT_FILE (see steam_bootstrap.cpp); the Windows
-        // steamclient64.dll under Wine has no populated cert store either,
-        // so we stage the same bundle at a Windows-accessible path and
-        // XServerDisplayActivity points STEAM_SSL_CERT_FILE at it.
         try {
             val caSrc = File(context.filesDir, "wnsteam_cacert.pem")
             if (caSrc.exists() && caSrc.length() > 0) {
@@ -703,12 +406,6 @@ object WnSteamAssetsInstaller {
         return ok
     }
 
-    /**
-     * Stage a copy of the bionic `libsteamclient.so` at [bridgeLibPath]
-     * (`<filesDir>/libsteamclient.so`). The Wine process runs as our app
-     * uid and can read filesDir; this short path is what the patched
-     * lsteamclient.so dlopens. Idempotent — skips when up to date.
-     */
     private fun stageBridgeLibsteamclient(context: Context, imageFs: ImageFs): Boolean {
         val src = File(imageFs.rootDir, "usr/lib/libsteamclient.so")
         if (!src.exists()) {
@@ -718,9 +415,6 @@ object WnSteamAssetsInstaller {
         val dest = bridgeLibPath(context)
         val apkId = apkStamp(context)
         val stamp = File(context.filesDir, ".wnsteam-bridge-lib.stamp")
-        // Re-copy when the APK changed even if the size is unchanged — a
-        // recompiled libsteamclient.so can land at the exact same byte
-        // count, so size-only would silently keep a stale bridge lib.
         if (dest.exists() && dest.length() == src.length() && !stampStale(stamp, apkId)) {
             return true
         }
@@ -736,22 +430,6 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    /**
-     * GameNative's prebuilt `lsteamclient.so` (the Wine-unix bridge) has the
-     * path of the bionic `libsteamclient.so` HARDCODED — a Ghidra decompile
-     * of `steamclient_init` shows a no-format-specifier
-     * `snprintf(buf, 0x1000, "/data/data/app.gamenative/files/imagefs/usr/lib/libsteamclient.so")`.
-     * There is no env override. For our app — and every product flavor —
-     * that `app.gamenative` path does not exist, so the bridge would fail
-     * with "unable to load CreateInterface".
-     *
-     * We patch the `.rodata` string in place to point at [bridgeLibPath],
-     * resolved from the real runtime package dir — correct for every flavor
-     * (`com.winnative.cmod` / `com.ludashi.benchmark` / `com.tencent.ig`)
-     * and never hardcoded in our source. The replacement is NUL-padded to
-     * the original 65-byte field and must fit within it (all our flavor
-     * paths are ~49-56 bytes — comfortably within budget).
-     */
     private fun patchLsteamclientLibPath(soFile: File, context: Context) {
         val marker = "/data/data/app.gamenative/files/imagefs/usr/lib/libsteamclient.so"
         val markerBytes = marker.toByteArray(Charsets.US_ASCII)
@@ -799,11 +477,6 @@ object WnSteamAssetsInstaller {
         }
     }
 
-    /**
-     * Wipe stamps + installed files so the next [install] re-extracts.
-     * Useful when the container's wine version changes (caller is expected
-     * to detect this).
-     */
     fun reset(context: Context) {
         val imageFs = ImageFs.find(context)
         listOf(
@@ -815,56 +488,6 @@ object WnSteamAssetsInstaller {
         ).forEach { if (it.exists()) it.delete() }
     }
 
-    /**
-     * Pick the lsteamclient.dll variant that matches the prefix's PE arch.
-     *
-     * Container.wineVersion is the PROTON build name, e.g.
-     * `Proton-9.0-arm64ec-0` — describes the native ABI Wine itself runs
-     * on, NOT necessarily the PE arch inside the prefix. A
-     * `Proton-9.0-arm64ec-0` container with `wineprefixArch=x86_64` runs
-     * x86_64 PE games + DLLs in `system32` (verified empirically:
-     * `system32/kernel32.dll` is `MS PE32+ executable (DLL) x86-64`).
-     *
-     * Earlier code keyed off `wineVersion` and shipped the aarch64 bridge
-     * (PE32+ Aarch64, 56 MB) into an x86_64 prefix; Wine's PE loader then
-     * refused to load it for x86_64 callers and Forest's stock
-     * `steam_api64.dll` silently failed `LoadLibrary("steamclient64.dll")`
-     * → game showed "STEAM NOT INITIALIZED" with `/proc/maps` containing
-     * zero steam-related mappings (verified 2026-05-20).
-     *
-     * Now: consult the actual wineprefix arch in `extraData`. Falls back
-     * to wineVersion sniffing if extraData is missing — preserves prior
-     * behaviour for older containers that haven't been re-saved.
-     */
-    /**
-     * Replace the game's stock `steam_api.dll` / `steam_api64.dll` with the
-     * GameNative-style steampipe bridge shipped under `assets/wnsteam/
-     * steampipe/`. The original DLL is preserved alongside as `.orig`.
-     *
-     * Why: Valve's stock `steam_api64.dll` for older Steamworks SDK builds
-     * (e.g. The Forest at 211 KB, 2018-vintage) short-circuits inside
-     * `SteamAPI_Init` before reaching `LoadLibrary("steamclient64.dll")`.
-     * Wine `+module/+loaddll` trace shows zero `steamclient64.dll` load
-     * attempts in 15K+ lines of debug — our whole Bionic bridge chain
-     * (steam_api64 → steamclient64.dll → lsteamclient.dll →
-     * libsteamclient.so) is dormant.
-     *
-     * The GameNative steampipe replacement (7.3 MB PE, exports the full
-     * `SteamAPI_*` + flat-C surface) DOES reach the LoadLibrary path,
-     * letting our existing bridge engage. Game's Mono / CSteamworks call
-     * SteamAPI_Init → steampipe bridge → LoadLibrary("steamclient64.dll")
-     * → our system32 bridge → dlopen libsteamclient.so → seed_state_
-     * from_env_once populates state → BLoggedOn returns true.
-     *
-     * Walks the game install tree (max-depth 10) so DLLs under
-     * `<game>/<engine_data>/Plugins/` (e.g. Unity's `TheForest_Data/
-     * Plugins/steam_api64.dll`) are also swapped. Skips entries whose
-     * `.orig` already exists with our bridge stamp — idempotent across
-     * launches.
-     *
-     * Returns the number of DLLs swapped. Zero if the game dir doesn't
-     * exist or has no steam_api*.dll files.
-     */
     fun installSteampipeBridgeIntoApp(context: Context, gameInstallDir: File): Int {
         if (!gameInstallDir.isDirectory) {
             Timber.tag(TAG).w("steampipe: game dir missing: ${gameInstallDir.absolutePath}")
@@ -879,32 +502,15 @@ object WnSteamAssetsInstaller {
             val asset = if (is64) STEAMPIPE_API64 else STEAMPIPE_API32
             val orig = File(f.parentFile, f.name + ".orig")
             try {
-                // Preserve the genuine DLL on first sighting (orig doesn't
-                // exist yet, so the live file IS the original Valve binary).
-                // Once .orig is captured we never overwrite it — a subsequent
-                // re-swap leaves .orig untouched.
                 if (!orig.exists()) {
                     f.copyTo(orig, overwrite = false)
                 }
-                // Always rewrite the live DLL from our asset. Rewriting on
-                // every launch is cheap (few hundred KB) and naturally picks
-                // up a new bridge build without needing a version marker —
-                // APK-compressed assets can't be openFd'd to compare lengths
-                // cheaply, and a stamp file would have to track asset
-                // identity anyway.
                 java.io.FileOutputStream(f).use { out ->
                     context.assets.open(asset).use { it.copyTo(out) }
                 }
                 swapped++
                 Timber.tag(TAG).i("steampipe: swapped ${f.path} (orig backed up as ${orig.name})")
 
-                // Stage the gbe_fork backend alongside the bridge under
-                // the name `original_steam_api64.dll`. The bridge PE
-                // export-forwards ~1200 calls to this module — without
-                // it, the Windows loader fails forwarder resolution at
-                // first GetProcAddress and the game can't init Steam.
-                // Only stage the 64-bit variant for now; 32-bit support
-                // can come later if any game asks.
                 if (is64) {
                     val backend = File(f.parentFile, "original_steam_api64.dll")
                     try {

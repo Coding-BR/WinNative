@@ -297,12 +297,6 @@ object SteamSaveSnapshotManager {
                         return@withLock BackupResult(false, "Sign in to Steam before importing.")
                     }
                     val resolver = context.contentResolver
-                    // Without containerHint, steamPrefixResolver falls into
-                    // ContainerUtils.getUsableContainerOrNull which prefers the
-                    // global "preferred game container" pref — appId-agnostic and
-                    // can route writes into the wrong wineprefix when the user
-                    // has a non-default container set for this game. The launcher
-                    // always passes shortcut.container; pass it here too.
                     val prefixResolver = steamPrefixResolver(context, appId, containerHint)
 
                     // Cloud listing for basename → canonical-path reconstruction. If the local
@@ -521,11 +515,6 @@ object SteamSaveSnapshotManager {
         return sources.values.toList()
     }
 
-    // Mirror SteamCloudSyncHelper.steamPrefixResolver / SteamService.syncCloudOnExit:
-    // derive accountId from steamUserSteamId64 BEFORE the steamUserAccountId pref so
-    // restores land in the same userdata/<accountId>/ subdir the in-Wine launcher
-    // writes (accId = WN_STEAM_STEAMID & 0xFFFFFFFF). A stale steamUserAccountId
-    // would otherwise point at a different folder than the game uses.
     private fun resolveAccountId(): Long =
         SteamService.userSteamId?.accountID?.toLong()
             ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }

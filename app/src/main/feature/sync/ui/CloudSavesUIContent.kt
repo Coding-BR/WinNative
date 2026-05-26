@@ -134,8 +134,6 @@ internal fun CloudSavesContent(
     var historyRefreshKey by remember { mutableStateOf(0) }
     var historyLoading by remember { mutableStateOf(false) }
     var historyEntries by remember { mutableStateOf<List<GameSaveBackupManager.BackupHistoryEntry>>(emptyList()) }
-    // True when the Steam Cloud listing couldn't be fetched (renders
-    // the reconnect message instead of the empty-state copy).
     var historySteamUnreachable by remember { mutableStateOf(false) }
     var entryPendingRestore by remember {
         mutableStateOf<GameSaveBackupManager.BackupHistoryEntry?>(null)
@@ -602,7 +600,6 @@ internal fun CloudSavesContent(
                         },
                     )
                 }
-                // Force-upload local save to Steam Cloud.
                 val pushAction: @Composable (Modifier) -> Unit = { mod ->
                     ActionWithHelper(
                         icon = Icons.Outlined.CloudUpload,
@@ -1286,7 +1283,6 @@ private fun TogglePairCard(
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val stacked = maxWidth < 380.dp
         val offlineGates = showOfflineMode && offlineModeEnabled
-        // Disable semantics: checked = cloud OFF. Enable semantics: checked = cloud ON.
         val cloudSyncCell: @Composable (Modifier) -> Unit = { mod ->
             TogglePaneCell(
                 modifier = mod,

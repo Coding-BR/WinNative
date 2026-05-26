@@ -142,12 +142,6 @@ void CMClient::disconnect() {
 }
 
 void CMClient::log_off_and_disconnect(std::chrono::milliseconds flush_window) {
-    // CMsgClientLogOff has an empty body; the EMsg id is what matters.
-    // Send + briefly let the channel flush before tearing down so Steam
-    // sees the logoff before the socket goes away. We do NOT wait for
-    // CMsgClientLoggedOff's eresult — best-effort: most of the value
-    // is in Steam's CM processing the LogOff record before our follow-up
-    // bootstrap LogonWithRefreshToken races in.
     if (state_.load() == ClientState::LoggedOn) {
         pb::CMsgClientLogOff msg;
         const bool ok = send_proto_message(EMsg::ClientLogOff, msg.serialize());
@@ -678,7 +672,6 @@ void CMClient::cloud_get_user_quota(CloudUserQuotaCallback cb,
     pb::CCloud_GetUserQuota_Request req;
     call_service_method(
         "Cloud.GetUserQuota#1",
-        /*authed=*/true,
         req.serialize(),
         [cb = std::move(cb)](JobResult r) {
             if (r.synthetic_failure || r.eresult != 1) {
@@ -1004,14 +997,8 @@ void CMClient::set_rich_presence(
     pb::CPlayer_SetRichPresence_Request req;
     req.appid         = app_id;
     req.rich_presence = kv;
-    // Fire-and-forget — Steam doesn't ack the RP write directly; the
-    // follow-up CMsgClientPersonaState for self carries the echoed
-    // rich_presence map which our persona_observer mirrors back.
-    // Calling with no callback gives a 5-second default timeout we
-    // ignore (the response is just an empty acknowledgment).
     call_service_method(
         "Player.SetRichPresence#1",
-        /*authed=*/true,
         req.serialize(),
         [app_id, count = kv.size()](JobResult r) {
             if (r.synthetic_failure || r.eresult != 1) {
@@ -1129,8 +1116,6 @@ void CMClient::request_friend_personas(const std::vector<uint64_t>& sids,
                 sids.size());
         return;
     }
-    // CMsgClientRequestFriendData accepts a repeated list; sending a
-    // single message is more efficient than fanning out per friend.
     pb::CMsgClientRequestFriendData req;
     req.persona_state_requested = persona_state_requested;
     req.friends = sids;  // copy is fine — caller's vector is small
@@ -1154,10 +1139,6 @@ std::vector<pb::License> CMClient::license_list() const {
 
 std::vector<uint64_t> CMClient::friends_list() const {
     std::lock_guard<std::mutex> lk(friends_mu_);
-    // Only surface mutual friends (relationship == 3 / Friend) — the
-    // public ISteamFriends.GetFriendCount semantics expect "people I am
-    // friends with", not pending requests / blocked / etc. Other states
-    // are still tracked internally for future EFriendFlags filtering.
     std::vector<uint64_t> out;
     out.reserve(friends_.size());
     for (const auto& [sid, rel] : friends_) {
@@ -1518,7 +1499,6 @@ void CMClient::route_inbound_(EMsg emsg,
         case EMsg::ClientMMSSetLobbyDataResponse:
         case EMsg::ClientMMSSetLobbyOwnerResponse:
         case EMsg::ClientMMSGetLobbyStatusResponse:
-            // Single-shot response — JobManager handles routing + parse.
             jobs_.deliver(header.jobid_target,
                           header.eresult,
                           header.error_message,
@@ -1526,11 +1506,6 @@ void CMClient::route_inbound_(EMsg emsg,
             break;
 
         case EMsg::ClientMMSLobbyData: {
-            // Server push — emitted whenever a lobby the client is
-            // subscribed to changes (metadata edit, member join/leave,
-            // owner change). Decode + forward to the observer; the
-            // observer (registered by libsteamclient.so) mirrors into
-            // pushed().active_lobbies and emits LobbyDataUpdate_t.
             auto resp = pb::CMsgClientMMSLobbyData::deserialize(body);
             if (!resp) {
                 WN_LOGE("MMSLobbyData parse failed (%zu bytes)", body.size());
@@ -1686,11 +1661,6 @@ void CMClient::route_inbound_(EMsg emsg,
             steam_id_.store(0);
             session_id_.store(0);
             family_group_id_.store(0);
-            // Drop the LoggedOn flag while the channel is still up so the
-            // bridge fires dispatch_logon_state(false) and the
-            // libsteamclient mirror flips pushed.logged_on=false. Stays at
-            // Connected (post-handshake, pre-logon) so the SDK consumer
-            // can drive a re-logon if it wants to.
             if (state_.load() == ClientState::LoggedOn) {
                 set_state_locked_(ClientState::Connected);
             }
@@ -1701,10 +1671,6 @@ void CMClient::route_inbound_(EMsg emsg,
         }
 
         case EMsg::ClientPersonaState: {
-            // Server-pushed persona updates; cache the entry for our own
-            // SteamID so self_persona() can surface name/avatar/game,
-            // AND cache friend personas separately so the ISteamFriends
-            // queries (via libsteamclient.so) can return real names.
             auto resp = pb::CMsgClientPersonaState::deserialize(body);
             if (resp) {
                 const uint64_t self = steam_id_.load();
@@ -1717,35 +1683,15 @@ void CMClient::route_inbound_(EMsg emsg,
                                 f.player_name.c_str(), f.game_played_app_id);
                         std::lock_guard<std::mutex> lk(persona_mu_);
                         self_persona_ = f;  // copy: cached for self_persona() reader
-                        // Fall through to the bridge dispatch so libsteamclient.so
-                        // mirrors self persona into its pushed.persona_name /
-                        // persona_state too. The observer differentiates self
-                        // from friend by comparing pushed().steam_id, so the
-                        // same dispatch wires both paths.
                     } else {
-                        // Cache only entries that carry an actual name —
-                        // CMsgClientPersonaState can be sliced by
-                        // EClientPersonaStateFlag and arrive with just the
-                        // state, game, or avatar alone. Don't overwrite a
-                        // previously-cached name with an empty string.
                         std::lock_guard<std::mutex> lk(friend_personas_mu_);
                         auto& slot = friend_personas_[f.friendid];
                         slot.sid = f.friendid;
                         if (!f.player_name.empty()) slot.player_name = f.player_name;
                         slot.persona_state      = f.persona_state;
                         slot.game_played_app_id = f.game_played_app_id;
-                        // Avatar hash arrives only when EClientPersonaStateFlag_Avatar
-                        // is set on the request flags; an empty bytes vec means
-                        // "this push didn't carry one" — preserve the previously-
-                        // cached hash so a stats-only push doesn't wipe the
-                        // avatar.
                         if (!f.avatar_hash.empty()) slot.avatar_hash = f.avatar_hash;
                     }
-                    // Reactive bridge dispatch — libsteamclient.so registers
-                    // an observer that mirrors this update into its pushed_
-                    // state + emits PersonaStateChange_t with zero Kotlin
-                    // round-trip. Observer fires AFTER the cache update so a
-                    // re-entrant friend_personas() read sees consistent data.
                     {
                         WnCmPersonaEvent ev{};
                         ev.sid              = f.friendid;
@@ -1756,8 +1702,6 @@ void CMClient::route_inbound_(EMsg emsg,
                         ev.avatar_hash      = f.avatar_hash.empty()
                                                 ? nullptr : f.avatar_hash.data();
                         ev.avatar_hash_len  = f.avatar_hash.size();
-                        // Build pointer-pair array for the RP map. Stack-
-                        // allocated; lives for the observer call duration.
                         std::vector<WnCmRichPresenceKV> kv;
                         kv.reserve(f.rich_presence.size());
                         for (const auto& [k, v] : f.rich_presence) {
@@ -1789,9 +1733,6 @@ void CMClient::route_inbound_(EMsg emsg,
                     std::lock_guard<std::mutex> lk(license_mu_);
                     license_list_ = msg->licenses;
                 }
-                // Build the bridge-shaped POD array for the observer.
-                // Field-for-field projection; observer reads each entry's
-                // package_id + owner_id for family-share resolution.
                 bridge_entries.reserve(msg->licenses.size());
                 for (const auto& lic : msg->licenses) {
                     bridge_entries.push_back({
@@ -1813,9 +1754,6 @@ void CMClient::route_inbound_(EMsg emsg,
                             "for this session)");
                 }
             }
-            // Reactive bridge dispatch — fires after cache + library
-            // ingest so re-entrant readers see consistent state. No-op
-            // when no observer is registered.
             wn_cm_bridge_dispatch_license_list(
                 bridge_entries.empty() ? nullptr : bridge_entries.data(),
                 bridge_entries.size());
@@ -1842,10 +1780,6 @@ void CMClient::route_inbound_(EMsg emsg,
         }
 
         case EMsg::ClientFriendsList: {
-            // Server-pushed at logon (full snapshot, bincremental=false)
-            // and on every relationship change (bincremental=true) — we
-            // merge incrementals into the cached map. Powers
-            // ISteamFriends queries via WnLibSteamClient.setFriendsList.
             auto msg = pb::CMsgClientFriendsList::deserialize(body);
             std::vector<uint64_t> mutual_sids;
             if (msg) {
@@ -1854,18 +1788,12 @@ void CMClient::route_inbound_(EMsg emsg,
                 size_t mutual = 0;
                 for (const auto& e : msg->friends) {
                     if (e.efriendrelationship == 0) {
-                        // None = removed; drop the entry.
                         friends_.erase(e.ulfriendid);
                     } else {
                         friends_[e.ulfriendid] = e.efriendrelationship;
                     }
                     if (e.efriendrelationship == 3) ++mutual;
                 }
-                // Collect ALL current mutual friends for the observer —
-                // matches the WnLibSteamClient.setFriendsList contract
-                // of full-set replacement on each push. Incremental
-                // pushes still produce a complete current snapshot here
-                // because we merged into friends_ first.
                 mutual_sids.reserve(friends_.size());
                 for (const auto& [sid, rel] : friends_) {
                     if (rel == 3) mutual_sids.push_back(sid);
@@ -1878,11 +1806,6 @@ void CMClient::route_inbound_(EMsg emsg,
                 WN_LOGE("CMsgClientFriendsList parse failed (%zu bytes)",
                         body.size());
             }
-            // Reactive bridge dispatch — libsteamclient.so observer mirrors
-            // into pushed.friends. Friends mutex already released above; the
-            // pointer-into-vector lives for this scope only, observer must
-            // copy if it retains (the registered handler does — std::vector
-            // assignment into pushed.friends).
             wn_cm_bridge_dispatch_friends_list(
                 mutual_sids.empty() ? nullptr : mutual_sids.data(),
                 mutual_sids.size());
@@ -1893,15 +1816,6 @@ void CMClient::route_inbound_(EMsg emsg,
         }
 
         case EMsg::ClientAccountInfo: {
-            // CMsgClientAccountInfo fields we surface:
-            //   field 1  persona_name             (string)
-            //   field 2  ip_country               (string, ISO 3166-1)
-            //   field 15 two_factor_state         (varint enum; 0 = none)
-            //   field 17 is_phone_verified        (varint bool)
-            //   field 19 is_phone_identifying     (varint bool)
-            //   field 20 is_phone_need_verification (varint bool)
-            // Other fields (count_authed_computers, locked, tutorial …)
-            // are skipped.
             WnCmAccountInfo info{};
             std::string persona_name;
             std::string ip_country;
@@ -1975,9 +1889,6 @@ void CMClient::route_inbound_(EMsg emsg,
             break;
         }
         case EMsg::ClientEmailAddrInfo: {
-            // Email-address info is a separate message; we don't track
-            // email status today. Forward to the upstream observer for
-            // visibility (and future wires).
             WN_LOGI("ClientEmailAddrInfo (%u bytes) — forwarded, not parsed",
                     static_cast<unsigned>(body.size()));
             ClientMessageCallback cb;
@@ -2001,20 +1912,6 @@ void CMClient::set_state_locked_(ClientState s) {
     StateCallback cb;
     { std::lock_guard<std::mutex> lk(cb_mu_); cb = on_state_; }
     safe_invoke(cb, s);
-    // Reactive bridge — libsteamclient.so observes this directly without
-    // a Kotlin poll hop. Map ClientState → bool logged_on:
-    //   Disconnected / Connecting / Connected = not logged on
-    //   LoggedOn                                = logged on
-    //
-    // CRITICAL: only dispatch when the LoggedOn-vs-not edge actually
-    // CHANGES. Without this guard, a normal CM cycle
-    //   Disconnected → Connecting → Connected → LoggedOn
-    // dispatches three (logon_state=false) events before the final
-    // (true) — undoing the warm "logged_on=true" that seedFromPref
-    // Manager set from cached credentials on cold-start. The Compose
-    // UI gates Sign-In affordance on this flag, so the user perceives
-    // "still asking me to sign in" while a perfectly valid reconnect
-    // is in flight.
     bool was_logged_on = (prev == ClientState::LoggedOn);
     bool is_logged_on  = (s    == ClientState::LoggedOn);
     if (was_logged_on != is_logged_on) {
@@ -2118,12 +2015,6 @@ void CMClient::library_populate_step_() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ISteamMatchmaking lobby browser (Phase A) — single-shot CMsgClient
-// MMSGetLobbyList → ClientMMSGetLobbyListResponse (EMsgs 6607/6608).
-// Mirror of get_user_stats — same JobManager-tracked envelope-and-send
-// pattern, same synthetic-failure handling on timeout / disconnect.
-// ---------------------------------------------------------------------------
 void CMClient::lobby_get_list(
         uint32_t app_id,
         std::vector<pb::CMsgClientMMSGetLobbyListFilter> filters,
@@ -2207,12 +2098,6 @@ void CMClient::lobby_send_chat(uint32_t app_id, uint64_t lobby_sid,
     }
 }
 
-// ---------------------------------------------------------------------------
-// InviteToLobby — CMsgClientMMSInviteToLobby (6621). Fire-and-forget.
-// Steam routes the invite to the target user's online client (overlay
-// notification + Friends-list popup) or queues it as a Friends chat
-// message if they're offline.
-// ---------------------------------------------------------------------------
 void CMClient::lobby_invite_user(uint32_t app_id, uint64_t lobby_sid,
                                   uint64_t invitee_sid) {
     if (state_.load() != ClientState::LoggedOn) {
@@ -2232,9 +2117,6 @@ void CMClient::lobby_invite_user(uint32_t app_id, uint64_t lobby_sid,
     }
 }
 
-// ---------------------------------------------------------------------------
-// CreateLobby — CMsgClientMMSCreateLobby (6601) → response 6602
-// ---------------------------------------------------------------------------
 void CMClient::lobby_create(uint32_t app_id, int32_t lobby_type,
                             int32_t max_members, LobbyCreateCallback cb,
                             std::chrono::seconds timeout) {
@@ -2283,9 +2165,6 @@ void CMClient::lobby_create(uint32_t app_id, int32_t lobby_type,
     }
 }
 
-// ---------------------------------------------------------------------------
-// JoinLobby — CMsgClientMMSJoinLobby (6603) → response 6604
-// ---------------------------------------------------------------------------
 void CMClient::lobby_join(uint32_t app_id, uint64_t lobby_sid,
                           LobbyJoinCallback cb,
                           std::chrono::seconds timeout) {
@@ -2337,13 +2216,6 @@ void CMClient::lobby_join(uint32_t app_id, uint64_t lobby_sid,
     }
 }
 
-// ---------------------------------------------------------------------------
-// LeaveLobby — CMsgClientMMSLeaveLobby (6605), fire-and-forget.
-// Steam sends 6606 LeaveLobbyResponse but the SDK contract doesn't gate
-// any callback on it — the game has already moved on by the time the
-// ack arrives. We send through `send_proto_message` which doesn't track
-// the response.
-// ---------------------------------------------------------------------------
 void CMClient::lobby_leave(uint32_t app_id, uint64_t lobby_sid) {
     if (state_.load() != ClientState::LoggedOn) {
         WN_LOGI("lobby_leave: not logged on, dropping");
@@ -2361,13 +2233,6 @@ void CMClient::lobby_leave(uint32_t app_id, uint64_t lobby_sid) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SetLobbyData — CMsgClientMMSSetLobbyData (6609) → response 6610.
-// Same recipe as lobby_create / lobby_join. Steam also fires a 6612
-// LobbyData push to every member after a successful SetLobbyData; the
-// existing LobbyData observer arm handles that — no extra wiring
-// needed here.
-// ---------------------------------------------------------------------------
 void CMClient::lobby_set_data(uint32_t app_id, uint64_t lobby_sid,
                               uint64_t steam_id_member,
                               std::vector<uint8_t> metadata,
@@ -2427,12 +2292,6 @@ void CMClient::lobby_set_data(uint32_t app_id, uint64_t lobby_sid,
     }
 }
 
-// ---------------------------------------------------------------------------
-// SetLobbyOwner — CMsgClientMMSSetLobbyOwner (6615) → response 6616.
-// Host-only operation. On success Steam pushes a 6612 LobbyData with the
-// updated owner_sid; the existing LobbyData observer mirrors that back
-// into pushed().active_lobbies so GetLobbyOwner re-reads cleanly.
-// ---------------------------------------------------------------------------
 void CMClient::lobby_set_owner(uint32_t app_id, uint64_t lobby_sid,
                                 uint64_t new_owner_sid,
                                 LobbySetOwnerCallback cb,

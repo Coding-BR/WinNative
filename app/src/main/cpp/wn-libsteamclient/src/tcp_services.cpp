@@ -34,10 +34,6 @@ std::once_flag g_start_once;
 std::atomic<int> g_accepted_count{0};
 std::atomic<bool> g_any_bound{false};
 
-// Parse "host:port" (e.g. "127.0.0.1:57343"). On parse failure returns
-// fallback_port bound to 127.0.0.1. Host is ignored — the listener
-// always binds 127.0.0.1 since this is a local-only IPC surface (the
-// game's lsteamclient.dll connects from inside the same Android proc).
 int parse_port(const char* env_value, int fallback_port) {
     if (!env_value || !*env_value) return fallback_port;
     const char* colon = std::strchr(env_value, ':');
@@ -52,7 +48,6 @@ int parse_port(const char* env_value, int fallback_port) {
     return static_cast<int>(p);
 }
 
-// Bind + listen on 127.0.0.1:port. Returns the listening fd or -1.
 int bind_listener(int port, const char* svc_name) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -82,10 +77,6 @@ int bind_listener(int port, const char* svc_name) {
     return fd;
 }
 
-// Format up to `n` bytes from `buf` as space-separated hex, truncating
-// to `max_bytes_in_log` to keep logcat lines bounded. The Steamworks
-// IPC framing uses small headers + variable bodies, so 96 bytes is
-// enough to see header + magic + the start of any payload.
 std::string hex_dump(const uint8_t* buf, size_t n, size_t max_bytes_in_log = 96) {
     size_t shown = std::min(n, max_bytes_in_log);
     std::string out;
@@ -104,9 +95,6 @@ std::string hex_dump(const uint8_t* buf, size_t n, size_t max_bytes_in_log = 96)
     return out;
 }
 
-// Read exactly `n` bytes (handling short reads + EINTR). Returns
-// false on EOF before completion or on socket error; true if `out`
-// is now filled with `n` bytes.
 bool read_exact(int fd, uint8_t* out, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -119,21 +107,7 @@ bool read_exact(int fd, uint8_t* out, size_t n) {
     return true;
 }
 
-// Per-connection handler. Stage 1: keep the connection alive, attempt
-// to read length-prefixed frames (uint32 LE length, then `length`
-// payload bytes) and log each frame's hex dump. Falls back to raw
-// chunk-mode logging when the first 4 bytes don't look like a sane
-// length (probably ASCII probe traffic from `adb shell nc` test
-// harnesses). Either mode keeps reading until the peer closes.
-//
-// The actual Steam binary IPC frame format starts with a 4-byte
-// length in little-endian. We don't yet RESPOND to any frame —
-// stage 2 will layer that on top once we have real traffic captures
-// to design the response paths against.
 void handle_connection(int conn_fd, const char* svc_name) {
-    // First peek the first 4 bytes — if they decode as a plausible
-    // length (1..256K), assume length-prefixed mode. Otherwise treat
-    // the stream as opaque raw bytes (chunk dump).
     uint8_t header[4];
     if (!read_exact(conn_fd, header, sizeof(header))) {
         WN_LOGI("tcp_services[%s]: conn fd=%d closed before any header",
@@ -149,9 +123,6 @@ void handle_connection(int conn_fd, const char* svc_name) {
     const bool framed = (first_len > 0 && first_len <= 256 * 1024);
 
     if (!framed) {
-        // Raw-stream mode: log the 4 we read, then keep reading 256-byte
-        // chunks until peer closes. Useful for `nc` probes and any
-        // unrecognized non-framed protocol.
         WN_LOGI("tcp_services[%s]: conn fd=%d raw-stream (first 4B=%s)",
                 svc_name, conn_fd, hex_dump(header, sizeof(header)).c_str());
         uint8_t chunk[256];
@@ -171,7 +142,6 @@ void handle_connection(int conn_fd, const char* svc_name) {
         return;
     }
 
-    // Framed mode: first 4B was a length; loop reading <length><body>.
     WN_LOGI("tcp_services[%s]: conn fd=%d framed-mode entry, first body=%u B",
             svc_name, conn_fd, first_len);
     int frame_idx = 0;
@@ -187,7 +157,6 @@ void handle_connection(int conn_fd, const char* svc_name) {
                 svc_name, conn_fd, frame_idx, length,
                 hex_dump(body.data(), body.size()).c_str());
         ++frame_idx;
-        // Next frame: read its 4-byte length header.
         if (!read_exact(conn_fd, header, sizeof(header))) {
             WN_LOGI("tcp_services[%s]: conn fd=%d closed cleanly after %d frame(s)",
                     svc_name, conn_fd, frame_idx);
@@ -208,9 +177,6 @@ void handle_connection(int conn_fd, const char* svc_name) {
     ::close(conn_fd);
 }
 
-// Listener thread body. Loops accept() until the fd is closed (or
-// process exits). Detached. Emits IPCFailure_t on unrecoverable
-// accept() failure so games gating on IPC health see the signal.
 void listener_loop(int listen_fd, std::string svc_name) {
     for (;;) {
         sockaddr_in peer{};
@@ -235,14 +201,11 @@ void listener_loop(int listen_fd, std::string svc_name) {
         WN_LOGI("tcp_services[%s]: accepted from %s:%u (conn fd=%d, total=%d)",
                 svc_name.c_str(), peer_ip, ntohs(peer.sin_port),
                 conn, g_accepted_count.load(std::memory_order_relaxed));
-        // Hand off the connection to a detached worker. Stage 0:
-        // log + close. Stage 1+: parse Steam IPC frames.
         std::thread(handle_connection, conn, svc_name.c_str()).detach();
     }
     ::close(listen_fd);
 }
 
-// Bind one service. Returns true if it bound + spun up the listener thread.
 bool spawn_service(const char* env_key, int fallback_port, const char* svc_name) {
     int port = parse_port(::getenv(env_key), fallback_port);
     int fd = bind_listener(port, svc_name);

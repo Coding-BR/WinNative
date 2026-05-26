@@ -13,8 +13,6 @@ std::vector<uint8_t> CCloud_GetAppFileChangelist_Request::serialize() const {
 }
 
 std::vector<uint8_t> CCloud_GetUserQuota_Request::serialize() const {
-    // Empty body — the Cloud service derives the user from the
-    // authenticated CM session.
     return {};
 }
 

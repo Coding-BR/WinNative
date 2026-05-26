@@ -142,13 +142,6 @@ class DebugFragment : Fragment() {
                         onWnHybridModeChanged = { checked ->
                             com.winlator.cmod.feature.stores.steam.utils.PrefManager
                                 .wnHybridMode = checked
-                            // Live-toggle: when the user is already signed in,
-                            // immediately swap the active Steam session
-                            // between wn-session and the bootstrap. No
-                            // re-sign-in required — much more discoverable +
-                            // verifiable on device. No-op when the user isn't
-                            // signed in (the takeover then runs from
-                            // onWnLoggedOn on next sign-in).
                             com.winlator.cmod.feature.stores.steam.service
                                 .SteamService.setHybridModeRuntime(checked)
                             WinToast.show(

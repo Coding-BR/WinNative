@@ -207,12 +207,6 @@ class SteamService : Service() {
     // healthy — resetting immediately let a flapping connection reconnect
     // without bound (the cause of the backgrounded-app battery drain).
     @Volatile private var stableConnectionJob: Job? = null
-    // Watchdog that proactively rotates the refresh token when within
-    // [REFRESH_TOKEN_ROTATION_THRESHOLD_DAYS] of JWT expiry. Without
-    // this, a long-running session can land on an expired token at
-    // the next CM reconnect (or Real-Steam launch), forcing the user
-    // to re-sign-in. Fires on every successful logon + every
-    // [REFRESH_TOKEN_ROTATION_CHECK_INTERVAL_MS] thereafter.
     @Volatile private var refreshTokenWatchdogJob: Job? = null
 
     // App-lifecycle gating for the Steam session. While the app is
@@ -223,13 +217,6 @@ class SteamService : Service() {
     @Volatile private var appInForeground = true
     @Volatile private var suspendedForBackground = false
 
-    /**
-     * Diagnostic-only read of the session-suspension reason set. Used by
-     * the HybridMode state-dump to surface why the long-lived wn-session
-     * is null when it shouldn't be (background idle suspend / Bionic
-     * hand-off / not-yet-brought-up). Format: a comma-separated string of
-     * the currently-active reasons, or empty when nothing's suspending.
-     */
     private fun suspensionReasonForDiag(): String {
         val reasons = mutableListOf<String>()
         if (suspendedForBackground) reasons += "background-idle"
@@ -240,12 +227,6 @@ class SteamService : Service() {
         return reasons.joinToString(",")
     }
 
-    // Suspended because a Bionic Steam game session owns the account's
-    // single Steam logon (the bootstrap's libsteamclient.so). The
-    // wn-steam-client CM session must stay down while this is set — two
-    // concurrent LogonWithRefreshToken with one shared refresh token is
-    // rejected by Steam (AccessDenied / rate-limit). Toggled by the
-    // bionicHandoffAcquire/Release companion methods.
     @Volatile private var suspendedForBionic = false
 
     // Cancellable timer that defers the background suspend decision by
@@ -325,18 +306,7 @@ class SteamService : Service() {
         // than retrying a doomed logon forever.
         private const val CONNECT_LOGON_MAX_ATTEMPTS = 8
 
-        // Refresh-token rotation: when the JWT's exp is within this
-        // many days, the watchdog calls Authentication.GenerateAccess
-        // TokenForApp#1 to mint a fresh token. 7d gives a comfortable
-        // buffer for users who only open the app weekly; tighter
-        // values would rotate too often and tax the renewal endpoint,
-        // while looser ones can fall off the cliff if the user goes
-        // offline for a few days.
         private const val REFRESH_TOKEN_ROTATION_THRESHOLD_DAYS = 7
-        // The watchdog re-checks at this cadence while logged-on. 6h
-        // means a user keeping the app open for many days never lets
-        // the token drift more than 6h past the threshold before
-        // rotation fires.
         private const val REFRESH_TOKEN_ROTATION_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000L
 
         // Grace period after the app is backgrounded before the Steam session
@@ -410,15 +380,6 @@ class SteamService : Service() {
             DownloadCoordinator.runOnScope { DownloadCoordinator.resumeAll() }
         }
 
-        /**
-         * Bionic Steam hand-off. The bootstrap (libsteamclient.so) and the
-         * wn-steam-client CM client cannot both hold a Steam logon with one
-         * shared refresh token. Call [bionicHandoffAcquire] before the
-         * bootstrap logs on (it drops wn-steam-client's session), and
-         * [bionicHandoffRelease] when the game session ends (it logs the
-         * bootstrap off and brings wn-steam-client back). No-ops when the
-         * service isn't running.
-         */
         fun bionicHandoffAcquire() {
             instance?.bionicHandoffAcquireImpl()
         }
@@ -427,35 +388,7 @@ class SteamService : Service() {
             instance?.bionicHandoffReleaseImpl()
         }
 
-        /* Steam Launcher note (2026-05-21): an earlier `planWHandoffAcquire`
-         * (renew token + log off wn-steam-client before the launcher
-         * logs on) was removed. Reverse-engineering of GameHub showed
-         * its model is TWO PARALLEL Steam sessions — the app's client
-         * and the in-Wine SteamAgent both stay logged on at once,
-         * distinguished only by distinct `login_id` (obfuscated_private_ip)
-         * + `client_instance_id`. No logoff, no pre-launch renewal.
-         * wn-steam-client already mints a unique random login_id per
-         * session (cm_client.cpp), so the Steam Launcher coexists with
-         * it the same way. See [[project_hybrid_steam_client]]. */
 
-        /**
-         * Live-toggle wn_hybrid_mode while the user is already signed in.
-         * Without this, flipping PrefManager.wnHybridMode only takes effect
-         * on next sign-in — Settings > Debug calls this so the change is
-         * immediate + verifiable on-device.
-         *
-         * When [enabled] flips ON and the user is currently logged on, run
-         * the same takeover the onWnLoggedOn path runs: wait for any
-         * in-flight session activity to settle, suspend wn-session via the
-         * hand-off, and prewarm the bootstrap. When flipping OFF and the
-         * bootstrap currently owns the session, log it off and bring
-         * wn-session back. Both branches are no-ops if state already
-         * matches the requested mode (idempotent).
-         *
-         * Safe to call from any thread — the heavy work runs on the
-         * SteamService scope so the caller (a UI toggle handler) returns
-         * immediately.
-         */
         fun setHybridModeRuntime(enabled: Boolean) {
             val svc = instance ?: return
             if (enabled) {
@@ -463,22 +396,10 @@ class SteamService : Service() {
                 if (svc.suspendedForBionic) return           // bootstrap already owns the session
                 svc.scope.launch {
                     Timber.i("Hybrid mode live-toggle ON — bootstrap takeover")
-                    // STEP 1: mint a fresh refresh token via
-                    // Authentication.GenerateAccessTokenForApp so the
-                    // bootstrap can log on with a token Steam hasn't
-                    // seen yet (bypasses the concurrent-login anti-abuse
-                    // — commits 90361f6 / af76660 documented the EResult=15
-                    // wall). The renewal is best-effort: on failure we
-                    // fall back to the existing refresh token, which
-                    // may still trip Steam's guard but is no worse
-                    // than the pre-renewal state.
                     val renewed = svc.renewRefreshTokenForHandoff()
                     Timber.i("Hybrid mode live-toggle: token renewal " +
                         if (renewed) "OK (fresh token saved)"
                         else "skipped/failed — using existing token")
-                    // STEP 2: clean LogOff + disconnect of wn-session
-                    // (commit af76660 — sends CMsgClientLogOff so Steam
-                    // clears the session immediately).
                     svc.bionicHandoffAcquireImpl()
                     delay(1800)
                     try {
@@ -899,20 +820,9 @@ class SteamService : Service() {
         // flow writes from Dispatchers.IO.
         @Volatile private var wnSession: WnSteamSession? = null
 
-        /**
-         * Diagnostic-only read of the active wn-session's native CMClient
-         * state (0=Disconnected, 1=Connecting, 2=Connected, 3=LoggedOn).
-         * Returns -1 if there is no active session at all. Lets the
-         * HybridModeReceiver state-dump expose the C++ state of truth
-         * alongside the libsteamclient.so pushed_state mirror — when
-         * the two disagree (state==2 but pushed.logged_on==true) we
-         * know the warm-claim drifted from reality and any cloud /
-         * ticket call that requires state==3 will fail.
-         */
         @JvmStatic
         fun wnSessionStateForDiag(): Int = wnSession?.state() ?: -1
 
-        /** Diagnostic-only read of why the session is suspended (if at all). */
         @JvmStatic
         fun wnSessionSuspensionReasonForDiag(): String =
             instance?.suspensionReasonForDiag() ?: "no-service"
@@ -931,11 +841,6 @@ class SteamService : Service() {
         // reuse of an already-logged-on session stays lock-free.
         private val wnSessionBringUpMutex = kotlinx.coroutines.sync.Mutex()
 
-        // Back-off gate for LogonWithRefreshToken attempts. Steam responds
-        // to bursts with EResult=84 and accumulating attempts soft-locks
-        // the account. Background helpers consult logonGateUntilMs before
-        // firing a new logon; the gate clears on a successful LoggedOn
-        // transition. Manual sign-in flows are exempt.
         @Volatile internal var logonGateUntilMs: Long = 0L
             private set
         @Volatile internal var lastLogonFailureEresult: Int = 0
@@ -943,7 +848,6 @@ class SteamService : Service() {
         @Volatile internal var consecutiveLogonFailures: Int = 0
             private set
 
-        /** Reset the gate on a successful LoggedOn transition. */
         internal fun recordLogonSuccess() {
             if (logonGateUntilMs != 0L || consecutiveLogonFailures != 0) {
                 Timber.i("logon gate cleared (was open until ${logonGateUntilMs}, " +
@@ -954,13 +858,6 @@ class SteamService : Service() {
             consecutiveLogonFailures = 0
         }
 
-        /**
-         * Engage the gate after a non-OK EResult. EResult 67 (2FA required)
-         * and 88 (email-code required) are skipped — those wait on user
-         * input, not on a back-off.
-         *
-         * Backoff schedule: 30s, 2min, 5min, 15min, 30min, 60min cap.
-         */
         internal fun recordLogonFailure(eresult: Int) {
             if (eresult == 1) return
             if (eresult == 67 || eresult == 88) return
@@ -1170,30 +1067,12 @@ class SteamService : Service() {
         suspend fun setPersonaState(state: EPersonaState) =
             withContext(Dispatchers.IO) {
                 PrefManager.personaState = state.code()
-                // HYBRID STAGE-2 — in hybrid mode the wn-session is
-                // permanently suspended so its CMsgClientChangeStatus path
-                // is a guaranteed no-op (withWnSession would return null
-                // and silently drop). Public ISteamFriends has no
-                // SetPersonaState (it's IClientFriends, internal and
-                // un-RE'd); for now we accept that hybrid mode doesn't
-                // broadcast the new state to Steam friends and just keep
-                // the LOCAL UI in sync (status drawer reflects the user's
-                // pick). Future: either RE IClientFriends SetPersonaState
-                // slot OR send CMsgClientChangeStatus from steam_bootstrap
-                // through libsteamclient.so's open CM channel.
                 if (!PrefManager.wnHybridMode) {
                     withWnSession { session -> session.setPersonaState(state.code()) }
                 } else {
                     Timber.d("Hybrid: setPersonaState($state) local-only; " +
                         "Steam-side broadcast deferred until IClientFriends RE")
                 }
-                // Sync our open-source libsteamclient.so's pushed state +
-                // emit PersonaStateChange_t for any in-process game that
-                // observes ISteamFriends.GetPersonaState. Routes through
-                // the same JNI setter the seedFromPrefManager path uses,
-                // so the receiver state row's pstate cell flips with
-                // every change — independent of the wn-session CM
-                // round-trip (which is suspended in hybrid mode).
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setPersonaState(state.code())
                 // Reflect the change locally — Steam does not echo our own
@@ -1209,15 +1088,6 @@ class SteamService : Service() {
             withContext(Dispatchers.IO) {
                 val svc = instance ?: return@withContext
 
-                // libsteamclient.so is now the SINGLE Steam session (the
-                // "hybrid mode" toggle is retired). Read persona through
-                // its ISteamFriends vtable (slots 0 + 2) — two sync calls
-                // vs the wn-session CMsgClientRequestFriendData →
-                // CMsgClientPersonaState round-trip. Fall through to
-                // wn-session only when the .so isn't populated yet (cold
-                // boot before the hand-off has fired — withWnSession's
-                // suspendedForBionic guard makes the fall-through a no-op
-                // post-hand-off).
                 run {
                     val bs = com.winlator.cmod.feature.stores.steam.wnsteam
                         .WnSteamBootstrap
@@ -1237,7 +1107,6 @@ class SteamService : Service() {
                         Timber.i("user persona via libsteamclient.so: name='$playerName' state=$stateCode")
                         return@withContext
                     }
-                    // .so not populated yet — try wn-session as fallback.
                     Timber.d("libsteamclient.so persona empty; falling through to wn-session")
                 }
 
@@ -1276,9 +1145,6 @@ class SteamService : Service() {
                     PluviaApp.events.emit(SteamEvent.PersonaStateReceived(svc.localPersona.value))
                     Timber.i("user persona via wn-steam-client: name='$playerName'")
 
-                    // Push into our open-source libsteamclient.so so
-                    // ISteamFriends.GetPersonaName / GetPersonaState
-                    // return the real values to game-side callers.
                     if (playerName.isNotEmpty()) {
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                             .setPersonaName(playerName)
@@ -1286,11 +1152,6 @@ class SteamService : Service() {
                     com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                         .setPersonaState(obj.optInt("personaState"))
 
-                    // Self-avatar push. ISteamFriends.GetSmallFriendAvatar
-                    // works uniformly for self vs friends (game passes
-                    // its own SteamID), so we just feed the same
-                    // friend_avatar_hashes map keyed by the self sid
-                    // and let AvatarFetcher do the CDN round-trip.
                     if (avatarHash.isNotEmpty() && avatarHash.length % 2 == 0) {
                         val selfSid = withWnSession { it.steamId() } ?: 0L
                         if (selfSid != 0L) {
@@ -1305,9 +1166,6 @@ class SteamService : Service() {
                             if (ok) {
                                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                                     .setFriendAvatarHash(selfSid, bytes)
-                                // Prefetch all three tiers so the
-                                // game's GetSmall/Medium/LargeFriendAvatar
-                                // for self all resolve.
                                 com.winlator.cmod.feature.stores.steam.wnsteam.AvatarFetcher
                                     .enqueueAllTiers(selfSid, avatarHash)
                             }
@@ -4287,7 +4145,6 @@ class SteamService : Service() {
 
                                 di.updateStatus(DownloadPhase.FAILED, errorMsg)
                                 di.setActive(false)
-                                // Clean up markers and DB state
                                 MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
                                 if (downloadTaskType == DownloadRecord.TASK_UPDATE) {
                                     MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_COMPLETE_MARKER)
@@ -4920,13 +4777,6 @@ class SteamService : Service() {
                 // Cloud.GetAppFileChangelist via the C++ WN-Steam-Client — the full
                 // remote file list. The parser scales the proto unix-second timestamps
                 // to the millis the rest of the code expects.
-                //
-                // Wait up to 5s for wn-session to come up logged on before
-                // declaring "cloud unreachable". The conflict-probe fires
-                // from the launcher Play-button path which can land milli-
-                // seconds after process start — without this loop, a cold
-                // open returns null and the dialog (historically) lied
-                // about a conflict with "Unknown" on the cloud side.
                 val deadlineMs = System.currentTimeMillis() + 5_000L
                 while (System.currentTimeMillis() < deadlineMs) {
                     val s = withWnSession { it }
@@ -5044,16 +4894,6 @@ class SteamService : Service() {
             appId: Int,
             configDirectory: String,
         ) = runCatching {
-            // libsteamclient.so primary path: source the achievement schema
-            // directly from its ISteamUserStats via
-            // WnSteamBootstrap.listAchievementsFull(). Goldberg's
-            // achievement_name_to_block.json + binary VDF aren't produced
-            // here — cold-client-only artifacts that Bionic games don't
-            // consume — but the launcher's in-app achievement display
-            // (cachedAchievements) still wants the list, so we populate
-            // that. Falls through to wn-session if the .so isn't bound
-            // to this appId yet (prewarm uses appId=0 so library/sign-in
-            // time can't drive this).
             run {
                 val bs = com.winlator.cmod.feature.stores.steam.wnsteam
                     .WnSteamBootstrap
@@ -5078,25 +4918,8 @@ class SteamService : Service() {
                 Timber.d("libsteamclient.so achievements not ready for app $appId — falling through to wn-session CM fetch")
             }
 
-            // Cold-warm libsteamclient.so from the per-app schema cache
-            // BEFORE the CM fetch. Game-side achievement HUDs gating on
-            // ISteamUserStats.RequestCurrentStats → UserStatsReceived_t
-            // light up immediately. The fresh CM push that lands later
-            // overwrites with current data; the setter-level dedup
-            // avoids redundant callbacks when nothing changed.
-            //
-            // No-op when no cache exists (first launch of this app, or
-            // cache was deleted). When wn-session is rate-limited /
-            // signed-out, this is the ONLY data the game sees until
-            // logon recovers — strict improvement over the prior
-            // empty-schema state.
-            @Suppress("UNUSED_VARIABLE")
-            val warmedFromCache = warmAchievementSchemaFromCache(appId)
+            warmAchievementSchemaFromCache(appId)
 
-            // Primary path: the C++ WN-Steam-Client (Phase 9 — JavaSteam is
-            // being dropped). CMsgClientGetUserStats returns the binary-VDF
-            // UserGameStatsSchema — exactly what StatsAchievementsGenerator
-            // consumes to emit Goldberg's achievements.json + stats.json.
             val schemaArray: ByteArray = run {
                 val wn = withWnSession { session ->
                     withContext(Dispatchers.IO) { session.getUserStatsSchema(appId) }
@@ -5123,56 +4946,12 @@ class SteamService : Service() {
                 File(configDirectory, "achievement_name_to_block.json").writeText(mappingJson.toString(), Charsets.UTF_8)
             }
 
-            // Push the parsed schema (and any unlocks pulled from
-            // CMsgClientGetUserStats.achievement_blocks via
-            // StatsAchievementsGenerator) into libsteamclient.so so its
-            // ISteamUserStats vtable returns real data when anything
-            // queries through the .so (the bootstrap's diagnostic path
-            // OR a game's lsteamclient.dll bridged through our TCP
-            // services down the line). Best-effort — no-op when the
-            // .so isn't loaded.
             pushAchievementSchemaToLibSteamClient(appId, result.achievements, result.stats,
                                                    result.nameToBlockBit)
         }.onFailure { e ->
             Timber.w(e, "Failed to generate achievements for appId=$appId")
         }
 
-        /**
-         * Forward a parsed achievement schema + per-stat defaults into
-         * `libsteamclient.so` via [WnLibSteamClient]. Picks a single
-         * locale for display name / description (per-locale string maps
-         * are flattened to one English entry, falling back to the user's
-         * configured container language and finally any available locale).
-         * Also pushes the per-achievement unlock state so
-         * `ISteamUserStats.GetAchievementAndUnlockTime` returns truth at
-         * call time. Best-effort; missing locales / fields are tolerated.
-         */
-        /**
-         * Fetch [appId]'s cloud file list via wn-session and forward it
-         * into `libsteamclient.so` so a bound game's
-         * `ISteamRemoteStorage.GetFileCount` / `GetFileNameAndSize` /
-         * `FileExists` / `GetFileSize` / `GetFileTimestamp` answer from
-         * real data instead of stub zeros. Also flips
-         * `setCloudEnabledForApp(true)` once a successful listing has
-         * arrived. No-op when not logged on (the fetch returns null);
-         * call off the main thread (CM round-trip).
-         */
-        /**
-         * Push the per-app DLC list into libsteamclient.so so the
-         * bound game's ISteamApps.GetDLCCount / BGetDLCDataByIndex
-         * answer from real data. Source: wn-session's library snapshot
-         * (PICS-cached extended.listofdlc). Best-effort — silent when
-         * wn-session isn't logged on / snapshot is empty.
-         */
-        /**
-         * Push the per-app installed-depot list into libsteamclient.so
-         * so the bound game's ISteamApps.GetInstalledDepots answers
-         * from real data (Source-engine sv_pure check, Anti-Cheat
-         * depot-list audits). Sourced from the Room-cached install
-         * registry — same data getInstalledDepotsOf returns.
-         * Best-effort; explicit empty push clears the previous game's
-         * value when the registry has nothing for [appId].
-         */
         fun pushAppInstalledDepotsToLibSteamClient(appId: Int) = runCatching {
             if (appId <= 0) return@runCatching
             val depots: IntArray = getInstalledDepotsOf(appId)
@@ -5195,12 +4974,6 @@ class SteamService : Service() {
                 JSONObject(snapshotJson).optJSONArray("owned_apps") ?: return@runCatching
             } catch (_: Exception) { return@runCatching }
 
-            // Find the parent app entry, collect DLC ids; then look
-            // each DLC up in the same owned_apps array to pull the
-            // PICS-cached name when available. Also pull the parent
-            // app's build_id (PICS depots.branches.public.buildid)
-            // and push it through so ISteamApps.GetAppBuildId returns
-            // the real value.
             val dlcIds = mutableListOf<Int>()
             val byId   = mutableMapOf<Int, String>()
             var parentBuildId = 0
@@ -5219,8 +4992,6 @@ class SteamService : Service() {
                 Timber.i("Pushed buildId=$parentBuildId to libsteamclient.so (app $appId)")
             }
             if (dlcIds.isEmpty()) {
-                // Explicit clear so a previous bound game's DLC doesn't
-                // leak into this one.
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setAppDlcs(appId, IntArray(0), emptyArray(), BooleanArray(0))
                 Timber.d("Pushed empty DLC list to libsteamclient.so (app $appId)")
@@ -5236,12 +5007,6 @@ class SteamService : Service() {
             Timber.w(e, "pushAppDlcsToLibSteamClient failed (appId=$appId)")
         }
 
-        // Push the per-app Workshop subscribed-and-installed items list
-        // into libsteamclient.so so games can enumerate installed mods
-        // through ISteamUGC slots 70-75. Source of truth is the existing
-        // WorkshopModsGenerator staging dir — anything fully downloaded
-        // there is treated as subscribed-and-installed. Replaces the
-        // pushed entry for [appId] in full; empty list clears it.
         fun pushAppWorkshopItemsToLibSteamClient(appId: Int) = runCatching {
             if (appId <= 0) return@runCatching
             val ctx = instance?.applicationContext ?: return@runCatching
@@ -5279,13 +5044,6 @@ class SteamService : Service() {
             Timber.w(e, "pushAppWorkshopItemsToLibSteamClient failed (appId=$appId)")
         }
 
-        // Push the per-app ISteamInventory item-definition catalog into
-        // libsteamclient.so. Fetches the same IGameInventory/GetItemDef
-        // Archive JSON the ColdClient pipeline uses, then flattens it
-        // into the per-def parallel-array layout the JNI setter wants.
-        // Powers ISteamInventory slots 20-22 in Bionic mode so F2P /
-        // microtransaction games (TF2, Dota 2, CS-likes, etc.) enumerate
-        // their item catalog rather than seeing an empty inventory.
         suspend fun pushInventoryItemDefsToLibSteamClient(appId: Int) = runCatching {
             if (appId <= 0) return@runCatching
             val ctx = instance?.applicationContext ?: return@runCatching
@@ -5298,7 +5056,6 @@ class SteamService : Service() {
             val arr = try {
                 org.json.JSONArray(trimmed)
             } catch (_: org.json.JSONException) {
-                // Tolerate the bracketless variant gbe_fork emits.
                 try { org.json.JSONArray("[$trimmed]") } catch (_: Exception) { return@runCatching }
             }
             val defIds = mutableListOf<Int>()
@@ -5345,12 +5102,9 @@ class SteamService : Service() {
                 Timber.d("pushCloudStateToLibSteamClient: no cloud list (app $appId, not logged on?)")
                 return@runCatching
             }
-            // Live files only — forgotten / deleted entries should not be
-            // surfaced through ISteamRemoteStorage.GetFileCount.
             val live = response.files.filter { it.isPersisted }
             val names      = Array(live.size) { i -> live[i].filename }
             val sizes      = IntArray(live.size) { i -> live[i].rawFileSize.coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
-            // SteamAutoCloud stores timestamps in ms; the .so expects unix seconds.
             val timestamps = LongArray(live.size) { i -> live[i].timestamp / 1000L }
             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                 .setCloudFiles(names, sizes, timestamps)
@@ -5359,12 +5113,6 @@ class SteamService : Service() {
             Timber.i("Pushed ${live.size} cloud file(s) to libsteamclient.so (app $appId, " +
                 "changeNumber=${response.currentChangeNumber})")
 
-            // Cloud quota is account-level, not per-app, but the natural
-            // refresh point is alongside the per-app file list (caller
-            // is already on a worker thread and authed). Push under
-            // setCloudQuota so ISteamRemoteStorage.GetQuota answers
-            // accurate numbers. The 30s native timeout caps the worst
-            // case for an unresponsive CM.
             val quota = withWnSession { s ->
                 withContext(Dispatchers.IO) { s.getCloudUserQuota() }
             }
@@ -5382,105 +5130,29 @@ class SteamService : Service() {
             Timber.w(e, "pushCloudStateToLibSteamClient failed (appId=$appId)")
         }
 
-        /**
-         * Account-level Cloud quota refresh that doesn't require a
-         * bound game. Pulls Cloud.GetUserQuota#1 and pushes the result
-         * into libsteamclient.so so the receiver state's
-         * `cloud: ... quota=used/total` row shows real numbers even in
-         * prewarm/library mode. Best-effort; silent no-op when not
-         * logged on.
-         */
-        /**
-         * Fetch a fresh Encrypted App Ticket via wn-session's
-         * CMsgClientRequestEncryptedAppTicket CM round-trip and push the
-         * resulting bytes into libsteamclient.so's per-app cache. The
-         * .so's ISteamUser.RequestEncryptedAppTicket / GetEncryptedApp
-         * Ticket slots then serve real bytes instead of the synthetic
-         * "WNETKT" placeholder.
-         *
-         * BLOCKING — call off the main thread. No-op when not logged on.
-         * Returns true if real bytes were pushed; false if we fell back
-         * to synthetic (or the call failed entirely).
-         */
-        /**
-         * Single chokepoint for prepping libsteamclient.so state ahead of a
-         * game launch — regardless of which launch path (ColdClient,
-         * Goldberg, Bionic, Runtime DRM Injection, Real Steam). Pushes the
-         * bound appId + ticket bytes so when the game queries through our
-         * `.so` it gets real data, not the synthetic "WNETKT"/"WNAT"
-         * placeholders.
-         *
-         * Previously this was scattered across enrichSteamSettings (which
-         * the Bionic Steam branch in XServerDisplayActivity skips) and
-         * WnSteamBootstrap.start. The audit (#113) identified Bionic
-         * launches were silently failing DRM checks (e.g. Monster Hunter
-         * Stories / Monster Hunter Rise) because their encrypted-app-
-         * ticket cache stayed empty — game's GetEncryptedAppTicket inside
-         * our `.so` returned synthetic 32B "WNETKT" bytes that Capcom DRM
-         * rejects.
-         *
-         * Idempotent and safe to call multiple times. BLOCKING — call off
-         * the main thread.
-         */
-        /** Java-friendly blocking wrapper. CALL OFF MAIN THREAD. */
         @JvmStatic
         fun prepareLibSteamClientForLaunchBlocking(appId: Int) {
             runBlocking { prepareLibSteamClientForLaunch(appId) }
         }
         suspend fun prepareLibSteamClientForLaunch(appId: Int) {
             if (appId <= 0) return
-            // Bind the appId first so notify_games_played fires and the
-            // ticket pushes land on the right key.
             runCatching {
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setAppId(appId)
             }
-            // Kick the overlay-request poll loop. The game's Activate
-            // GameOverlay* slots enqueue requests in pushed-state;
-            // this coroutine drains them + dispatches Intent.ACTION_
-            // VIEW. Idempotent — startOverlayPollLoop guards on the
-            // singleton job ref.
             startOverlayPollLoop()
-            // Resolve the launch-time beta branch and push it so
-            // ISteamApps.GetCurrentBetaName returns it. WinNative installs
-            // the public branch by default; future per-shortcut beta picker
-            // can route through resolveSelectedBetaName(appId).
             runCatching {
                 val branch = resolveSelectedBetaName(appId)
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setAppCurrentBeta(appId, branch)
                 Timber.i("prepareLibSteamClientForLaunch: app=$appId beta='${branch.ifEmpty { "public" }}'")
             }
-            // Wait for wn-session to be logged on before firing the
-            // ticket prefetches. Without this, a cold-start → instant-
-            // launch race returns null/false from both fetches; the
-            // game ends up with synthetic placeholder bytes that fail
-            // DRM checks. 15s is the same budget getEncryptedAppTicket
-            // uses; existing launch path already absorbs PICS/DLC
-            // multi-second waits so the user doesn't perceive the
-            // delay. If we time out, fire anyway — the fetches will
-            // return synthetic bytes that single-player titles can
-            // proceed with.
             val deadlineMs = System.currentTimeMillis() + 15_000L
             while (System.currentTimeMillis() < deadlineMs) {
                 val session = withWnSession { it }
                 if (session != null && _isLoggedInFlow.value) break
                 kotlinx.coroutines.delay(500L)
             }
-            // Run the three prefetches concurrently — they each hit a
-            // separate CM endpoint, no reason to serialize. Each is
-            // independently runCatching'd so a failure on one doesn't
-            // drop the others.
-            //
-            // The cloud-state push is the missing piece that caused
-            // ISteamRemoteStorage queries from inside the game to see
-            // an empty file list with IsCloudEnabledForApp=false: the
-            // mirror was only refreshed inside enrichSteamSettings,
-            // which the Bionic launch branch skips. Without it, in-
-            // game cloud reads / conflict-dialog probes hit a blank
-            // libsteamclient mirror and the conflict UI rendered
-            // "Unknown" for the cloud side because fetchCloudFileList
-            // also raced wn-session startup.
             kotlinx.coroutines.coroutineScope {
                 val ticketJob = async {
                     runCatching { refreshEncryptedAppTicketForLibSteamClient(appId) }
@@ -5503,11 +5175,6 @@ class SteamService : Service() {
                             false
                         }
                 }
-                // pushAppDlcsToLibSteamClient + pushAppInstalledDepotsToLibSteamClient
-                // are independently defined but had no caller — ISteamApps.BIsDlcInstalled
-                // / GetDLCCount / GetInstalledDepots therefore returned 0/false even when
-                // wn-session knew the real list. Fire them alongside the tickets so the
-                // game sees real DLC + depot answers from its first call onward.
                 val dlcJob = async {
                     runCatching { pushAppDlcsToLibSteamClient(appId); true }
                         .getOrElse { e ->
@@ -5552,17 +5219,6 @@ class SteamService : Service() {
             }
         }
 
-        /**
-         * Resolve the beta branch the game should launch on. Returns
-         * the SDK-shaped name — empty string means the public branch
-         * (matches Steamworks GetCurrentBetaName semantics).
-         *
-         * Today WinNative always installs from public; this resolver
-         * is the single hook a future per-shortcut beta picker can
-         * plumb through. Reads:
-         *   1. The Steam shortcut's `selectedBranch` extra (planned UI).
-         *   2. Falls back to "" (public).
-         */
         @JvmStatic
         fun resolveSelectedBetaName(appId: Int): String {
             if (appId <= 0) return ""
@@ -5580,14 +5236,6 @@ class SteamService : Service() {
 
         suspend fun refreshEncryptedAppTicketForLibSteamClient(appId: Int): Boolean {
             if (appId <= 0) return false
-            // Route through getEncryptedAppTicket — that path already
-            // owns the 30-minute Room cache + the wn-session fallback
-            // (including the 15s wait-for-logon retry loop). The
-            // previous direct call to s.requestEncryptedAppTicket fired
-            // a duplicate CM round-trip on every game launch even when
-            // Goldberg had ALREADY consumed the bytes off the Room
-            // cache milliseconds earlier — two trips for the same
-            // ticket, racing the rate-limiter.
             val instance = SteamService.instance ?: return false
             val bytes = runCatching { instance.getEncryptedAppTicket(appId) }
                 .getOrElse { e ->
@@ -5605,25 +5253,6 @@ class SteamService : Service() {
             return true
         }
 
-        /**
-         * Pre-fetch the per-app Steam ownership ticket (CMsgClientGetApp
-         * OwnershipTicket → CMClient::tickets() cache) so a follow-up
-         * ISteamUser.GetAuthSessionTicket from a Wine/Proton game's
-         * lsteamclient.dll returns a real Steam-signed ticket wrapped
-         * with the SteamKit2-style 24-byte header. Without this, the
-         * stub falls back to a synthetic WNAT body that real
-         * matchmaking servers reject.
-         *
-         * Calls [WnSteamSession.prepareApp] under the hood — that also
-         * triggers PICS product-info fetch + DLC ownership tickets in
-         * one batch. Best-effort: suspends until the callback fires or
-         * the wn-session timeout elapses (~30s native). No-op when not
-         * logged on or appId is invalid.
-         *
-         * The cache populated here is read by libsteamclient.so via
-         * the cm_bridge.wn_cm_get_cached_app_ownership_ticket function;
-         * see isteam_stubs.cpp ISteamUser slot 13 (GetAuthSessionTicket).
-         */
         suspend fun prefetchOwnershipTicketForLibSteamClient(appId: Int): Boolean {
             if (appId <= 0) return false
             val dlcAppIds = getInstalledDlcDepotsOf(appId).orEmpty().toIntArray()
@@ -5675,18 +5304,11 @@ class SteamService : Service() {
             fun pick(map: Map<String, String>?): String =
                 map?.get(locale) ?: map?.get("english") ?: map?.values?.firstOrNull() ?: ""
 
-            // Currently-bound appId — push only when it matches, so a
-            // launcher-time schema regen (no game active) doesn't blow
-            // away a live game's data. AppId=0 push is OK too — that's
-            // the prewarm baseline anyone querying gets.
             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                 .setAppId(appId)
 
             val n = achievements.size
             if (n == 0) {
-                // Empty schema is still a valid push — clears stale data
-                // from a previous app and marks stats_ready=true so
-                // ISteamUserStats.RequestCurrentStats returns true.
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setAchievementSchema(emptyArray(), emptyArray(), emptyArray(), emptyArray(), BooleanArray(0))
                 Timber.i("Pushed empty achievement schema to libsteamclient.so (app $appId)")
@@ -5701,11 +5323,6 @@ class SteamService : Service() {
             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                 .setAchievementSchema(apiNames, displayNames, descriptions, icons, hidden)
 
-            // Push the stat name→numeric-id map so SetStatInt/Float
-            // uploads work on the next StoreStats. Without this,
-            // dirty stats are silently dropped from the upload.
-            // Stats may not have integer ids in legacy schemas — skip
-            // entries with non-numeric ids.
             val statNames = mutableListOf<String>()
             val statIds = mutableListOf<Int>()
             for (s in stats) {
@@ -5720,11 +5337,6 @@ class SteamService : Service() {
                 Timber.i("Pushed stat name→id map for app $appId: ${statNames.size} entries")
             }
 
-            // Layer the bit-pack mapping (block_id + bit_index per
-            // achievement) so StoreStats can construct the right
-            // CMsgClientStoreUserStats2 payload server-side. Without
-            // this, achievements unlock locally but never propagate to
-            // the user's Steam profile.
             if (nameToBlockBit.isNotEmpty()) {
                 val mappedNames = mutableListOf<String>()
                 val mappedBlocks = mutableListOf<Int>()
@@ -5746,10 +5358,6 @@ class SteamService : Service() {
                 }
             }
 
-            // Layer additional locales on top so games launched in a
-            // non-English language honor the schema's per-locale strings.
-            // The primary push above already seeded the "english" key —
-            // we skip it here to avoid re-writing the same value.
             var localeAddsPushed = 0
             for (a in achievements) {
                 val dnByLocale = a.displayName ?: emptyMap()
@@ -5766,11 +5374,6 @@ class SteamService : Service() {
                 }
             }
 
-            // Achievement-level unlock state — only push entries that
-            // explicitly came back from CMsgClientGetUserStats with an
-            // unlock or a stored progress, so we don't override what
-            // SetAchievement / ClearAchievement may have already
-            // written into pushed state.
             var unlocksPushed = 0
             for (a in achievements) {
                 val unlocked = a.unlocked == true
@@ -5781,11 +5384,6 @@ class SteamService : Service() {
                     ++unlocksPushed
                 }
             }
-            // Default values for the schema's stats. The full live
-            // values arrive from CMsgClientGetUserStats / ClientStat
-            // pushes; this baseline keeps GetStatInt / GetStatFloat
-            // from reporting "stat not found" before the live push
-            // lands.
             for (s in stats) {
                 when (s.type) {
                     "int" -> com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
@@ -5796,28 +5394,9 @@ class SteamService : Service() {
             }
             Timber.i("Pushed achievement schema to libsteamclient.so: app=$appId ach=$n unlocks=$unlocksPushed stats=${stats.size} localeAdds=$localeAddsPushed")
 
-            // Persist the schema so the next launch of this app warms
-            // libsteamclient.so before the CM fetch completes. Cached
-            // to filesDir/wn_lsteam_schemas/<appId>.json rather than
-            // SharedPreferences — schemas are 10-100 KB each and SP
-            // keeps every entry resident in memory.
             cacheAchievementSchemaJson(appId, achievements, stats, nameToBlockBit)
         }
 
-        /**
-         * Serialize the per-app achievement + stat schema to JSON and
-         * write to `<filesDir>/wn_lsteam_schemas/<appId>.json`. Best-
-         * effort — IO failures are logged but don't propagate.
-         *
-         * On-disk shape:
-         * ```
-         * { "v":1, "ts":<unix>, "achievements":[...], "stats":[...] }
-         * ```
-         * The per-locale `displayName` / `description` maps survive
-         * round-trip so [warmAchievementSchemaFromCache] can fully
-         * restore the same data path [pushAchievementSchemaToLibSteamClient]
-         * walked on the fresh side.
-         */
         internal fun cacheAchievementSchemaJson(
             appId: Int,
             achievements: List<com.winlator.cmod.feature.stores.steam.statsgen.Achievement>,
@@ -5882,17 +5461,6 @@ class SteamService : Service() {
             }
         }
 
-        /**
-         * Restore a previously-cached schema and push it through
-         * [pushAchievementSchemaToLibSteamClient]. Returns true if a
-         * cache existed and a non-empty schema was pushed.
-         *
-         * Called early in [generateAchievements] so game-side achievement
-         * HUDs see real data immediately rather than waiting for the
-         * CM round-trip. The subsequent fresh push (when the CM fetch
-         * completes) replaces this with current data — the dedup at
-         * setter level avoids redundant callbacks if nothing changed.
-         */
         internal fun warmAchievementSchemaFromCache(appId: Int): Boolean {
             if (appId <= 0) return false
             val ctx = instance?.applicationContext ?: return false
@@ -5943,9 +5511,6 @@ class SteamService : Service() {
                 )
             }
             if (achievements.isEmpty() && stats.isEmpty()) return false
-            // Restore the bit-pack mapping from the cache so warm
-            // starts can still push StoreStats through to Steam even
-            // before the CM ingest re-runs.
             val nameToBlockBit = mutableMapOf<String, Pair<Int, Int>>()
             val bitsArr = root.optJSONArray("nameToBlockBit")
             if (bitsArr != null) {
@@ -6408,17 +5973,6 @@ class SteamService : Service() {
 
                                 if (steamInstance != null && appInfo != null) {
                                     progressWrapper("Checking Local Saves...", 0f)
-                                    // Exit semantics: always upload local. Without
-                                    // preferredSave=Local, syncUserFiles defaults to
-                                    // None — which converts the common "Valve's
-                                    // real steamclient64.dll auto-uploaded mid-game
-                                    // → cloud changeNumber bumped > our DAO" case
-                                    // into SyncResult.Conflict and skips the exit
-                                    // upload. User just played, their local IS the
-                                    // truth, so resolve in favor of local. Trade-off:
-                                    // same as Cold Client — second device's exit
-                                    // overwrites the first's progress if you play
-                                    // the same game on two devices simultaneously.
                                     val postSyncInfo =
                                         SteamAutoCloud
                                             .syncUserFiles(
@@ -6518,7 +6072,6 @@ class SteamService : Service() {
                     "beginLaunchAppBlocking must not be called on the main thread"
                 }
                 var completionSent = false
-                // Consistent accountId chain — see SteamCloudSyncHelper.steamPrefixResolver.
                 val accountId =
                     userSteamId?.accountID?.toLong()
                         ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
@@ -6563,7 +6116,6 @@ class SteamService : Service() {
         ): Boolean {
             return withContext(Dispatchers.IO) {
                 try {
-                    // Consistent accountId chain — see SteamCloudSyncHelper.steamPrefixResolver.
                     val accountId =
                         userSteamId?.accountID?.toLong()
                             ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
@@ -6607,22 +6159,6 @@ class SteamService : Service() {
             callback: CloudSyncCallback,
             containerHint: Container? = null,
         ) {
-            // Defensive container activation. PathType.toAbsPath resolves
-            // through the per-session home/xuser symlink (flipped by
-            // ContainerManager.activateContainer to the active container's
-            // xuser-N), and exit-time is the one cloud-op codepath that
-            // didn't enforce activation — SteamCloudSyncHelper
-            // .activateContainerForCloudOp does the same on the download
-            // side. If anything between the game exit and this upload
-            // swaps the symlink target, we'd otherwise upload from the
-            // wrong container's wineprefix. Cheap & idempotent.
-            //
-            // Prefer the caller-supplied containerHint (taken from the
-            // game's shortcut). The appId-keyed fallback uses
-            // ContainerUtils.getUsableContainerOrNull which prefers the
-            // global "preferred game container" pref — appId-agnostic and
-            // would activate the wrong container for any Steam game
-            // configured with its own non-default container.
             runCatching {
                 val target = containerHint
                     ?: com.winlator.cmod.feature.stores.steam.utils.ContainerUtils
@@ -6630,13 +6166,6 @@ class SteamService : Service() {
                 target?.let { com.winlator.cmod.runtime.container.ContainerManager(context).activateContainer(it) }
             }.onFailure { Timber.w(it, "syncCloudOnExit: container activation failed for app=%d", appId) }
 
-            // Same fallback order as SteamCloudSyncHelper.steamPrefixResolver /
-            // SteamUtils.writeCompleteSettingsDir — derive from steamUserSteamId64
-            // BEFORE steamUserAccountId so the exit upload reads from the SAME
-            // userdata/<accountId>/<appId>/ subdir the launch-time download
-            // wrote into and the in-Wine real Steam used at play time. A stale
-            // steamUserAccountId would otherwise point the upload at a
-            // different folder than the game just wrote to.
             val accountId =
                 userSteamId?.accountID?.toLong()
                     ?: PrefManager.steamUserSteamId64.takeIf { it != 0L }?.let { it and 0xFFFFFFFFL }
@@ -6719,9 +6248,6 @@ class SteamService : Service() {
             if (accessToken != null) PrefManager.accessToken = accessToken
             if (refreshToken != null) PrefManager.refreshToken = refreshToken
             if (clientId != null) PrefManager.clientId = clientId
-            // SteamID64 is the JWT `sub` claim — Steam-signed, no network
-            // round-trip needed. Persist it now so seedFromPrefManager has
-            // the right identity to push even if the CM reconnect lags.
             val tokenForSid = refreshToken ?: accessToken
             var newSid: Long = 0L
             var accountSwitched: Boolean = false
@@ -6747,16 +6273,9 @@ class SteamService : Service() {
                     Timber.w(e, "persistLoginTokens: JWT decode failed")
                 }
             }
-            // Mirror identity into libsteamclient.so before the CM reaches
-            // LoggedOn so game-side queries hitting BLoggedOn/GetSteamID
-            // in the gap see the right account. setLoggedOn(true) is a
-            // warm claim; the state observer flips it false on a logon
-            // failure. On account switch, clear stale per-account state
-            // from the previous identity.
             if (newSid != 0L) {
                 runCatching {
                     if (accountSwitched) {
-                        // Drop the previous account's per-account mirror state.
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                             .setPersonaName("")
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
@@ -6768,11 +6287,6 @@ class SteamService : Service() {
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                             .setAppId(0)
                         Timber.i("persistLoginTokens: cleared libsteamclient mirror on account switch")
-                        // The encrypted-app-ticket Room cache is keyed by
-                        // appId only — without a per-account purge, a
-                        // game launch on the new account would receive
-                        // the previous account's cached ticket. Same
-                        // reasoning as logOut().
                         instance?.let { svc ->
                             svc.scope.launch(Dispatchers.IO) {
                                 runCatching { svc.encryptedAppTicketDao.deleteAll() }
@@ -6780,17 +6294,6 @@ class SteamService : Service() {
                                         Timber.w(it,
                                             "Failed to clear encrypted-app-ticket cache on account switch")
                                     }
-                                // steam_app is the games-list catalog the
-                                // home Steam tab renders from (UnifiedActivity
-                                // .kt collects SteamAppDao.getAllOwnedApps()).
-                                // The DAO filter on owner_account_id is
-                                // commented out (it's a JSON List<Int>, not
-                                // a scalar — Room can't IN-match it), so
-                                // without this purge the previous account's
-                                // catalog rows merge with the new account's
-                                // PICS re-populate and the tab shows BOTH
-                                // libraries. app_info (installed-shortcut
-                                // metadata) is a different table and stays.
                                 runCatching { svc.db.steamAppDao().deleteAll() }
                                     .onFailure {
                                         Timber.w(it,
@@ -6861,19 +6364,11 @@ class SteamService : Service() {
 
                 if (!result.success || result.refreshToken.isEmpty()) {
                     Timber.e("WnSteam auth failed: %s", result.errorMessage)
-                    // Surface to games observing the .so — SteamServerConnectFailure_t
-                    // (id 102) carries the EResult so multiplayer auth-retry UI
-                    // sees the right code (15 = AccessDenied, 84 = RateLimit, ...).
-                    // stillRetrying=false because the auth coroutine has given up
-                    // — the user will need to re-initiate login.
                     com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                         .reportLogonFailure(
                             eresult = result.errorCode.takeIf { it != 0 } ?: 2 /* Fail */,
                             stillRetrying = false,
                         )
-                    // Engage the shared logon-attempt gate so a subsequent
-                    // background path (cloud sync, ticket prefetch) can't
-                    // race the user's "Sign in" tap and stack attempts.
                     recordLogonFailure(result.errorCode.takeIf { it != 0 } ?: 2)
                     PluviaApp.events.emit(
                         SteamEvent.LogonEnded(username, LoginResult.Failed,
@@ -6916,9 +6411,6 @@ class SteamService : Service() {
                     while (waited < 35 && session.state() != 3) { delay(1000); waited++ }
                     if (session.state() != 3 && wnSession === session) {
                         Timber.w("WnSteam CM logon never reached LoggedOn")
-                        // EResult=6 NoConnection — best fit for "channel
-                        // never reached LoggedOn within the watchdog window".
-                        // stillRetrying=true: onWnDisconnected will reconnect.
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                             .reportLogonFailure(eresult = 6, stillRetrying = true)
                         PluviaApp.events.emit(
@@ -6972,9 +6464,6 @@ class SteamService : Service() {
                         3 -> {
                             isConnected = true
                             _isLoggedInFlow.value = true
-                            // Logon success → clear the rate-limit gate
-                            // so subsequent token-stale events restart
-                            // the back-off schedule from 30s.
                             recordLogonSuccess()
                             if (!wnLoggedOnHandled) {
                                 wnLoggedOnHandled = true
@@ -6984,20 +6473,6 @@ class SteamService : Service() {
                         0 -> {
                             if (wnSession === session) {
                                 isConnected = false
-                                // Don't clear _isLoggedInFlow while the
-                                // user has a valid refresh-token cached
-                                // — the reconnect loop is the right
-                                // place to flip it false (after it gives
-                                // up). Flipping it here on every CM
-                                // burp causes the Compose UI to flash
-                                // "Sign In" while a 2-second reconnect
-                                // is in progress, then flip back. The
-                                // UI gates on this StateFlow, so the
-                                // user perceives "asked to sign in
-                                // again" even though the credentials
-                                // are still valid. onWnDisconnected
-                                // schedules the reconnect and clears
-                                // the flag only after retry exhaustion.
                                 if (PrefManager.refreshToken.isBlank()) {
                                     _isLoggedInFlow.value = false
                                 }
@@ -7011,37 +6486,10 @@ class SteamService : Service() {
                 override fun onClientMessage(emsg: Int, eresult: Int, body: ByteArray) {
                     Timber.d("WnSteam(logon) inbound emsg=%d eresult=%d body=%d bytes",
                         emsg, eresult, body.size)
-                    // ClientLogonResponse (EMsg 751) with non-OK eresult — Steam
-                    // is rejecting the logon. Forward to libsteamclient.so so
-                    // any game-side observer of SteamServerConnectFailure_t
-                    // sees the failure code. stillRetrying=true because the
-                    // disconnect handler will schedule a reconnect (unless
-                    // the eresult is non-recoverable — caller filters that).
                     if (emsg == 751 && eresult != 1) {
                         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                             .reportLogonFailure(eresult = eresult, stillRetrying = true)
-                        // Engage the shared logon-attempt gate so the next
-                        // cloud-sync / quota / ticket call doesn't fire
-                        // another LogonWithRefreshToken inside the back-off
-                        // window. Without this guard every caller would
-                        // independently retry against an EResult=84 lockout
-                        // and stack attempts on the account.
                         recordLogonFailure(eresult)
-                        // Detect non-recoverable revocation: Steam is telling
-                        // us "this token will never work, stop trying."
-                        // Without this guard we'd grind through the 8-attempt
-                        // reconnect budget then silently give up, leaving the
-                        // user staring at "loading…" indefinitely.
-                        //   EResult 5  InvalidPassword
-                        //   EResult 15 AccessDenied (after a fresh renewal)
-                        //   EResult 18 InvalidParam
-                        //   EResult 65 AccountLogonDeniedNoMail
-                        //   EResult 67 AccountLoginDeniedNeedTwoFactor (special-
-                        //                  cased — we leave 2FA flows alone)
-                        // For the rest, clear the stored refresh-token + emit
-                        // a LogonEnded(AccessDenied) event the UI can show
-                        // exactly once. Idempotent: if the token is already
-                        // blank, no-op.
                         val nonRecoverable = eresult == 5 || eresult == 15 ||
                             eresult == 18 || eresult == 65
                         if (nonRecoverable && PrefManager.refreshToken.isNotBlank()) {
@@ -7056,8 +6504,6 @@ class SteamService : Service() {
                                         LoginResult.Failed,
                                         "Steam refused the cached session (EResult=$eresult). Please sign in again."))
                             }
-                            // Reset libsteamclient identity so a fresh sign-
-                            // in doesn't see stale state.
                             runCatching {
                                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                                     .setLoggedOn(false)
@@ -7086,15 +6532,6 @@ class SteamService : Service() {
                         "WnLibrary snapshot: %d packages, %d owned apps (of %d tracked)",
                         snap.packages.size, snap.ownedApps.size, snap.allAppsCount,
                     )
-                    // Mirror per-app names + buildIds from the freshly-
-                    // arrived PICS snapshot into libsteamclient.so so
-                    // ISteamAppList.GetAppName + ISteamApps.GetAppBuildId
-                    // see real values as new metadata lands. Filters to
-                    // entries with non-empty name / non-zero build_id —
-                    // incomplete PICS records (anonymous owned licenses
-                    // awaiting access tokens) would otherwise clear
-                    // previously-cached entries; the JNI side filters
-                    // empty/zero values to a no-op already.
                     val nameIds  = mutableListOf<Int>()
                     val nameStrs = mutableListOf<String>()
                     var buildIdsPushed = 0
@@ -7109,10 +6546,6 @@ class SteamService : Service() {
                                 .setAppBuildId(a.id, a.buildId)
                             ++buildIdsPushed
                         }
-                        // Per-app source-package list — powers slots 8 +
-                        // 9 (GetEarliestPurchaseUnixTime / BIsSubscribed
-                        // FromFreeWeekend) by joining against the
-                        // license-list observer's pushed.licenses.
                         if (a.sourcePackageIds.isNotEmpty()) {
                             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                                 .nativeSetAppSourcePackages(
@@ -7150,15 +6583,11 @@ class SteamService : Service() {
         internal suspend fun <T> withWnSession(
             block: suspend (WnSteamSession) -> T,
         ): T? {
-            // No second concurrent logon while a bootstrap takeover owns
-            // the account's session.
             if (instance?.suspendedForBionic == true) {
                 Timber.i("withWnSession: suspended for Bionic hand-off — no CM session")
                 return null
             }
-            // Reuse the logged-on session lock-free.
             wnSession?.takeIf { it.state() == 3 }?.let { return block(it) }
-            // Skip new logons while the back-off gate is open.
             val gateUntil = logonGateUntilMs
             if (gateUntil > 0L) {
                 val now = System.currentTimeMillis()
@@ -7170,9 +6599,6 @@ class SteamService : Service() {
                     return null
                 }
             }
-            // Serialize bring-up so concurrent callers share one session
-            // (multiple Steam logons on one account-instance kick each
-            // other with ClientLoggedOff eresult=34).
             return wnSessionBringUpMutex.withLock {
                 wnSession?.takeIf { it.state() == 3 }?.let { return@withLock block(it) }
                 val svc = instance ?: return@withLock null
@@ -7181,8 +6607,6 @@ class SteamService : Service() {
                     Timber.w("withWnSession: no stored refresh token")
                     return@withLock null
                 }
-                // Re-check the gate — a peer may have tripped it while we
-                // were waiting on the mutex.
                 run {
                     val gu = logonGateUntilMs
                     if (gu > 0L && System.currentTimeMillis() < gu) {
@@ -7215,30 +6639,21 @@ class SteamService : Service() {
                     }
                     if (brought.state() != 3) {
                         Timber.w("withWnSession: session never reached LoggedOn")
-                        // Inline observer only fires recordLogonFailure on
-                        // EMsg=751; absent that, attribute the timeout.
                         if (lastLogonFailureEresult == 0) recordLogonFailure(16)
                         return@withLock null
                     }
-                    // Promote to the shared long-lived session so later
-                    // callers take the lock-free fast path. A per-call
-                    // throwaway session can't hold persona / games-played.
                     installWnLogonObserver(brought)
                     wnSession = brought
                     promoted = true
                     isConnected = true
                     _isLoggedInFlow.value = true
                     recordLogonSuccess()
-                    // State reached LoggedOn before the observer was wired
-                    // up — run the post-logon work directly.
                     if (!wnLoggedOnHandled) {
                         wnLoggedOnHandled = true
                         instance?.onWnLoggedOn(brought)
                     }
                     block(brought)
                 } finally {
-                    // Tear down only the unpromoted session; the promoted
-                    // one is now the shared session.
                     if (!promoted) {
                         runCatching { brought.disconnect() }
                         runCatching { brought.close() }
@@ -7447,22 +6862,12 @@ class SteamService : Service() {
             isLoggingOut = true
             _isLoggedInFlow.value = false
             PrefManager.clearAuthTokens()
-            // Wipe per-app encrypted-app-ticket cache so a re-sign-in
-            // on a DIFFERENT account doesn't serve the previous account's
-            // tickets to games. The cache is keyed by appId only; the
-            // SteamID is implicit in the bytes. Without this, the 30-min
-            // cache (SteamService.kt:8336 area) would happily return the
-            // old account's bytes to the next sign-in's game launches.
             instance?.let { svc ->
                 svc.scope.launch(Dispatchers.IO) {
                     runCatching { svc.encryptedAppTicketDao.deleteAll() }
                         .onFailure { Timber.w(it, "Failed to clear encrypted-app-ticket cache on logout") }
                 }
             }
-            // Reset libsteamclient.so's bound appId so a stale slot 13/21
-            // doesn't serve last-game's tickets. Also clear logged_on
-            // explicitly (the CM observer would do this on disconnect
-            // but we just changed it to ignore non-LoggedOn-edge events).
             runCatching {
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setAppId(0)
@@ -7483,11 +6888,6 @@ class SteamService : Service() {
             wnLibrary?.stopObserving()
             wnLibrary = null
 
-            // HYBRID STAGE-2 — if the bootstrap was the live session
-            // (wn_hybrid_mode hand-off), stop it too. nativeShutdown
-            // unsets every env var, drops the IClient* + ISteam* cached
-            // pointers, and wakes any callback awaiter so they unblock
-            // instead of waiting forever on a dead session.
             try {
                 com.winlator.cmod.feature.stores.steam.wnsteam
                     .WnSteamBootstrap.stop()
@@ -7527,18 +6927,6 @@ class SteamService : Service() {
             }
         }
 
-        // ── Overlay-request poll loop ──────────────────────────────
-        //
-        // The running game's ISteamFriends.ActivateGameOverlayTo* slots
-        // (28..33) enqueue a serialized request into pushed-state. This
-        // coroutine drains the queue at 250 ms cadence and dispatches
-        // each entry as an Intent.ACTION_VIEW so the system browser /
-        // appropriate app opens the URL.
-        //
-        // Lazy-started by prepareLibSteamClientForLaunch on every game
-        // launch (idempotent — the singleton job ref guards re-entry).
-        // Stopped by logOut() to release the coroutine when the user
-        // signs out.
         @Volatile private var overlayPollJob: kotlinx.coroutines.Job? = null
 
         fun startOverlayPollLoop() {
@@ -7563,10 +6951,6 @@ class SteamService : Service() {
             overlayPollJob = null
         }
 
-        // Parse the `kind\x01arg1\x01sid\x01appid` wire form emitted by
-        // nativePollOverlayRequest and fire the matching Intent.ACTION_
-        // VIEW. Falls back to no-op when the kind is unknown or no SAW
-        // (signed-and-wait) context is yet available.
         private fun dispatchOverlayRequest(serialized: String) {
             val parts = serialized.split('\u0001')
             if (parts.size < 4) {
@@ -7582,17 +6966,10 @@ class SteamService : Service() {
                              else "https://${arg1}"
                 "store"   -> "https://store.steampowered.com/app/${appId}/"
                 "user"    -> "https://steamcommunity.com/profiles/${sid}"
-                // The lobby invite dialog has no public web equivalent —
-                // log it for now. A future deep-link could open the in-
-                // app friend picker.
                 "invite"  -> {
                     Timber.i("overlay: invite dialog requested (lobby=0x${sid.toString(16)})")
                     return
                 }
-                // ActivateGameOverlay("Friends"|"Settings"|...) — most
-                // games use "Friends" / "Players" / "Achievements".
-                // Map "Achievements" to the per-app stats page; others
-                // drop to the user profile.
                 "dialog"  -> when (arg1) {
                     "Achievements" -> "https://steamcommunity.com/stats/${appId}/achievements/"
                     "Players"      -> "https://steamcommunity.com/profiles/${
@@ -7639,11 +7016,6 @@ class SteamService : Service() {
                         licenseDao.deleteAll()
                         encryptedAppTicketDao.deleteAll()
                         downloadingAppInfoDao.deleteAll()
-                        // Drop the per-account games-list catalog so a
-                        // subsequent sign-in as a different user doesn't
-                        // see the previous account's library merged into
-                        // its own. app_info (installed-shortcut metadata)
-                        // is a separate table — installed games stay.
                         db.steamAppDao().deleteAll()
                     }
                 }
@@ -8035,19 +7407,9 @@ class SteamService : Service() {
         val notification = notificationHelper.createForegroundNotification("Steam Service is running")
         startForeground(1, notification)
 
-        // Seed our open-source libsteamclient.so with everything we
-        // know from PrefManager NOW, so its interface stubs return
-        // meaningful values from the moment the .so is dlopened —
-        // not after wn-session's first round-trip. Idempotent.
         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
             .seedFromPrefManager(applicationContext)
 
-        // Seed the owned + installed app sets from the existing
-        // Room cache. Best-effort — runs on the IO dispatcher so the
-        // service-startup path doesn't block. The seed makes
-        // ISteamApps.BIsSubscribedApp / BIsAppInstalled answer
-        // correctly the moment the .so is queried, even before any
-        // fresh CMsgClientLicenseList round-trip.
         scope.launch(Dispatchers.IO) {
             try {
                 val ownedIds = appDao.getAllAppIds().toIntArray()
@@ -8059,20 +7421,12 @@ class SteamService : Service() {
                 if (installed.isNotEmpty()) {
                     com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                         .setInstalledApps(installed)
-                    // Per-app install dir push too, so
-                    // ISteamApps.GetAppInstallDir returns real paths.
                     installed.forEach { appId ->
                         val dir = runCatching { getAppDirPath(appId) }.getOrNull()
                         if (!dir.isNullOrEmpty()) {
                             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                                 .setAppInstallDir(appId, dir)
                         }
-                        // Cloud remote-dir push — gives ISteamRemoteStorage
-                        // FileWrite/Read/Delete a target on production
-                        // paths. Resolves to the same .../userdata/<acct>/
-                        // <appId>/remote dir wn-session's cloud-sync layer
-                        // batches up to Steam, so writes land where the
-                        // sync layer expects them.
                         val acct = runCatching {
                             com.winlator.cmod.feature.stores.steam.utils
                                 .SteamUtils.getSteam3AccountId().toLong()
@@ -8090,11 +7444,6 @@ class SteamService : Service() {
                         }
                     }
                 }
-                // Bulk-push app names. ISteamAppList.GetAppName reads
-                // from this so games / launchers querying through our
-                // .so see human-readable titles instead of empty strings.
-                // Pulls from the same Room cache that drives the library
-                // UI, so names are coherent across the app.
                 val nameIds   = mutableListOf<Int>()
                 val nameStrs  = mutableListOf<String>()
                 for (id in ownedIds) {
@@ -8250,13 +7599,6 @@ class SteamService : Service() {
         Timber.i("App foregrounded — waking the WN-Steam-Client session")
         retryAttempt = 0
         if (isRunning && !isStopping && PrefManager.refreshToken.isNotBlank()) {
-            // Optimistic warm: restore libsteamclient.so's logged_on flag
-            // immediately so a game queried during the 5-10s reconnect
-            // window doesn't see BLoggedOn=false. The CM observer will
-            // re-affirm true once Connected→LoggedOn fires; if logon
-            // ultimately fails, the non-recoverable EResult handler
-            // (installWnLogonObserver onClientMessage) will flip it back.
-            // Mirrors the cold-start path's seedFromPrefManager logic.
             runCatching {
                 com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                     .setLoggedOn(true)
@@ -8338,41 +7680,6 @@ class SteamService : Service() {
         return true
     }
 
-    /**
-     * Bionic Steam hand-off — ACQUIRE. Drops the wn-steam-client CM session
-     * and stops it auto-reconnecting, so the account has NO active client
-     * logon — clearing the way for the bootstrap's libsteamclient.so to log
-     * on with the shared refresh token. Two concurrent
-     * LogonWithRefreshToken for one token are rejected by Steam
-     * (AccessDenied / rate-limit), so the two clients must take turns.
-     */
-    /**
-     * Mint a fresh refresh token from the current wn-session and
-     * persist it to PrefManager BEFORE the bootstrap takeover. Returns
-     * true iff a new token was successfully minted + saved. Best-effort:
-     * on any failure (no wn-session / not logged on / service error /
-     * timeout) returns false and leaves PrefManager.refreshToken
-     * untouched — the existing token will then drive the bootstrap's
-     * LogonWithRefreshToken (may hit Steam's concurrent-login guard,
-     * but degrades to the pre-fix behavior, not worse).
-     *
-     * Calls Authentication.GenerateAccessTokenForApp#1 with
-     * renewal_type=Allow per the public Steam protocol.
-     */
-    /**
-     * Proactive refresh-token rotation watchdog. Started from
-     * [onWnLoggedOn]; cancelled on disconnect / logout / hand-off.
-     * Decodes the cached refresh-token's JWT `exp` claim; if within
-     * [REFRESH_TOKEN_ROTATION_THRESHOLD_DAYS], calls
-     * [renewRefreshTokenForHandoff] to mint a fresh token via
-     * Authentication.GenerateAccessTokenForApp#1. Re-checks every
-     * [REFRESH_TOKEN_ROTATION_CHECK_INTERVAL_MS] thereafter.
-     *
-     * Without this, a long-lived session can land on an expired
-     * refresh-token at the next CM reconnect (or Real-Steam launch),
-     * forcing the user to re-sign-in. With it, tokens rotate
-     * silently while the session is healthy.
-     */
     private fun startRefreshTokenWatchdog() {
         refreshTokenWatchdogJob?.cancel()
         refreshTokenWatchdogJob = scope.launch(Dispatchers.IO) {
@@ -8437,26 +7744,10 @@ class SteamService : Service() {
         refreshTokenWatchdogJob?.cancel()
         picsChangesCheckerJob?.cancel()
         picsGetProductInfoJob?.cancel()
-        // CLEAN HAND-OFF: send CMsgClientLogOff before disconnecting so
-        // Steam clears the session immediately. A bare disconnect just
-        // closes the socket — Steam keeps the session alive for ~5 min
-        // (heartbeat timeout), and the bootstrap's subsequent
-        // LogonWithRefreshToken with the SAME token then hits EResult=15
-        // (AccessDenied — observed on-device 2026-05-19 commit 90361f6).
-        // Best-effort: 500ms flush window for the LogOff to leave the
-        // channel before the disconnect.
         wnSession?.let { s -> runCatching { s.logOffAndDisconnect(500) } }
     }
 
-    /**
-     * Bionic Steam hand-off — RELEASE. The game session has ended: log the
-     * bootstrap off (so the account again has no client logon), then bring
-     * the wn-steam-client CM session back up. The two never overlap.
-     */
     private fun bionicHandoffReleaseImpl() {
-        // Always log the bootstrap off first — this also recovers a leaked
-        // WnSteamBootstrap `initialized` flag from a prior game whose
-        // termination callback was missed (stop() is a no-op if not init'd).
         runCatching {
             com.winlator.cmod.feature.stores.steam.wnsteam.WnSteamBootstrap.stop()
         }
@@ -8512,9 +7803,6 @@ class SteamService : Service() {
         backgroundIdleJob?.cancel()
         backgroundIdleJob = null
         suspendedForBackground = false
-        // Clear the Bionic hand-off latch too, so a service teardown after
-        // a hard game crash (where bionicHandoffRelease was never called)
-        // cannot leave wn-steam-client permanently suppressed.
         suspendedForBionic = false
         appInForeground = true
 
@@ -8603,8 +7891,6 @@ class SteamService : Service() {
                 retryAttempt = 0
                 Timber.d("Connection stable — reconnect retry budget reset")
             }
-        // Kick the refresh-token rotation watchdog. Runs an
-        // immediate check + then every 6h while connected.
         startRefreshTokenWatchdog()
         isLoggingOut = false
         _isLoggedInFlow.value = true
@@ -8624,30 +7910,13 @@ class SteamService : Service() {
             }
         }
 
-        // Push session state into our open-source libsteamclient.so so
-        // ISteamUser.GetSteamID / BLoggedOn etc. return real values to
-        // anyone querying through it (the bootstrap's stage-2 self-
-        // test + any game that dlopens our peer). Best-effort —
-        // no-op when the lib isn't loaded.
         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
             .setSteamId(steamId64)
         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
             .setLoggedOn(true)
-        // Steam Cloud is on by default for all signed-in accounts unless
-        // the user globally disables it from the Steam Settings UI —
-        // we don't currently surface that toggle, so once logged on we
-        // report account-level Cloud as enabled. Per-app enablement
-        // defaults false in prewarm/library mode; the game-launch path
-        // ([bindAppCloudState]) flips it true for the bound appId.
         com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
             .setCloudEnabledForAccount(true)
 
-        // NOTE: the Bionic Steam bootstrap is deliberately NOT pre-warmed
-        // here. The bootstrap's libsteamclient.so and this wn-steam-client
-        // session cannot both hold a logon with one shared refresh token
-        // (Steam → AccessDenied). The bootstrap instead logs on at Bionic
-        // game-launch time, after bionicHandoffAcquire() drops this session
-        // — see the hand-off model in XServerDisplayActivity.
 
         // retrieve persona data of logged in user
         scope.launch { requestUserPersona() }
@@ -8656,14 +7925,8 @@ class SteamService : Service() {
         // CMsgClientLicenseList.
         scope.launch { processLicenseList() }
 
-        // Push the user's friends-list into libsteamclient.so so any
-        // game-side ISteamFriends.GetFriendCount / GetFriendByIndex
-        // queries see real data. CMsgClientFriendsList is server-pushed
-        // at logon — poll briefly until it arrives, then push.
         scope.launch { pushFriendsListToLibSteamClient() }
 
-        // Cloud user quota — account-level CM round-trip (not gated on
-        // a bound game). Drives ISteamRemoteStorage.GetQuota's answer.
         scope.launch { refreshCloudQuotaForLibSteamClient() }
 
         // Request family share info if the logon response gave us a family id.
@@ -8704,9 +7967,6 @@ class SteamService : Service() {
             val effectiveState =
                 (EPersonaState.from(PrefManager.personaState) ?: EPersonaState.Online).code()
             withWnSession { s -> s.setPersonaState(effectiveState) }
-            // Mirror into libsteamclient.so so ISteamFriends.GetPersonaState
-            // (slot 2) flips from 0 (Offline default) to 1 (Online) — keeps
-            // the in-process state coherent with what we just told Steam.
             com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
                 .setPersonaState(effectiveState)
         }
@@ -8715,18 +7975,6 @@ class SteamService : Service() {
         _loginResult = LoginResult.Success
         PluviaApp.events.emit(SteamEvent.LogonEnded(PrefManager.username, LoginResult.Success))
 
-        // Pre-fetch ownership tickets for every installed app so a
-        // follow-up game launch's ISteamUser.GetAuthSessionTicket
-        // returns the wrapped real ticket immediately (no CM round-
-        // trip latency on the launch hot path). The bridge cache is
-        // populated by CMClient::prepare_app via wn-session's
-        // CMsgClientGetAppOwnershipTicket round-trip.
-        //
-        // Best-effort + fire-and-forget — each app's pre-fetch is
-        // independent; one failure doesn't block the others. Launched
-        // on the SteamService scope so it survives this onWnLoggedOn
-        // returning. Throttled to 8 concurrent in-flight CM requests
-        // so a 50-game library doesn't flood the channel.
         scope.launch {
             try {
                 val installed = withContext(Dispatchers.IO) {
@@ -8753,11 +8001,6 @@ class SteamService : Service() {
             }
         }
 
-        // wn-session is the single long-lived CM client. Game-side queries
-        // through libsteamclient.so route back here via cm_bridge, so the
-        // bootstrap takeover that used to run from this site is no longer
-        // necessary. The bionicHandoffAcquire/Release entry points remain
-        // for explicit callers that need a bootstrap-owned session.
     }
     // endregion
 
@@ -8904,21 +8147,6 @@ class SteamService : Service() {
     // hook was removed
     // endregion
 
-    /**
-     * Poll the wn-steam-client's friends-list cache (populated by the
-     * server-pushed `CMsgClientFriendsList`) and forward the SteamID64s
-     * into our open-source `libsteamclient.so`. This lets in-game
-     * `ISteamFriends.GetFriendCount` / `GetFriendByIndex` /
-     * `GetFriendRelationship` return real data instead of zeros.
-     *
-     * The full snapshot arrives one or two seconds after logon; we poll
-     * up to ~6s (30 × 200ms) before giving up. Pushing an empty array is
-     * still semantically correct ("no friends") — the .so's pushed
-     * friends-list is replaced wholesale on each call.
-     *
-     * Per-friend persona names are pushed separately as
-     * `CMsgClientPersonaState` updates arrive (a follow-up).
-     */
     private suspend fun pushFriendsListToLibSteamClient() {
         var ids = LongArray(0)
         for (attempt in 0 until 30) {
@@ -8932,27 +8160,13 @@ class SteamService : Service() {
 
         if (ids.isEmpty()) return
 
-        // Ask Steam for persona data for every friend so player names
-        // resolve via ISteamFriends.GetFriendPersonaName. Steam answers
-        // asynchronously via CMsgClientPersonaState pushes; we poll the
-        // cached snapshot below until it stops growing.
         withWnSession { s ->
-            // 1 = EClientPersonaStateFlag.PlayerName — the bit we need
-            // to receive names. Using the full flag set (~0) also works
-            // but pulls down more bytes per push.
             s.requestFriendPersonas(ids, personaStateRequested = 1)
         }
 
         pushFriendPersonaNamesToLibSteamClient(ids)
     }
 
-    /**
-     * Poll wn-steam-client's cached friend personas for up to ~6s, then
-     * forward each (sid, name) tuple into libsteamclient.so via
-     * [WnLibSteamClient.setFriendPersonaName]. Self-pushing is skipped —
-     * the local persona name is pushed by the existing
-     * [requestUserPersona] path.
-     */
     private suspend fun pushFriendPersonaNamesToLibSteamClient(
         expectedIds: LongArray,
     ) {
@@ -8961,20 +8175,11 @@ class SteamService : Service() {
         for (attempt in 0 until 30) {
             json = withWnSession { s -> s.getFriendPersonas() } ?: "[]"
             val arr = try { JSONArray(json) } catch (_: Exception) { JSONArray() }
-            // Stop early if we already have a name for every friend in
-            // the snapshot, OR if growth stalled for two consecutive
-            // polls.
             if (arr.length() >= expectedIds.size) break
             if (arr.length() == lastCount && arr.length() > 0) break
             lastCount = arr.length()
             delay(200)
         }
-        // Route the friend-persona JSON through the shared helper —
-        // handles name/state/game/avatar-hash routing AND AvatarFetcher
-        // enqueue AND PrefManager.friendsSnapshotJson persistence in
-        // one place. The same helper is replayed on cold-boot via
-        // seedFromPrefManager so friend overlays light up immediately
-        // rather than 5-10s after wn-session reconnects.
         val pushed = com.winlator.cmod.feature.stores.steam.wnsteam.WnLibSteamClient
             .pushFriendPersonasJson(json, persistSnapshot = true)
         Timber.i("Pushed $pushed friend persona(s) to libsteamclient.so (snapshot persisted)")
@@ -9271,19 +8476,6 @@ class SteamService : Service() {
                 return cachedTicket.encryptedTicket
             }
 
-            // Primary path: the C++ WN-Steam-Client (Phase 9 — JavaSteam is
-            // being dropped). RequestEncryptedAppTicket returns the serialized
-            // EncryptedAppTicket protobuf — exactly what Goldberg's
-            // configs.user.ini `ticket=` consumes.
-            //
-            // CRITICAL: if wn-session isn't logged on yet at launch time
-            // (cold-start + game-launch-too-fast), withWnSession will
-            // immediately return null and we'll write configs.user.ini
-            // with NO ticket. Capcom-DRM titles (MHR / MHS) reject and
-            // refuse to boot. Wait up to 15s for logon to complete
-            // before giving up — the same launch path already absorbs
-            // multi-second waits for PICS and DLC fetch, so the user
-            // doesn't notice.
             var wnTicket: ByteArray? = null
             val ticketWaitDeadlineMs = System.currentTimeMillis() + 15_000L
             while (wnTicket == null && System.currentTimeMillis() < ticketWaitDeadlineMs) {
@@ -9291,8 +8483,6 @@ class SteamService : Service() {
                     withContext(Dispatchers.IO) { session.requestEncryptedAppTicket(appId) }
                 }
                 if (wnTicket != null) break
-                // No session or session returned null. Both can transient
-                // — wait briefly then retry. Don't busy-loop.
                 kotlinx.coroutines.delay(500L)
             }
             if (wnTicket == null) {
