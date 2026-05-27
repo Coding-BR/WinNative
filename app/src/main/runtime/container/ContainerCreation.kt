@@ -180,9 +180,9 @@ object ContainerCreation {
             put("inputType", WinHandler.DEFAULT_INPUT_TYPE.toInt())
             put("startupSelection", Container.STARTUP_SELECTION_ESSENTIAL.toInt())
             put("box64Version", defaults.box64Version)
-            put("box64Preset", Box64Preset.PERFORMANCE)
+            put("box64Preset", Box64Preset.COMPATIBILITY)
             put("fexcoreVersion", defaults.fexcoreVersion)
-            put("fexcorePreset", FEXCorePreset.PERFORMANCE)
+            put("fexcorePreset", FEXCorePreset.INTERMEDIATE)
             put("desktopTheme", WineThemeManager.DEFAULT_DESKTOP_THEME)
             put("midiSoundFont", "")
             put("lc_all", "")
@@ -319,8 +319,8 @@ object ContainerCreation {
         container.setEmulator64(defaults.emulator)
         container.setBox64Version(defaults.box64Version)
         container.setFEXCoreVersion(defaults.fexcoreVersion)
-        container.setBox64Preset(Box64Preset.PERFORMANCE)
-        container.setFEXCorePreset(FEXCorePreset.PERFORMANCE)
+        container.setBox64Preset(Box64Preset.COMPATIBILITY)
+        container.setFEXCorePreset(FEXCorePreset.INTERMEDIATE)
         container.saveData()
     }
 

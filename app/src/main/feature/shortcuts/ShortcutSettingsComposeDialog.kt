@@ -1078,7 +1078,7 @@ class ShortcutSettingsComposeDialog private constructor(
             val fexcorePreset =
                 if (state.selectedFexcorePreset.intValue in fexcorePresetIds.indices)
                     fexcorePresetIds[state.selectedFexcorePreset.intValue]
-                else FEXCorePreset.COMPATIBILITY
+                else FEXCorePreset.INTERMEDIATE
             hasContainerOverride = hasContainerOverride or saveOverride(
                 "fexcorePreset", fexcorePreset, container.getFEXCorePreset()
             )

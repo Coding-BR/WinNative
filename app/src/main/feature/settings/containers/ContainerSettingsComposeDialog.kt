@@ -759,7 +759,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
 
         val fexcoreVersionEntries = state.fexcoreVersionEntries.value
         val fexcoreVersion = fexcoreVersionEntries.getOrElse(state.selectedFexcoreVersion.intValue) { "" }
-        val fexcorePreset = fexcorePresetIds.getOrElse(state.selectedFexcorePreset.intValue) { FEXCorePreset.COMPATIBILITY }
+        val fexcorePreset = fexcorePresetIds.getOrElse(state.selectedFexcorePreset.intValue) { FEXCorePreset.INTERMEDIATE }
 
         val desktopTheme = buildDesktopThemeString()
 
@@ -920,7 +920,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
         box64PresetIds = ids
         val saved = container?.getBox64Preset()
             ?: PreferenceManager.getDefaultSharedPreferences(context)
-                .getString("box64_preset", Box64Preset.PERFORMANCE)
+                .getString("box64_preset", Box64Preset.COMPATIBILITY)
         val idx = ids.indexOfFirst { it == saved }
         state.selectedBox64Preset.intValue = if (idx >= 0) idx else 0
     }
@@ -936,7 +936,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
         fexcorePresetIds = ids
         val saved = container?.getFEXCorePreset()
             ?: PreferenceManager.getDefaultSharedPreferences(context)
-                .getString("fexcore_preset", FEXCorePreset.PERFORMANCE)
+                .getString("fexcore_preset", FEXCorePreset.INTERMEDIATE)
         val idx = ids.indexOfFirst { it == saved }
         state.selectedFexcorePreset.intValue = if (idx >= 0) idx else 0
     }
