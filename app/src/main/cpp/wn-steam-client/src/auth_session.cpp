@@ -15,6 +15,14 @@ constexpr const char* kLogTag = "WnSteamAuth";
 #define WN_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, kLogTag, __VA_ARGS__)
 #define WN_LOGI(...) __android_log_print(ANDROID_LOG_INFO,  kLogTag, __VA_ARGS__)
 
+void secure_clear(std::string& s) {
+    if (!s.empty()) {
+        volatile char* p = const_cast<volatile char*>(s.data());
+        for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
+    }
+    s.clear();
+}
+
 // Sleep that can be cut short by the cancel flag.
 void interruptible_sleep_seconds(float seconds,
                                  const std::atomic<bool>& cancel_flag) {
@@ -87,6 +95,7 @@ void CredentialsAuthSession::step_begin_session(
 
     auto encrypted = rsa_pkcs1v15_encrypt_password_with_hex_key(
         config_.password, key.publickey_mod, key.publickey_exp);
+    secure_clear(config_.password);
     if (!encrypted) {
         AuthSessionResult err;
         err.error_message = "password RSA encryption failed";
@@ -112,6 +121,7 @@ void CredentialsAuthSession::step_begin_session(
     req.device_details.platform_type        = pb::EAuthTokenPlatformType::SteamClient;
     req.device_details.os_type              = 16;  // EOSType.Windows
     req.guard_data           = config_.guard_data;
+    secure_clear(config_.guard_data);
 
     auto self = shared_from_this();
     client_->call_service_method(

@@ -340,7 +340,15 @@ jlong to_handle(SessionHandle* p) noexcept {
     return static_cast<jlong>(reinterpret_cast<uintptr_t>(p));
 }
 
-jobject build_auth_result(JNIEnv* env, const wn_steam::AuthSessionResult& r) {
+void secure_clear(std::string& s) {
+    if (!s.empty()) {
+        volatile char* p = const_cast<volatile char*>(s.data());
+        for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
+    }
+    s.clear();
+}
+
+jobject build_auth_result(JNIEnv* env, wn_steam::AuthSessionResult& r) {
     auto make_str = [&](const std::string& s) -> jstring {
         return env->NewStringUTF(s.c_str());
     };
@@ -370,6 +378,10 @@ jobject build_auth_result(JNIEnv* env, const wn_steam::AuthSessionResult& r) {
     if (jaccess)  env->DeleteLocalRef(jaccess);
     if (jguard)   env->DeleteLocalRef(jguard);
     if (jagree)   env->DeleteLocalRef(jagree);
+
+    secure_clear(r.refresh_token);
+    secure_clear(r.access_token);
+    secure_clear(r.new_guard_data);
 
     return obj;
 }

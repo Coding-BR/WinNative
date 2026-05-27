@@ -229,8 +229,7 @@ class WnSteamSession : AutoCloseable {
             if (host.isEmpty()) return null
             val fileSize = obj.optInt("fileSize", 0)
             val rawFileSize = obj.optInt("rawFileSize", 0)
-            val scheme = if (obj.optBoolean("useHttps", false)) "https" else "http"
-            val url = java.net.URL("$scheme://$host${obj.optString("urlPath")}")
+            val url = java.net.URL("https://$host${obj.optString("urlPath")}")
             val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 15_000
@@ -346,8 +345,7 @@ class WnSteamSession : AutoCloseable {
                         continue
                     }
                     val slice = fileBytes.copyOfRange(off, off + len)
-                    val scheme = if (blk.optBoolean("useHttps", false)) "https" else "http"
-                    val url = java.net.URL("$scheme://$host${blk.optString("urlPath")}")
+                    val url = java.net.URL("https://$host${blk.optString("urlPath")}")
                     val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
                         requestMethod = "PUT"
                         doOutput = true
