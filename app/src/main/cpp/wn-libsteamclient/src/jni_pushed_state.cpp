@@ -1962,6 +1962,7 @@ void diagnostic_run(DiagnosticCallback* self, void* payload) {
     ++self->runs;
     if (payload) {
         self->last_user    = static_cast<int32_t>(
+            *reinterpret_cast<const uint32_t*>(payload));
         self->last_eresult = *reinterpret_cast<const int32_t*>(
             static_cast<const uint8_t*>(payload) + 8);
     }
@@ -2027,6 +2028,7 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnLibSteamClient_nativeDiagn
     int32_t  body_eresult = eresult;
     lsc::push_call_result(h_call, static_cast<int>(callbackId),
                           &body_eresult, sizeof(body_eresult),
+                          /*io_failure=*/false);
 
     g_diag_cr_cb.vptr      = const_cast<void**>(kDiagnosticCallResultVtable);
     g_diag_cr_cb.flags     = 0;

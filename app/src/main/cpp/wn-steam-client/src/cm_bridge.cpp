@@ -558,6 +558,7 @@ static void state_sync_poller_loop() {
             WN_BRIDGE_LOGI("state-sync: fulfilling request for app=%u unlink=%d/%d",
                            app_id, unlink_rc, unlink_rc == 0 ? 0 : unlink_errno);
             bool dispatched = wn_cm_lobby_get_list(
+                /*hCall=*/0, app_id, /*num_lobbies_requested=*/0,
                 nullptr, nullptr, nullptr, nullptr, 0,
                 [](uint64_t, int32_t, const WnCmLobbyEntry*, size_t) {});
             if (!dispatched) {

@@ -832,9 +832,11 @@ public:
             if (lit == pushed().licenses.end()) continue;
             if (lit->second.minute_limit > 0) {
                 if (pcSecondsAllowed) {
+                    *pcSecondsAllowed = static_cast<uint32_t>(
                         lit->second.minute_limit * 60);
                 }
                 if (pcSecondsPlayed) {
+                    *pcSecondsPlayed = static_cast<uint32_t>(
                         std::max(0, lit->second.minutes_used) * 60);
                 }
                 return true;
@@ -2513,6 +2515,7 @@ public:
                 cb.m_nLobbiesMatching = static_cast<uint32_t>(sids.size());
                 push_call_result(hCall, lsc_cb::kLobbyMatchList,
                                   &cb, sizeof(cb),
+                                  /*io_failure=*/(eresult < 0));
             });
         if (!dispatched) {
             lsc_cb::LobbyMatchList cb{};
@@ -2567,6 +2570,7 @@ public:
                 cb.m_ulSteamIDLobby = lobby_sid;
                 push_call_result(hCall, lsc_cb::kLobbyCreated,
                                  &cb, sizeof(cb),
+                                 /*io_failure=*/(eresult < 0));
                 if (cb.m_eResult == 1 && lobby_sid != 0) {
                     lsc_cb::LobbyEnter le{};
                     le.m_ulSteamIDLobby         = lobby_sid;
@@ -2601,6 +2605,7 @@ public:
                 cb.m_EChatRoomEnterResponse = (chat_resp > 0) ? chat_resp : 2;
                 push_call_result(hCall, lsc_cb::kLobbyEnter,
                                  &cb, sizeof(cb),
+                                 /*io_failure=*/(chat_resp < 0));
             });
         if (!dispatched) {
             lsc_cb::LobbyEnter cb{};
@@ -2681,6 +2686,7 @@ public:
         }
         const uint64_t h = alloc_api_call_handle();
         wn_cm_lobby_set_data(h, pushed().app_id.load(), sid,
+                             /*steam_id_member=*/0,
                              reinterpret_cast<const uint8_t*>(blob.data()),
                              blob.size(),
                              max_members, lobby_type, lobby_flags,
@@ -2770,6 +2776,7 @@ public:
         }
         const uint64_t h = alloc_api_call_handle();
         wn_cm_lobby_set_data(h, pushed().app_id.load(), sid,
+                             /*steam_id_member=*/self,
                              reinterpret_cast<const uint8_t*>(blob.data()),
                              blob.size(),
                              max_members, lobby_type, lobby_flags,

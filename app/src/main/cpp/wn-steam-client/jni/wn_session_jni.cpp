@@ -2303,6 +2303,7 @@ Java_com_winlator_cmod_feature_stores_steam_wnsteam_WnSteamSession_nativeRenewRe
 
     s->client->call_service_method(
         "Authentication.GenerateAccessTokenForApp#1",
+        /*authed=*/true,
         body,
         [promise](wn_steam::JobResult r) {
             if (r.eresult != 1 /*EResult.OK*/ || r.synthetic_failure) {

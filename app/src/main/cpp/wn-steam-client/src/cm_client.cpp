@@ -672,6 +672,7 @@ void CMClient::cloud_get_user_quota(CloudUserQuotaCallback cb,
     pb::CCloud_GetUserQuota_Request req;
     call_service_method(
         "Cloud.GetUserQuota#1",
+        /*authed=*/true,
         req.serialize(),
         [cb = std::move(cb)](JobResult r) {
             if (r.synthetic_failure || r.eresult != 1) {
@@ -999,6 +1000,7 @@ void CMClient::set_rich_presence(
     req.rich_presence = kv;
     call_service_method(
         "Player.SetRichPresence#1",
+        /*authed=*/true,
         req.serialize(),
         [app_id, count = kv.size()](JobResult r) {
             if (r.synthetic_failure || r.eresult != 1) {
