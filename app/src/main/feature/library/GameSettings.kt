@@ -332,9 +332,6 @@ class GameSettingsStateHolder {
     val steamOfflineMode = mutableStateOf(false)
     val unpackFiles = mutableStateOf(false)
     val runtimePatcher = mutableStateOf(false)
-    val launchRealSteam = mutableStateOf(false)
-    val steamTypeEntries = mutableStateOf<List<String>>(emptyList())
-    val selectedSteamType = mutableIntStateOf(0)
 
     // Components
     val winComponentEntries = mutableStateOf<List<String>>(emptyList())
@@ -1883,12 +1880,7 @@ private fun SteamSection(state: GameSettingsStateHolder) {
         SettingCheckbox(
             label = stringResource(R.string.shortcuts_properties_use_cold_client),
             checked = state.useColdClient.value,
-            onCheckedChange = {
-                state.useColdClient.value = it
-                // Cold Client and Launch Steam Client are mutually exclusive —
-                // they use different Steam DLL setups that can't coexist at runtime.
-                if (it) state.launchRealSteam.value = false
-            }
+            onCheckedChange = { state.useColdClient.value = it }
         )
         Spacer(Modifier.height(4.dp))
         Text(
@@ -1930,12 +1922,7 @@ private fun SteamSection(state: GameSettingsStateHolder) {
         SettingCheckbox(
             label = stringResource(R.string.shortcuts_properties_unpack_files),
             checked = state.unpackFiles.value,
-            onCheckedChange = {
-                state.unpackFiles.value = it
-                // Unpack Files swaps the on-disk exe with a Steamless-stripped copy —
-                // incompatible with the original-exe launch Real Steam does via -applaunch.
-                if (it) state.launchRealSteam.value = false
-            }
+            onCheckedChange = { state.unpackFiles.value = it }
         )
         Spacer(Modifier.height(4.dp))
         Text(
@@ -1949,13 +1936,7 @@ private fun SteamSection(state: GameSettingsStateHolder) {
         SettingCheckbox(
             label = stringResource(R.string.shortcuts_properties_runtime_patcher),
             checked = state.runtimePatcher.value,
-            onCheckedChange = {
-                state.runtimePatcher.value = it
-                // Runtime DRM Patcher injects Goldberg DLLs into the game at launch —
-                // Real Steam talks to the actual Steam client and doesn't want emulated
-                // steamclient DLLs poking around in its address space.
-                if (it) state.launchRealSteam.value = false
-            }
+            onCheckedChange = { state.runtimePatcher.value = it }
         )
         Spacer(Modifier.height(4.dp))
         Text(
@@ -1964,46 +1945,6 @@ private fun SteamSection(state: GameSettingsStateHolder) {
             fontSize = 11.sp,
             lineHeight = 16.sp
         )
-    }
-
-    Spacer(Modifier.height(SettingItemGap))
-
-    SubsectionLabel(stringResource(R.string.steam_section_real_client))
-    Spacer(Modifier.height(8.dp))
-    SettingGroup {
-        SettingCheckbox(
-            label = stringResource(R.string.shortcuts_properties_launch_steam_client_beta),
-            checked = state.launchRealSteam.value,
-            onCheckedChange = {
-                state.launchRealSteam.value = it
-                // Launch Steam Client runs the game through the real Steam client's
-                // -applaunch pipeline. Cold Client, Unpack Files, and Runtime DRM
-                // Patcher all conflict with that path — disable when this one is on.
-                if (it) {
-                    state.useColdClient.value = false
-                    state.unpackFiles.value = false
-                    state.runtimePatcher.value = false
-                }
-            }
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            stringResource(R.string.shortcuts_properties_launch_steam_client_description),
-            color = TextDim,
-            fontSize = 11.sp,
-            lineHeight = 16.sp
-        )
-
-        Spacer(Modifier.height(SettingItemGap))
-
-        if (state.steamTypeEntries.value.isNotEmpty()) {
-            SettingDropdown(
-                label = stringResource(R.string.shortcuts_properties_steam_type),
-                entries = state.steamTypeEntries.value,
-                selectedIndex = state.selectedSteamType.intValue,
-                onSelected = { state.selectedSteamType.intValue = it }
-            )
-        }
     }
 }
 
