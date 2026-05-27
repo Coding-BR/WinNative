@@ -158,6 +158,14 @@ import javax.inject.Inject
 import kotlin.io.path.pathString
 import kotlin.time.Duration.Companion.seconds
 
+private fun JSONArray?.toIntList(): List<Int> {
+    val len = this?.length() ?: 0
+    if (len == 0) return emptyList()
+    val out = ArrayList<Int>(len)
+    for (i in 0 until len) out.add(this!!.getInt(i))
+    return out
+}
+
 @AndroidEntryPoint
 class SteamService : Service() {
     @Inject
@@ -1271,10 +1279,12 @@ class SteamService : Service() {
 
                 if (selectableDlcIds.isEmpty()) return@runBlocking emptyList()
 
+                // Single bulk SELECT instead of N findApp() calls; preserves the DB-first preference
+                // by overlaying the already-loaded dlcAppsById map only for IDs not in the DB.
+                val dlcFromDb = service.appDao.findApps(selectableDlcIds).associateBy { it.id }
                 selectableDlcIds
                     .mapNotNull { dlcAppId ->
-                        val dlcApp = service.appDao.findApp(dlcAppId) ?: dlcAppsById[dlcAppId]
-                        dlcApp?.takeIf { it.name.isNotBlank() }
+                        (dlcFromDb[dlcAppId] ?: dlcAppsById[dlcAppId])?.takeIf { it.name.isNotBlank() }
                     }
                     .sortedBy { it.name.lowercase() }
             }
@@ -7091,14 +7101,23 @@ class SteamService : Service() {
                 }
 
                 val installedManifestIds = readInstalledDepotManifestIds(appDirPath)
+                val cachedManifestFiles: Set<String> =
+                    File(appDirPath, ".DepotDownloader").list()?.toHashSet() ?: emptySet()
+                // Resolve manifests once per depot; the filter below decides which need updating,
+                // and the size calculation reuses the cached resolutions.
+                val depotManifests: Map<Int, Pair<DepotInfo, ManifestInfo>> =
+                    selectedDepots.mapNotNull { (depotId, depot) ->
+                        val manifest = resolveDepotManifestInfo(depot, branch) ?: return@mapNotNull null
+                        depotId to (depot to manifest)
+                    }.toMap()
                 val updateDepots =
-                    selectedDepots.filter { (depotId, depot) ->
-                        val manifest = resolveDepotManifestInfo(depot, branch) ?: return@filter false
+                    depotManifests.filter { (depotId, depotAndManifest) ->
+                        val manifest = depotAndManifest.second
                         val installedManifestId = installedManifestIds[depotId]
                         if (installedManifestId != null) {
                             installedManifestId != manifest.gid
                         } else {
-                            !hasCachedDepotManifest(appDirPath, depotId, manifest.gid)
+                            "${depotId}_${manifest.gid}.manifest" !in cachedManifestFiles
                         }
                     }
 
@@ -7109,7 +7128,7 @@ class SteamService : Service() {
                         hasUpdate = true,
                         downloadSize =
                             updateDepots.values
-                                .sumOf { depot -> manifestDownloadBytes(resolveDepotManifestInfo(depot, branch)) }
+                                .sumOf { (_, manifest) -> manifestDownloadBytes(manifest) }
                                 .coerceAtLeast(0L),
                         depotIds = updateDepots.keys.sorted(),
                     ).logged()
@@ -7199,12 +7218,6 @@ class SteamService : Service() {
                 Timber.w(it, "Failed to read Steam depot.config for $appDirPath")
                 emptyMap()
             }
-
-        private fun hasCachedDepotManifest(
-            appDirPath: String,
-            depotId: Int,
-            manifestId: Long,
-        ): Boolean = File(File(appDirPath, ".DepotDownloader"), "${depotId}_${manifestId}.manifest").exists()
 
         private fun cleanupCancelledUpdate(appDirPath: String) {
             MarkerUtils.removeMarker(appDirPath, Marker.DOWNLOAD_IN_PROGRESS_MARKER)
@@ -8406,23 +8419,21 @@ class SteamService : Service() {
                                 for (i in 0 until arr.length()) {
                                     val pkg = arr.getJSONObject(i)
                                     val pkgId = pkg.optInt("packageid")
-                                    val appIdsArr = pkg.optJSONArray("appids")
-                                    val appIds =
-                                        (0 until (appIdsArr?.length() ?: 0)).map { appIdsArr!!.getInt(it) }
+                                    val appIds = pkg.optJSONArray("appids").toIntList()
                                     licenseDao.updateApps(pkgId, appIds)
-                                    val depotIdsArr = pkg.optJSONArray("depotids")
-                                    val depotIds =
-                                        (0 until (depotIdsArr?.length() ?: 0)).map { depotIdsArr!!.getInt(it) }
+                                    val depotIds = pkg.optJSONArray("depotids").toIntList()
                                     licenseDao.updateDepots(pkgId, depotIds)
 
-                                    // Insert a stub row (or update) of SteamApps to the database.
-                                    appIds.forEach { appid ->
-                                        val steamApp = appDao.findApp(appid)?.copy(packageId = pkgId)
-                                        if (steamApp != null) {
-                                            appDao.update(steamApp)
-                                        } else {
-                                            appDao.insert(SteamApp(id = appid, packageId = pkgId))
-                                        }
+                                    if (appIds.isNotEmpty()) {
+                                        // Update package_id on existing rows in one statement; insert
+                                        // stubs for the rest. Replaces a per-app find/update/insert N+1.
+                                        val existing = appDao.findExistingIds(appIds).toHashSet()
+                                        appDao.setPackageIdForApps(appIds, pkgId)
+                                        val newApps = appIds.asSequence()
+                                            .filter { it !in existing }
+                                            .map { SteamApp(id = it, packageId = pkgId) }
+                                            .toList()
+                                        if (newApps.isNotEmpty()) appDao.insertAll(newApps)
                                     }
                                     queue.addAll(appIds)
                                 }
