@@ -363,15 +363,15 @@ class ShortcutSettingsComposeDialog private constructor(
         val gameSource = shortcut.getExtra("game_source", "")
         state.isSteamGame.value = gameSource == "STEAM" || gameSource == "steam"
         if (state.isSteamGame.value) {
-            state.useColdClient.value = getShortcutSetting(
-                "useColdClient", if (container.isUseColdClient) "1" else "0") == "1"
+            state.steamLauncher.value =
+                com.winlator.cmod.feature.stores.steam.utils.PrefManager.wnPlanW
+            // Legacy Launcher is on if either underlying setting was previously on.
+            state.useLegacyLauncher.value =
+                getShortcutSetting("useColdClient", if (container.isUseColdClient) "1" else "0") == "1" ||
+                getShortcutSetting("unpackFiles", if (container.isUnpackFiles) "1" else "0") == "1"
             state.useSteamInput.value = shortcut.getExtra("useSteamInput", "0") == "1"
-            state.forceDlc.value = getShortcutSetting(
-                "forceDlc", if (container.isForceDlc) "1" else "0") == "1"
             state.steamOfflineMode.value = getShortcutSetting(
                 "steamOfflineMode", if (container.isSteamOfflineMode) "1" else "0") == "1"
-            state.unpackFiles.value = getShortcutSetting(
-                "unpackFiles", if (container.isUnpackFiles) "1" else "0") == "1"
             state.runtimePatcher.value = getShortcutSetting(
                 "runtimePatcher", if (container.isRuntimePatcher) "1" else "0") == "1"
         }
@@ -1226,11 +1226,15 @@ class ShortcutSettingsComposeDialog private constructor(
 
             // Steam options
             if (state.isSteamGame.value) {
+                com.winlator.cmod.feature.stores.steam.utils.PrefManager.wnPlanW =
+                    state.steamLauncher.value
                 shortcut.putExtra("launchRealSteam", null)
                 shortcut.putExtra("steamType", null)
+                // "Use Legacy Launcher" drives both the ColdClient launcher and
+                // SteamStub DRM unpacking; persist both keys from the one toggle.
                 hasContainerOverride = hasContainerOverride or saveOverride(
                     "useColdClient",
-                    if (state.useColdClient.value) "1" else "0",
+                    if (state.useLegacyLauncher.value) "1" else "0",
                     if (container.isUseColdClient) "1" else "0"
                 )
                 hasContainerOverride = hasContainerOverride or saveOverride(
@@ -1239,18 +1243,13 @@ class ShortcutSettingsComposeDialog private constructor(
                     container.getExtra("useSteamInput", "0")
                 )
                 hasContainerOverride = hasContainerOverride or saveOverride(
-                    "forceDlc",
-                    if (state.forceDlc.value) "1" else "0",
-                    if (container.isForceDlc) "1" else "0"
-                )
-                hasContainerOverride = hasContainerOverride or saveOverride(
                     "steamOfflineMode",
                     if (state.steamOfflineMode.value) "1" else "0",
                     if (container.isSteamOfflineMode) "1" else "0"
                 )
                 hasContainerOverride = hasContainerOverride or saveOverride(
                     "unpackFiles",
-                    if (state.unpackFiles.value) "1" else "0",
+                    if (state.useLegacyLauncher.value) "1" else "0",
                     if (container.isUnpackFiles) "1" else "0"
                 )
                 hasContainerOverride = hasContainerOverride or saveOverride(
@@ -2176,10 +2175,10 @@ class ShortcutSettingsComposeDialog private constructor(
         }
 
         if (state.isSteamGame.value) {
-            state.useColdClient.value = container.isUseColdClient
-            state.forceDlc.value = container.isForceDlc
+            state.steamLauncher.value =
+                com.winlator.cmod.feature.stores.steam.utils.PrefManager.wnPlanW
+            state.useLegacyLauncher.value = container.isUseColdClient || container.isUnpackFiles
             state.steamOfflineMode.value = container.isSteamOfflineMode
-            state.unpackFiles.value = container.isUnpackFiles
             state.runtimePatcher.value = container.isRuntimePatcher
             state.useSteamInput.value = container.getExtra("useSteamInput", "0") == "1"
         }
