@@ -2,6 +2,8 @@ package com.winlator.cmod.runtime.display.environment.components;
 
 import android.content.Context;
 import android.media.AudioManager;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
 import android.os.Process;
 import com.winlator.cmod.runtime.display.connector.UnixSocketConfig;
 import com.winlator.cmod.runtime.display.environment.EnvironmentComponent;
@@ -12,17 +14,30 @@ import com.winlator.cmod.shared.io.FileUtils;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class PulseAudioComponent extends EnvironmentComponent {
+  private static final String SINK_NAME = "AAudioSink";
   private final UnixSocketConfig socketConfig;
+  private final String cliSocketPath;
   private final Options options;
   private static int pid = -1;
   private static final Object lock = new Object();
+  private static final ExecutorService controlExecutor =
+      Executors.newSingleThreadExecutor(
+          runnable -> {
+            Thread thread = new Thread(runnable, "PulseAudioControl");
+            thread.setDaemon(true);
+            return thread;
+          });
 
   public PulseAudioComponent(UnixSocketConfig socketConfig) {
     this(socketConfig, new Options());
@@ -30,6 +45,7 @@ public class PulseAudioComponent extends EnvironmentComponent {
 
   public PulseAudioComponent(UnixSocketConfig socketConfig, Options options) {
     this.socketConfig = socketConfig;
+    this.cliSocketPath = socketConfig.path + ".cli";
     this.options = options != null ? options : new Options();
   }
 
@@ -157,6 +173,41 @@ public class PulseAudioComponent extends EnvironmentComponent {
     }
   }
 
+  @Override
+  public void onPause() {
+    suspendSink(true);
+  }
+
+  @Override
+  public void onResume() {
+    suspendSink(false);
+  }
+
+  private void suspendSink(boolean suspend) {
+    synchronized (lock) {
+      if (pid == -1) return;
+    }
+
+    controlExecutor.execute(
+        () -> {
+          synchronized (lock) {
+            if (pid == -1) return;
+          }
+          sendCliCommand("suspend-sink " + SINK_NAME + " " + (suspend ? "1" : "0"));
+        });
+  }
+
+  private void sendCliCommand(String command) {
+    try (LocalSocket socket = new LocalSocket()) {
+      socket.connect(
+          new LocalSocketAddress(cliSocketPath, LocalSocketAddress.Namespace.FILESYSTEM));
+      OutputStream outputStream = socket.getOutputStream();
+      outputStream.write((command + "\n").getBytes(StandardCharsets.UTF_8));
+      outputStream.flush();
+    } catch (IOException ignored) {
+    }
+  }
+
   private void copyFromLibraryDir(File dst) {
     String[] libs =
         new String[] {
@@ -193,6 +244,7 @@ public class PulseAudioComponent extends EnvironmentComponent {
     if (!configDir.isDirectory()) configDir.mkdirs();
     File runtimeDir = new File(workingDir, "run");
     if (!runtimeDir.isDirectory()) runtimeDir.mkdirs();
+    new File(cliSocketPath).delete();
 
     int sampleRate =
         options.sampleRateOverridden ? options.sampleRate : getNativeOutputSampleRate(context);
@@ -231,6 +283,9 @@ public class PulseAudioComponent extends EnvironmentComponent {
             "load-module module-native-protocol-unix auth-anonymous=1 auth-cookie-enabled=0 socket=\""
                 + socketConfig.path
                 + "\"",
+            ".nofail",
+            "load-module module-cli-protocol-unix socket=\"" + cliSocketPath + "\"",
+            ".fail",
             "load-module module-aaudio-sink sink_name=AAudioSink rate=" + sampleRate,
             "set-default-sink AAudioSink",
             "set-sink-volume AAudioSink " + pulseVolumeHex(options.volume),
