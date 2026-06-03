@@ -6,4 +6,10 @@ public abstract class EnvironmentComponent {
   public abstract void start();
 
   public abstract void stop();
+
+  public void onPause() {
+  }
+
+  public void onResume() {
+  }
 }

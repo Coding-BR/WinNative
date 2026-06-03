@@ -132,8 +132,14 @@ public class XEnvironment implements Iterable<EnvironmentComponent> {
   }
 
   public void onPause() {
+    for (int i = components.size() - 1; i >= 0; i--) {
+      components.get(i).onPause();
+    }
   }
 
   public void onResume() {
+    for (EnvironmentComponent component : components) {
+      component.onResume();
+    }
   }
 }

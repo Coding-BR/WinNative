@@ -5400,7 +5400,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             );
         } else if (audioDriver.equals("pulseaudio")) {
             PulseAudioComponent.Options pulseOptions = PulseAudioComponent.Options.fromEnvVars(envVars);
-            if (!envVars.has("PULSE_LATENCY_MSEC")) {
+            if (pulseOptions.latencyMillis > 0) {
                 envVars.put("PULSE_LATENCY_MSEC", pulseOptions.latencyMillis);
             }
             envVars.put("PULSE_SERVER", rootPath + UnixSocketConfig.PULSE_SERVER_PATH);
