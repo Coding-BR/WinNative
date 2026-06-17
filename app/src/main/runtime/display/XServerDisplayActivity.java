@@ -344,6 +344,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private boolean isRefactorSizeEnabled = false;
     private static final long REFACTOR_SIZE_EXE_BYTES = 17408L;
     private static final long REFACTOR_SIZE_UNSTAGE_DELAY_MS = 3000L;
+    private static final long GRAPHICS_TEST_32_EXE_BYTES = 2333245L;
+    private static final long GRAPHICS_TEST_64_EXE_BYTES = 2361407L;
+    private String bootExePath;
 
     public boolean isPaused() { return isPaused; }
     public boolean isInputSuspended() {
@@ -727,9 +730,11 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         String incomingShortcutPath = intent.getStringExtra("shortcut_path");
         String incomingShortcutUuid = intent.getStringExtra("shortcut_uuid");
         int incomingContainerId = intent.getIntExtra("container_id", 0);
+        String incomingBootExe = intent.getStringExtra("boot_exe");
         String currentShortcutPath = shortcut != null ? shortcut.file.getAbsolutePath() : "";
         String currentShortcutUuid = shortcut != null ? shortcut.getExtra("uuid") : "";
         int currentContainerId = container != null ? container.id : 0;
+        String currentBootExe = bootExePath != null ? bootExePath : "";
 
         setIntent(intent);
         launchedFromPinnedShortcut = isPinnedShortcutLaunchIntent(intent);
@@ -741,8 +746,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 && !incomingShortcutUuid.isEmpty()
                 && !incomingShortcutUuid.equals(currentShortcutUuid);
         boolean containerChanged = incomingContainerId != 0 && incomingContainerId != currentContainerId;
+        boolean bootExeChanged = !(incomingBootExe != null ? incomingBootExe : "").equals(currentBootExe);
 
-        if (shortcutChanged || shortcutUuidChanged || containerChanged) {
+        if (shortcutChanged || shortcutUuidChanged || containerChanged || bootExeChanged) {
             Log.d("XServerDisplayActivity", "onNewIntent: launch target changed, cleaning up before recreation");
             switchLaunchTargetAfterCleanup(intent);
         }
@@ -1051,6 +1057,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         String shortcutPath = getIntent().getStringExtra("shortcut_path");
         String shortcutUuid = getIntent().getStringExtra("shortcut_uuid");
         int shortcutPathHash = getIntent().getIntExtra("shortcut_path_hash", 0);
+        bootExePath = getIntent().getStringExtra("boot_exe");
 
         android.net.Uri launchData = getIntent().getData();
         if (launchData != null) {
@@ -5163,6 +5170,27 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         }
     }
 
+    private void stageGraphicsTestExes() {
+        if (container == null) return;
+        File dir = new File(container.getRootDir(), ".wine/drive_c/ProgramData/Microsoft/Windows");
+        if (!dir.isDirectory() && !dir.mkdirs()) return;
+        stageBundledExe(dir, "Graphics-Test-32bit.exe", GRAPHICS_TEST_32_EXE_BYTES);
+        stageBundledExe(dir, "Graphics-Test-64bit.exe", GRAPHICS_TEST_64_EXE_BYTES);
+    }
+
+    private void stageBundledExe(File dir, String name, long expectedBytes) {
+        File dst = new File(dir, name);
+        if (dst.exists() && dst.length() == expectedBytes) return;
+        try (java.io.InputStream in = getAssets().open("winnative/" + name);
+             java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (Exception e) {
+            Log.e("XServerDisplayActivity", "Failed to stage " + name, e);
+        }
+    }
+
     private void unstageRefactorSizeHelper() {
         final File dst = new File(container.getRootDir(), ".wine/drive_c/WinNative/refactorsize.exe");
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
@@ -5559,11 +5587,12 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
         String wineArchKey = wineVersion != null && wineVersion.contains("arm64ec") ? "arm64ec" : "x86_64";
         String dxwrapperGateKey = dxwrapper + "|arch=" + wineArchKey;
-        if (!dxwrapperGateKey.equals(container.getExtra("dxwrapper")) || firstTimeBoot) {
+        boolean forceWrapperApply = bootExePath != null && !bootExePath.isEmpty();
+        if (!dxwrapperGateKey.equals(container.getExtra("dxwrapper")) || firstTimeBoot || forceWrapperApply) {
             Log.i("XServerDisplayActivity",
                     "DXVK/VKD3D extract: gate fired (key='" + dxwrapperGateKey
                             + "' prev='" + container.getExtra("dxwrapper")
-                            + "' firstTimeBoot=" + firstTimeBoot + ")");
+                            + "' firstTimeBoot=" + firstTimeBoot + " forced=" + forceWrapperApply + ")");
             wipeDxwrapperDllsForReextract();
             extractDXWrapperFiles(dxwrapper);
             container.putExtra("dxwrapper", dxwrapperGateKey);
@@ -5606,6 +5635,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         }
 
         WineStartMenuCreator.create(this, container);
+        stageGraphicsTestExes();
         WineUtils.createDosdevicesSymlinks(container, getActiveGameDirectoryPath(), isSteamShortcut());
 
         int inputType = container.getInputType();
@@ -6294,8 +6324,10 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                          : (container != null && container.getExtra("swapRB", "0").equals("1"));
         renderer.setSwapRB(swapRB);
 
-        if (shortcut != null) {
+        if (shortcut != null || (bootExePath != null && !bootExePath.isEmpty())) {
             renderer.setUnviewableWMClasses("explorer.exe");
+        }
+        if (shortcut != null) {
             String savedFpsLimit = shortcut.getExtra("fpsLimit", "0");
             try {
                 runtimeFpsLimit = Integer.parseInt(savedFpsLimit);
@@ -7298,7 +7330,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         EnvVars envVars = getOverrideEnvVars();
         String args = "";
 
-        if (shortcut != null) {
+        if (bootExePath != null && !bootExePath.isEmpty()) {
+            args = "\"" + bootExePath + "\"";
+        } else if (shortcut != null) {
             String path = shortcut.path;
             String gameSource = shortcut.getExtra("game_source", "CUSTOM");
             Log.d("XServerDisplayActivity", "getWineStartCommand: gameSource=" + gameSource + " shortcut.path=" + path);

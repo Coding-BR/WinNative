@@ -193,6 +193,10 @@
     <string name="library_games_immersive_blur_description">Aplică un efect de estompare asupra fundalului imersiv</string>
     <string name="library_games_custom_game">Joc personalizat</string>
     <string name="library_games_play">Joaca</string>
+    <string name="hero_boot_to_desktop_title">Pornește pe desktop</string>
+    <string name="hero_graphics_tests_title">Teste grafice</string>
+    <string name="hero_graphics_test_32">32-bit</string>
+    <string name="hero_graphics_test_64">64-bit</string>
     <string name="library_games_add_custom_game">Adauga joc personalizat</string>
     <string name="library_games_game_name">Nume joc</string>
     <string name="library_games_game_folder_mapped_drive">Folder joc (unitate de joc mapata)</string>
